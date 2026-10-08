@@ -179,3 +179,20 @@ See [`docs/http-api.md`](docs/http-api.md) for the full endpoint reference and
   the plan to make the Agent Plugin API eqoxide's sole programmatic interface, with A* navigation and
   chase-and-engage combat positioning in
   [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar)
+
+
+## Bump evaluation
+
+This fork is preparing a CPU-only headless runtime using the existing network and HTTP crates.
+The shipped application still requires graphics. Upstream has not declared a project license;
+creating this fork does not resolve reuse licensing.
+
+Run the scoped library checks with `scripts/check-headless-crates`. It uses an explicitly pinned
+Rust container, defaults to offline operation, and leaves the source read-only. Use `--online`
+only to download missing locked Cargo dependencies. `EQOXIDE_CHECK_CACHE` selects a dedicated
+build/cache directory. These checks do not launch a player or qualify a live session.
+
+The authoritative evaluation and session-test brief live in the
+[EQEmu operations worklog](http://localhost:8081/projects/bump-eqemu/worklog/).
+The combined artifact/fixture preparation manifest belongs to `thunderbump/bump-akk-stack`,
+under `validation/session-test/preparation.json` on its preparation branch.
