@@ -169,3 +169,20 @@ See [`docs/http-api.md`](docs/http-api.md) for the full endpoint reference and
 - [`docs/protocol-notes.md`](docs/protocol-notes.md) — EQ RoF2 wire protocol notes
 - [`docs/collision-system.md`](docs/collision-system.md), [`docs/zone-rendering.md`](docs/zone-rendering.md),
   [`docs/character-models.md`](docs/character-models.md) — rendering internals
+
+
+## Bump evaluation
+
+This fork is preparing a CPU-only headless runtime using the existing network and HTTP crates.
+The shipped application still requires graphics. Upstream has not declared a project license;
+creating this fork does not resolve reuse licensing.
+
+Run the scoped library checks with `scripts/check-headless-crates`. It uses an explicitly pinned
+Rust container, defaults to offline operation, and leaves the source read-only. Use `--online`
+only to download missing locked Cargo dependencies. `EQOXIDE_CHECK_CACHE` selects a dedicated
+build/cache directory. These checks do not launch a player or qualify a live session.
+
+The authoritative evaluation and session-test brief live in the
+[EQEmu operations worklog](http://localhost:8081/projects/bump-eqemu/worklog/).
+The combined artifact/fixture preparation manifest belongs to `thunderbump/bump-akk-stack`,
+under `validation/session-test/preparation.json` on its preparation branch.
