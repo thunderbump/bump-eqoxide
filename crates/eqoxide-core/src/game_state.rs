@@ -123,6 +123,8 @@ impl Gait {
 /// A single entity in the zone (NPC or PC, not the player themselves).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
+    /// Raw received spawn class; None when no class was received.
+    pub class_id: Option<u8>,
     pub spawn_id: u32,
     pub name: String,
     pub level: u32,
@@ -1143,6 +1145,9 @@ pub enum ServerAck {
 pub struct GameState {
     /// Increments on every zone-server entry, including same-zone re-entry.
     pub zone_epoch: u64,
+    /// Legacy graphical policies; CPU control disables these before gameplay begins.
+    pub automatic_loot: bool,
+    pub automatic_zone_crossing: bool,
     // Player
     pub player_id: u32,
     pub player_name: String,
@@ -1710,6 +1715,8 @@ impl GameState {
             // `false` (walk) — deliberately overridden here, the same way `messages` overrides its
             // derived-empty-`VecDeque` default just above.
             run_mode: true,
+            automatic_loot: true,
+            automatic_zone_crossing: true,
             ..Default::default()
         }
     }
@@ -2553,7 +2560,7 @@ pub fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) ->
         dead: false,
         equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
         face: 0, hairstyle: 0, haircolor: 0,
-        pose: Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0,
+        pose: Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0, class_id: None,
     }
 }
 
@@ -4380,7 +4387,7 @@ pub(crate) mod tests {
             // Drained by `ActionLoop::tick` every tick; a stale ack matches no held request.
             server_acks: _,
             // Identity + character sheet: the same character, in a different zone.
-            zone_epoch: _, player_id: _, player_name: _, player_level: _, player_race: _, player_class: _,
+            zone_epoch: _, automatic_loot: _, automatic_zone_crossing: _, player_id: _, player_name: _, player_level: _, player_race: _, player_class: _,
             player_gender: _, player_face: _, player_hairstyle: _, player_haircolor: _,
             player_guild_id: _, player_guild_rank: _, stats: _, player_skills: _,
             player_equipment: _, player_equipment_tint: _, mem_spells: _,

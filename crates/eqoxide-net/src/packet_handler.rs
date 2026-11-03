@@ -1248,7 +1248,7 @@ fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
         // If this new spawn is an NPC corpse, queue it for auto-looting. (The dead/Lying flagging that
         // lays the corpse down is now done for ALL spawn paths inside `register_spawn` — #253.)
         let sid = info.spawn_id;
-        if info.npc != 0 && name.to_lowercase().contains("corpse") {
+        if gs.automatic_loot && info.npc != 0 && name.to_lowercase().contains("corpse") {
             tracing::info!("EQ: NPC corpse spawned: id={} name={:?} → queuing for loot", sid, name);
             gs.pending_loot.push_back(sid);
             if gs.loot_queued_at.is_none() {
@@ -2055,7 +2055,7 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
             // Auto-loot our OWN kills: the NPC corpse reuses the mob's spawn_id, and the server
             // doesn't send OP_BecomeCorpse for these deaths — so queue the corpse here. The
             // gameplay loop sends OP_LootRequest after a short delay (loot-empty corpses are a no-op).
-            if killer_id == gs.player_id {
+            if gs.automatic_loot && killer_id == gs.player_id {
                 gs.pending_loot.push_back(d_id);
                 if gs.loot_queued_at.is_none() {
                     gs.loot_queued_at = Some(std::time::Instant::now());
@@ -2302,10 +2302,11 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     }
 
     // EQEmu ChatChannel: 0 guild, 2 group, 3 shout, 4 auction, 5 OOC, 6 broadcast, 7 tell,
-    // 8 say, 11 gmsay. The inter-agent channels are ALSO recorded as structured chat events for
-    // the GET /events feed; `say` (8) is NPC dialogue / local say and stays in the message log only.
+    // 8 say, 11 gmsay. Received local say also enters the bounded event feed so a
+    // headless caller can read NPC dialogue without mistaking its own local echo for delivery.
     let event_channel = match chan_num {
         7  => Some("tell"),
+        8  => Some("say"),
         5  => Some("ooc"),
         3  => Some("shout"),
         2  => Some("group"),
@@ -2325,7 +2326,7 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     if !sender.is_empty() {
         // Log under the channel kind (tell/ooc/shout/group) so the chat window
         // can color and tab-filter by channel; plain say stays "chat" (#162).
-        gs.log_msg_with_item_links(event_channel.unwrap_or("chat"), &format!("<{}> {}", sender, msg), item_links);
+        gs.log_msg_with_item_links(if chan_num == 8 { "chat" } else { event_channel.unwrap_or("chat") }, &format!("<{}> {}", sender, msg), item_links);
     } else {
         // Zone-wide broadcasts without a sender (server messages like "An earthquake strikes!").
         gs.log_msg_with_item_links("zone", &msg, item_links);
@@ -3609,6 +3610,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // deployed content never sets it nonzero anyway. This is the "place in the client where
         // the spawn struct's appearance fields are read" the issue asks be a considered decision.
         npc_tint_index: info.npc_tint_index,
+        class_id: Some(info.class_),
     });
 }
 
@@ -3758,7 +3760,7 @@ mod tests {
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
             face: 0, hairstyle: 0, haircolor: 0, pose: Pose::Standing, gait: None, is_boat: false, flymode: 0,
-            npc_tint_index: 0,
+            npc_tint_index: 0, class_id: None,
         }
     }
 
@@ -5580,8 +5582,10 @@ mod tests {
         super::apply_channel_message(&mut gs, &payload);
         assert!(gs.messages.iter().any(|m| m.kind == "chat"
             && m.text == "<Guard_Janior> Halt, adventurer!"));
-        // Say (NPC dialogue) is NOT an inter-agent chat event.
-        assert!(gs.chat_events.is_empty(), "say must not produce a chat event");
+        // Only received dialogue is published; outgoing self echoes remain filtered.
+        let event = gs.chat_events.back().expect("received say event");
+        assert_eq!((&*event.category, &*event.kind, &*event.from, &*event.text),
+            ("chat", "say", "Guard_Janior", "Halt, adventurer!"));
     }
 
     fn make_tell(sender: &str, target: &str, msg: &str) -> Vec<u8> {
@@ -8939,7 +8943,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9],
             helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0,
+            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0, class_id: None,
         });
         // Build a 32-byte Death_Struct payload: spawn_id=42, killer_id=1 (player)
         let mut pkt = [0u8; 32];
@@ -9290,5 +9294,18 @@ mod tests {
             assert_eq!(gs.target_hp_pct, Some(37.0),
                 "spawn_id {sid}: and the targeted mob's published hp_pct with it");
         }
+    }
+}
+
+#[cfg(test)]
+mod explicit_loot_policy_tests {
+    use super::*;
+    #[test]
+    fn explicit_policy_does_not_queue_own_kill() {
+        let mut gs=GameState::new();gs.automatic_loot=false;gs.player_id=1;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42,"a_rat",0.0,0.0,0.0,true));
+        let mut death=vec![0;32];death[0..4].copy_from_slice(&42u32.to_le_bytes());death[4..8].copy_from_slice(&1u32.to_le_bytes());
+        apply_death(&mut gs,&death);
+        assert!(gs.world.entities[&42].dead);assert!(gs.pending_loot.is_empty());
     }
 }

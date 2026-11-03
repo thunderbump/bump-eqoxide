@@ -109,7 +109,15 @@ async fn run_login_flow_with_world(
             // Creation rejections and world selection failures must surface immediately.
             Err(LoginError::Fatal(e)) => return Err(e),
             Err(LoginError::Retryable(e)) => tracing::warn!("EQ: login failed (attempt {}): {}", attempt, e),
-            Ok((stream, net_rx, gs, world_creds)) => {
+            Ok((stream, net_rx, mut gs, world_creds)) => {
+                if expected.is_some() {
+                    // Selected-world CPU sessions are driven explicitly. A corpse received during
+                    // the login burst must not start unsolicited gameplay when the loop begins.
+                    gs.automatic_loot = false;
+                    gs.automatic_zone_crossing = false;
+                    gs.pending_loot.clear();
+                    gs.loot_queued_at = None;
+                }
                 // Seed /entities map with everything discovered during login.
                 {
                     // #643: this is the SECOND roster publisher (the action loop's `sync_entities` is

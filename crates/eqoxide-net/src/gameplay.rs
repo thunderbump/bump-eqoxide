@@ -185,9 +185,9 @@ pub async fn run_gameplay_phase(
         // dependency on other data published by the setter (/exit or window-close).
         if shutdown.load(Ordering::Relaxed) {
             perform_clean_shutdown(s, rx).await;
-            // Logout sent. Idle until the main thread exits the process (it owns the winit/Wayland
-            // teardown). Do NOT return — returning would let run_login_flow retry and reconnect.
-            loop { sleep(Duration::from_millis(200)).await; }
+            // run_login_flow returns after gameplay; it never retries a completed session.
+            // Returning lets CPU hosts finish shutdown while graphical owners tear down their UI.
+            return;
         }
 
         // ── Server-side session drop (#642) ──────────────────────────────────
@@ -3170,3 +3170,24 @@ mod wedge_timeline_tests {
     }
 }
 
+
+#[cfg(test)]
+mod shutdown_completion_tests {
+    use super::*;
+    #[tokio::test]
+    async fn clean_logout_returns_to_the_host_without_reconnecting() {
+        let(stream,rx)=crate::transport::test_stream(0,0).await;
+        let slots=crate::action_loop::ActionLoopSlots {
+            world:Default::default(),quest:Default::default(),group_slots:Default::default(),command:Default::default(),
+            social:Default::default(),merchant_slots:Default::default(),inventory_slots:Default::default(),
+            interact:Default::default(),chat:Default::default(),controller:Default::default(),guild_slots:Default::default(),
+            collision:Arc::new(std::sync::RwLock::new(None)),maps_dir:"/unused".into(),
+        };
+        let lifecycle=GameplayLifecycle {shutdown:Arc::new(AtomicBool::new(true)),camp:Default::default(),
+            camp_until:Default::default(),respawn:Default::default(),
+            game_state_snapshot:Arc::new(arc_swap::ArcSwap::from_pointee(GameState::new())),net_health:Default::default()};
+        let credentials=WorldCredentials{lsid:0,ls_key:String::new(),world_host:"not-used".into(),world_port:0};
+        tokio::time::timeout(Duration::from_secs(2),run_gameplay_phase(stream,rx,GameState::new(),"Synthetic".into(),
+            ActionLoop::new(slots),credentials,lifecycle)).await.expect("host must observe logout completion");
+    }
+}

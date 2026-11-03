@@ -18,7 +18,7 @@
 //! so our `is_water(server_x, server_y, server_z)` passes `(server_y, server_x, server_z)` as the
 //! BSP location to match the server's classification exactly.
 
-use std::path::Path;
+use std::{io::Read, path::Path};
 
 /// EQEmu region type for a zone-line region.
 const REGION_ZONE_LINE: i32 = 3;
@@ -52,6 +52,8 @@ pub enum RegionLoadError {
     /// The file exists but is not region data: shorter than the 18-byte header (10-byte magic + u32
     /// version + u32 node count), or wrong magic.
     NotRegionData,
+    /// Bounded input or node expansion exceeded the caller's budget.
+    LimitExceeded,
     /// A `.wtr` format version this build cannot read (only v1 and v2 are supported).
     UnsupportedVersion(u32),
     /// The header declares more BSP nodes than the file actually carries.
@@ -65,6 +67,7 @@ impl std::fmt::Display for RegionLoadError {
         match self {
             Self::Missing => write!(f, "no .wtr file for this zone"),
             Self::Unreadable(kind) => write!(f, ".wtr present but unreadable ({kind:?}), not confirmed absent"),
+            Self::LimitExceeded => write!(f, ".wtr exceeds the bounded input/node budget"),
             Self::NotRegionData => write!(f, ".wtr present but not region data (bad magic/header)"),
             Self::UnsupportedVersion(v) => write!(f, ".wtr is v{v}; only v1/v2 are supported"),
             Self::Truncated { declared_nodes, bytes } =>
@@ -106,6 +109,7 @@ impl RegionDataAbsent {
         match self {
             Self::NotAttached => "region_data_not_attached",
             Self::LoadFailed(e) => match e {
+                RegionLoadError::LimitExceeded      => "region_data_limit_exceeded",
                 RegionLoadError::Missing            => "region_data_missing",
                 RegionLoadError::Unreadable(_)      => "region_data_unreadable",
                 RegionLoadError::NotRegionData      => "region_data_not_region_data",
@@ -358,12 +362,21 @@ impl RegionMap {
     /// `Option`-returning wrapper it used to share this impl with was deleted in #803, so a caller
     /// can no longer answer off data it never read without first writing the discard by hand.
     pub fn try_load(dir: &Path, zone: &str) -> Result<RegionMap, RegionLoadError> {
+        Self::try_load_bounded(dir, zone, 64 * 1024 * 1024)
+    }
+
+    /// Limit native region input before allocating; v1 zero-index exits remain valid.
+    pub fn try_load_bounded(dir: &Path, zone: &str, max_file_bytes: usize) -> Result<RegionMap, RegionLoadError> {
         let path = dir.join(format!("{zone}.wtr"));
-        let d = std::fs::read(&path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
+        let file = std::fs::File::open(&path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
             RegionLoadError::Missing
         } else {
             RegionLoadError::Unreadable(e.kind())
         })?;
+        let cap = max_file_bytes.checked_add(1).ok_or(RegionLoadError::LimitExceeded)?;
+        let mut d = Vec::new();
+        file.take(cap as u64).read_to_end(&mut d).map_err(|e|RegionLoadError::Unreadable(e.kind()))?;
+        if d.len() > max_file_bytes { return Err(RegionLoadError::LimitExceeded); }
         if d.len() < 18 || &d[..10] != b"EQEMUWATER" { return Err(RegionLoadError::NotRegionData); }
         let version = u32::from_le_bytes(d[10..14].try_into().unwrap());
         // v1 = 36-byte nodes (no zone-line index); v2 = 40-byte nodes (trailing index).
@@ -375,9 +388,11 @@ impl RegionMap {
                 return Err(RegionLoadError::UnsupportedVersion(version));
             }
         };
-        let mut off = 14;
+        let mut off: usize = 14;
         let count = u32::from_le_bytes(d[off..off + 4].try_into().unwrap()) as usize; off += 4;
-        if d.len() < off + count * stride {
+        if count > 1_000_000 { return Err(RegionLoadError::LimitExceeded); }
+        let end = count.checked_mul(stride).and_then(|n|off.checked_add(n)).ok_or(RegionLoadError::LimitExceeded)?;
+        if d.len() < end {
             return Err(RegionLoadError::Truncated { declared_nodes: count, bytes: d.len() });
         }
         let mut nodes = Vec::with_capacity(count);
@@ -385,6 +400,10 @@ impl RegionMap {
             // ZBSP_Node: i32 node_number, f32 normal[3], f32 split, i32 region, i32 special, i32 left, i32 right [, i32 zone_line_index]
             let rd_f = |o: usize| f32::from_le_bytes(d[o..o + 4].try_into().unwrap());
             let rd_i = |o: usize| i32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+            if [rd_f(off+4),rd_f(off+8),rd_f(off+12),rd_f(off+16)].iter().any(|v|!v.is_finite())
+                || [rd_i(off+28),rd_i(off+32)].iter().any(|&index|index < 0 || index as usize > count) {
+                return Err(RegionLoadError::NotRegionData);
+            }
             nodes.push(BspNode {
                 normal:  [rd_f(off + 4), rd_f(off + 8), rd_f(off + 12)],
                 split:   rd_f(off + 16),
@@ -1041,5 +1060,20 @@ mod tests {
         // p = [east, north, z]; must be inside the oblique region and classify correctly.
         assert!(p[0] + p[1] > 50.0, "point inside north+east>50: {p:?}");
         assert_eq!(rm.zone_line_at(p[0], p[1], p[2]), Some(7), "returned point validates: {p:?}");
+    }
+}
+
+#[cfg(test)]
+mod bounded_region_tests {
+    use super::*;
+    #[test]
+    fn region_input_and_node_budgets_reject_before_expansion() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("bounded.wtr");
+        let mut bytes=b"EQEMUWATER".to_vec();bytes.extend_from_slice(&1u32.to_le_bytes());bytes.extend_from_slice(&1u32.to_le_bytes());bytes.extend_from_slice(&[0;36]);
+        std::fs::write(&path,&bytes).unwrap();
+        assert_eq!(RegionMap::try_load_bounded(dir.path(),"bounded",32).err(),Some(RegionLoadError::LimitExceeded));
+        assert!(RegionMap::try_load_bounded(dir.path(),"bounded",54).is_ok());
+        bytes[14..18].copy_from_slice(&1_000_001u32.to_le_bytes());std::fs::write(&path,&bytes).unwrap();
+        assert_eq!(RegionMap::try_load_bounded(dir.path(),"bounded",54).err(),Some(RegionLoadError::LimitExceeded));
     }
 }

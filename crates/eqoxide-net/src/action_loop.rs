@@ -1365,6 +1365,7 @@ impl ActionLoop {
         stream:  &mut EqStream,
         gs:      &mut GameState,
     ) {
+        self.command.actions().set_zone_epoch(gs.zone_epoch);
         let _action_scope = self.command.actions().drain_scope();
         // #492: drop any A3 pending slot the server never resolved (buy/open/cast) BEFORE the drains
         // re-check the in-flight singleton guard, so a stranded slot from a silent Unconfirmed/202
@@ -1608,6 +1609,7 @@ impl ActionLoop {
     }
 
     fn drain_zone_cross(&mut self, stream: &mut EqStream, gs: &mut GameState) {
+        if !gs.automatic_zone_crossing { return; }
         // Auto zone-cross (native mechanism): when the player stands in a DRNTP zone-line region
         // baked into the zone BSP, resolve its zone-point index to a destination via the
         // OP_SendZonepoints list and send OP_ZONE_CHANGE. The server then matches our real position
@@ -6205,7 +6207,7 @@ mod tests {
                 heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
                 gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0,
                 pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false,
-                flymode: 0, npc_tint_index: 0,
+                flymode: 0, npc_tint_index: 0, class_id: None,
             });
         }
 
@@ -6294,7 +6296,7 @@ mod tests {
             spawn_id: 99, name: "Sariel".into(), level: 8, is_npc: false,
             x: 0.0, y: 0.0, z: 0.0, hp_pct: 42.0, cur_hp: 42, max_hp: 100, race: "HUM".into(),
             heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
-            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0,
+            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0, class_id: None,
         });
 
         let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));

@@ -228,7 +228,7 @@ impl Host {
             self.merchant_value = merchant;
         }
         for event in gs.chat_events.iter().filter(|e| e.id > self.last_event) {
-            self.control.publish_event(json!({"kind":"received_game_event","source":"received_packet","event_id":event.id,
+            self.control.publish_event(json!({"kind":"received_game_event","source":if event.category=="chat" {"received_packet"} else {"client_game_event"},"event_id":event.id,
                 "category":event.category,"event_kind":event.kind,"from":event.from,"directed":event.directed,"text":event.text}));
         }
         if let Some(event) = gs.chat_events.back() {
@@ -355,10 +355,18 @@ impl Host {
                     return;
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                if !self.command.request_open_await(entity_id as u32, tx) {
+                let context = self
+                    .command
+                    .actions()
+                    .begin_for_zone("merchant_open", self.epoch);
+                if !context
+                    .scope(async { self.command.request_open_await(entity_id as u32, tx) })
+                    .await
+                {
                     self.outcome(&id, Status::Refused, Some("network_mailbox_busy"), None);
                     return;
                 }
+                let _ = self.control.mark_dispatched(&id);
                 let control = self.control.clone();
                 tokio::spawn(async move {
                     complete_await(control, id, rx, "server_merchant_open", None).await;
@@ -383,22 +391,39 @@ impl Host {
                     return;
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                if !self.command.request_buy_await(merchant, slot, tx) {
+                let context = self.command.actions().begin_for_zone("buy", self.epoch);
+                if !context
+                    .scope(async { self.command.request_buy_await(merchant, slot, tx) })
+                    .await
+                {
                     self.outcome(&id, Status::Refused, Some("network_mailbox_busy"), None);
                     return;
                 }
                 let control = self.control.clone();
+                let _ = self.control.mark_dispatched(&id);
                 let uncertain = self.transaction_uncertain.clone();
+                uncertain.store(true, Ordering::Release);
                 tokio::spawn(async move {
                     complete_await(control, id, rx, "server_buy_receipt", Some(uncertain)).await;
                 });
             }
             operation => {
+                let transaction = matches!(
+                    operation,
+                    Operation::Sell { .. } | Operation::InventoryMove { .. }
+                );
                 let tracker = self.command.actions();
-                let context = tracker.begin("headless_command");
+                let context = tracker.begin_for_zone("headless_command", self.epoch);
                 let accepted = context
                     .scope(async {
                         match operation {
+                            Operation::Loot { entity_id } => {
+                                gs.world.entities.get(&(entity_id as u32)).is_some_and(|e| {
+                                    e.dead
+                                        && e.is_npc
+                                        && e.dist_to(gs.player_x, gs.player_y, gs.player_z) <= 20.0
+                                }) && self.command.request_loot(entity_id as u32)
+                            }
                             Operation::Target { entity_id } => {
                                 observed_entity(gs, entity_id as u32, 500.0)
                                     && self.command.request_target(entity_id as u32)
@@ -444,7 +469,6 @@ impl Host {
                                 self.command.request_merchant_trade(ipc::TradeCmd::Close)
                             }
                             Operation::Sell { slot, quantity } => {
-                                self.transaction_uncertain.store(true, Ordering::Release);
                                 if let Some(merchant) = gs.merchant_open {
                                     gs.inventory.iter().any(|item| {
                                         item.slot == slot as i32
@@ -461,7 +485,6 @@ impl Host {
                                 to_slot,
                                 quantity,
                             } => {
-                                self.transaction_uncertain.store(true, Ordering::Release);
                                 quantity == 1
                                     && from_slot <= 32
                                     && to_slot <= 32
@@ -481,6 +504,10 @@ impl Host {
                     })
                     .await;
                 if accepted && context.accepted() {
+                    let _ = self.control.mark_dispatched(&id);
+                    if transaction {
+                        self.transaction_uncertain.store(true, Ordering::Release);
+                    }
                     self.action_ids.insert(context.id(), id);
                 } else {
                     tracker.discard(context.id());
@@ -528,10 +555,9 @@ async fn complete_await<T: serde::Serialize>(
             None,
         ),
     };
-    if status == Status::Unknown {
-        if let Some(uncertain) = uncertain {
-            uncertain.store(true, Ordering::Release);
-        }
+    if let Some(uncertain) = uncertain {
+        // Keep admission closed while a packet is outstanding and after an unknown outcome.
+        uncertain.store(status == Status::Unknown, Ordering::Release);
     }
     let _ = control.publish_outcome(&id, status, reason, evidence);
 }
@@ -652,6 +678,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
     let mut loaded_zone = String::new();
     let mut publish_at = Instant::now();
     let mut terminal: Option<String> = None;
+    let mut shutdown_started: Option<Instant> = None;
     loop {
         interval.tick().await;
         let now = Instant::now();
@@ -749,7 +776,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             nearby.sort_by_key(|entity| entity.spawn_id);
             let truncated = nearby.len() > 256;
             nearby.truncate(256);
-            let entities:Vec<_>=nearby.iter().map(|entity|json!({"id":entity.spawn_id,"name":entity.name,"npc":entity.is_npc,"dead":entity.dead,
+            let entities:Vec<_>=nearby.iter().map(|entity|json!({"id":entity.spawn_id,"class_id":entity.class_id,"name":entity.name,"npc":entity.is_npc,"dead":entity.dead,
                 "position":[entity.x,entity.y,entity.z],"hp_pct":entity.hp_pct,"level":entity.level,
                 "los":position.zip(col.as_ref()).map(|(p,c)|c.line_clear([p[0],p[1],p[2]+5.0],[entity.x,entity.y,entity.z+5.0],0.0)),"los_source":"local_native_static_geometry"})).collect();
             control.publish_state(host.epoch,json!({"phase":if terminal.is_some(){"failed"}else if ready{"ready"}else{"not_ready"},"failure":terminal,
@@ -762,6 +789,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 "nearby":{"available":gs.player_pos_known,"complete":false,"scope":"received_roster_within_radius","radius":500,"limit":256,"truncated":truncated,"entities":entities},
                 "inventory":{"known":gs.inventory_received,"revision":host.inventory_revision,"items":gs.inventory,"source":"received_with_local_prediction","coin":gs.coin,"coin_confirmed":gs.coin_confirmed},
                 "merchant":{"known":gs.merchant_open.is_some(),"catalog_complete":false,"revision":host.merchant_revision,"open":gs.merchant_open,"items":gs.merchant_items},
+                "policy":{"loot":"explicit_only","automatic_zone_crossing":false},
                 "transactions_blocked_until_relog":host.transaction_uncertain.load(Ordering::Acquire)
             }))?;
             publish_at = now + Duration::from_millis(100);
@@ -770,8 +798,15 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         for command in control.drain_actions() {
             host.dispatch(command, &gs, ready, now).await;
         }
-        if wiring.shutdown.load(Ordering::Acquire) && terminal.is_some() {
-            break;
+        if wiring.shutdown.load(Ordering::Acquire) {
+            let started = shutdown_started.get_or_insert(now);
+            if terminal.is_some() {
+                break;
+            }
+            if now.duration_since(*started) >= Duration::from_secs(8) {
+                api.abort();
+                return Err("logout completion deadline exceeded; session outcome unknown".into());
+            }
         }
         if api.is_finished() {
             host.halt("http_server_ended");
@@ -908,5 +943,64 @@ mod tests {
                 .unwrap()
                 .initialized
         );
+    }
+}
+
+#[cfg(test)]
+mod transaction_admission_tests {
+    use super::*;
+    #[tokio::test]
+    async fn refused_transaction_does_not_poison_later_work() {
+        let wiring = Wiring::new("/unused".into());
+        let mut host = Host {
+            control: Control::new("s".into(), "credential".into(), 8, 16).unwrap(),
+            command: wiring.command,
+            combat: wiring.combat,
+            controller_slots: wiring.controller,
+            body: None,
+            zone_in: Default::default(),
+            epoch: 1,
+            heading: 0.0,
+            motion: None,
+            attack_until: None,
+            action_ids: HashMap::new(),
+            transaction_uncertain: Arc::new(AtomicBool::new(false)),
+            inventory_revision: 0,
+            merchant_revision: 0,
+            inventory_value: Value::Null,
+            merchant_value: Value::Null,
+            last_event: 0,
+        };
+        let mut gs = GameState::new();
+        gs.inventory_received = true;
+        for operation in [
+            Operation::Sell {
+                slot: 23,
+                quantity: 1,
+            },
+            Operation::InventoryMove {
+                from_slot: 23,
+                to_slot: 24,
+                quantity: 1,
+            },
+        ] {
+            host.dispatch(
+                AdmittedCommand {
+                    id: "rejected".into(),
+                    request: crate::control::CommandRequest {
+                        session: "s".into(),
+                        zone_epoch: 1,
+                        inventory_revision: Some(0),
+                        merchant_revision: Some(0),
+                        operation,
+                    },
+                },
+                &gs,
+                true,
+                Instant::now(),
+            )
+            .await;
+            assert!(!host.transaction_uncertain.load(Ordering::Acquire));
+        }
     }
 }

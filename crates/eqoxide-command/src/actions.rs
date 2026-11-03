@@ -67,6 +67,8 @@ pub struct ActionTracker(Arc<Mutex<State>>);
 #[derive(Default)]
 struct State {
     next: u64,
+    zone_epoch: u64,
+    fences: HashMap<usize, (u64, u64)>,
     pending: HashMap<u64, Pending>,
     queued: HashMap<usize, Vec<u64>>,
     names: HashMap<usize, Action>,
@@ -74,7 +76,7 @@ struct State {
     held: HashMap<(Action, u64), Vec<u64>>,
     events: Vec<ActionRecord>,
 }
-struct Pending { kind: String, accepted: bool, deadline: Instant }
+struct Pending { kind: String, accepted: bool, deadline: Instant, zone_epoch: Option<u64> }
 #[derive(Clone, Debug)]
 pub struct ActionRecord { pub id: u64, pub kind: String, pub result: String, pub reason: String }
 #[derive(Clone)]
@@ -90,9 +92,17 @@ impl ActionTracker {
         let mut state = self.0.lock().unwrap();
         state.next = state.next.checked_add(1).expect("action ID exhausted");
         let id = state.next;
-        state.pending.insert(id, Pending { kind: kind.into(), accepted: false, deadline: Instant::now() + Duration::from_secs(30) });
+        state.pending.insert(id, Pending { kind: kind.into(), accepted: false, deadline: Instant::now() + Duration::from_secs(30), zone_epoch: None });
         ActionContext { tracker: self.clone(), id, accepted: Arc::new(AtomicBool::new(false)) }
     }
+    /// Attach caller knowledge to the network mailbox, without changing legacy UI callers.
+    pub fn begin_for_zone(&self, kind: &str, zone_epoch: u64) -> ActionContext {
+        let context = self.begin(kind);
+        self.0.lock().unwrap().pending.get_mut(&context.id).unwrap().zone_epoch = Some(zone_epoch);
+        context
+    }
+    /// Called by the sole network owner before draining any gameplay commands.
+    pub fn set_zone_epoch(&self, zone_epoch: u64) { self.0.lock().unwrap().zone_epoch = zone_epoch; }
     pub fn is_accepted(&self, id: u64) -> bool { self.0.lock().unwrap().pending.get(&id).is_some_and(|p| p.accepted) }
     pub fn discard(&self, id: u64) { self.0.lock().unwrap().pending.remove(&id); }
     pub fn finish(&self, id: u64, result: &str, reason: &str) {
@@ -116,13 +126,24 @@ impl ActionTracker {
                 p.accepted = true;
                 p.deadline = Instant::now() + Duration::from_secs(30);
                 context.accepted.store(true, Ordering::Release);
+                let epoch = p.zone_epoch;
+                if let Some(epoch) = epoch { state.fences.insert(key, (epoch, context.id)); }
                 if !awaited { state.queued.entry(key).or_default().push(context.id); }
             }
         });
     }
-    pub(crate) fn drain(&self, key: usize) {
+    pub(crate) fn drain(&self, key: usize) -> bool {
         let mut state = self.0.lock().unwrap();
+        if let Some((expected, id)) = state.fences.remove(&key) {
+            if expected != state.zone_epoch {
+                state.queued.remove(&key);
+                drop(state);
+                self.finish(id, "refused", "stale_zone_epoch_before_dispatch");
+                return false;
+            }
+        }
         if let Some(ids) = state.queued.remove(&key) { state.drained.entry(key).or_default().extend(ids); }
+        true
     }
     pub fn drain_scope(&self) -> DrainScope { DrainScope(self.clone()) }
 
@@ -170,7 +191,7 @@ impl crate::CommandState {
     pub(crate) fn dequeue<T>(&self, slot: &Mutex<Option<T>>) -> Option<T> {
         let mut value = slot.lock().unwrap();
         let result = value.take();
-        if result.is_some() { self.actions.drain(slot as *const _ as usize); }
+        if result.is_some() && !self.actions.drain(slot as *const _ as usize) { return None; }
         result
     }
 }
@@ -359,4 +380,31 @@ mod tests {
         assert!(tracker.take_events().is_empty());
     }
 
+}
+
+#[cfg(test)]
+mod zone_fence_tests {
+    use super::*;
+    #[tokio::test]
+    async fn stale_target_inventory_chat_and_awaited_buy_do_not_leave_their_mailboxes() {
+        let command=crate::CommandState::default();let tracker=command.actions();
+        tracker.set_zone_epoch(1);
+        let target=tracker.begin_for_zone("target",1);
+        assert!(target.scope(async {command.request_target(7)}).await);
+        let inventory=tracker.begin_for_zone("inventory",1);
+        assert!(inventory.scope(async {command.request_inventory_move(23,24)}).await);
+        let chat=tracker.begin_for_zone("tell",1);
+        chat.scope(async {command.request_chat_send(eqoxide_ipc::ChatSend{chan:7,to:"Other".into(),text:"hello".into()})}).await;
+        let buy=tracker.begin_for_zone("buy",1);let(tx,mut rx)=tokio::sync::oneshot::channel();
+        assert!(buy.scope(async {command.request_buy_await(7,1,tx)}).await);
+        tracker.set_zone_epoch(2);
+        assert!(command.take_target().is_none());assert!(command.take_inventory_move().is_none());
+        assert!(command.take_chat_send().is_empty());assert!(command.take_buy_await().is_none());
+        assert!(matches!(rx.try_recv(),Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
+        let events=tracker.take_events();assert_eq!(events.len(),4);
+        assert!(events.iter().all(|e| e.result=="refused" && e.reason=="stale_zone_epoch_before_dispatch"));
+        let current=tracker.begin_for_zone("target",2);
+        assert!(current.scope(async {command.request_target(7)}).await);
+        assert_eq!(command.take_target(),Some(7));
+    }
 }

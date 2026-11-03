@@ -84,6 +84,7 @@ Stop, attack-off, death, connection loss, shutdown and a new zone entry stop app
 | `target` | `entity_id` from the current received roster |
 | `attack` | `lease_ms` 1–5000; live received NPC target within 30 units |
 | `attack_off` | none; priority attack stop |
+| `loot` | `entity_id` of a received dead NPC within 20 units; ordinary loot protocol |
 | `sit`, `stand` | none; sit stops movement and attack |
 | `say` | `text`, maximum 512 bytes |
 | `tell` | `recipient`, `text` |
@@ -111,7 +112,10 @@ Unknown instance ID is null. Inventory includes local prediction and does not pr
 
 `GET /v2/player/events?after=SESSION:CURSOR&wait=5` long-polls for at most 5 seconds. Use the
 state's `event_cursor` verbatim. Gaps are explicit; reread state and outstanding commands after one.
-Received game events carry packet provenance; outbound local messages are not receipt evidence.
+Received chat (including NPC say) carries packet provenance; other game events are labeled client events.
+Outbound local messages are not receipt evidence. Received spawn class is exposed as nullable `class_id`.
+Automatic corpse looting and automatic zone-line requests are disabled for CPU sessions.
+Only explicit `loot` requests begin looting, including for the character's own kills.
 
 ## Limits
 

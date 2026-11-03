@@ -55,6 +55,9 @@ pub enum Operation {
         recipient: String,
         text: String,
     },
+    Loot {
+        entity_id: u16,
+    },
     MerchantOpen {
         entity_id: u16,
     },
@@ -181,6 +184,7 @@ struct Entry {
     // Preserve the JSON numbers before f32 conversion when checking changed retries.
     identity: Value,
     receipt: CommandReceipt,
+    dispatched: bool,
 }
 
 struct Journal {
@@ -335,6 +339,17 @@ impl Control {
             .collect()
     }
 
+    /// Queue admission has no packet-send evidence, but cancellation can no longer promise refusal.
+    pub fn mark_dispatched(&self, id: &str) -> Result<(), String> {
+        let mut journal = self.shared.journal.lock().unwrap();
+        let entry = journal.entries.get_mut(id).ok_or("unknown command id")?;
+        if entry.receipt.status != CommandStatus::Accepted {
+            return Err("command no longer accepted".into());
+        }
+        entry.dispatched = true;
+        Ok(())
+    }
+
     /// Outcomes come only from the host's actual local or server observations.
     /// `sent`, `applied_local`, and `confirmed` require an evidence object with a kind.
     pub fn publish_outcome(
@@ -384,7 +399,9 @@ impl Control {
             CommandStatus::AppliedLocal => {
                 matches!(status, CommandStatus::Confirmed | CommandStatus::Unknown)
             }
-            CommandStatus::Unknown => status == CommandStatus::Confirmed,
+            CommandStatus::Unknown => {
+                matches!(status, CommandStatus::Confirmed | CommandStatus::Refused)
+            }
             CommandStatus::Confirmed | CommandStatus::Refused => false,
         };
         if !allowed {
@@ -438,7 +455,11 @@ impl Control {
         for entry in journal.entries.values_mut() {
             if entry.receipt.status.busy() || entry.receipt.status == CommandStatus::AppliedLocal {
                 entry.receipt.status = if entry.receipt.status == CommandStatus::Accepted {
-                    CommandStatus::Refused
+                    if entry.dispatched {
+                        CommandStatus::Unknown
+                    } else {
+                        CommandStatus::Refused
+                    }
                 } else {
                     CommandStatus::Unknown
                 };
@@ -557,6 +578,7 @@ impl Control {
         journal.entries.insert(
             id,
             Entry {
+                dispatched: false,
                 request,
                 identity,
                 receipt: receipt.clone(),

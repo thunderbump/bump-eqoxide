@@ -28,7 +28,7 @@ impl CommandState {
     pub fn take_chat_send(&self) -> Vec<ChatSend> {
         let mut queue = self.chat.chat_send.lock().unwrap();
         let result = std::mem::take(&mut *queue);
-        self.actions.drain(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize);
+        if !self.actions.drain(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize) { return Vec::new(); }
         result
     }
 }

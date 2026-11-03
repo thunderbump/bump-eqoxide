@@ -572,3 +572,30 @@ async fn simultaneous_same_id_admission_enqueues_once() {
     assert_eq!(codes, vec![200, 202]);
     assert_eq!(control.drain_actions().len(), 1);
 }
+
+#[tokio::test]
+async fn fence_after_dispatch_is_unknown_and_accepts_a_late_server_receipt() {
+    let control = control(8, 16);
+    let body = request(json!({"kind":"buy","slot":1,"quantity":1}));
+    let (_, receipt) = authorized(&control, "PUT", "/v2/player/commands/buy-1", Some(body)).await;
+    assert_eq!(receipt["status"], "accepted");
+    control.drain_actions();
+    control.mark_dispatched("buy-1").unwrap();
+    control.set_ready(false);
+    assert_eq!(
+        control.command("buy-1").unwrap().status,
+        CommandStatus::Unknown
+    );
+    control
+        .publish_outcome(
+            "buy-1",
+            CommandStatus::Confirmed,
+            None,
+            Some(json!({"kind":"server_buy_receipt"})),
+        )
+        .unwrap();
+    assert_eq!(
+        control.command("buy-1").unwrap().status,
+        CommandStatus::Confirmed
+    );
+}
