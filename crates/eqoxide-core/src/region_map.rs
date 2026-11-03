@@ -26,7 +26,8 @@ const REGION_ZONE_LINE: i32 = 3;
 // Tree validation and query traversal have independent bounds: test fixtures bypass loading.
 const MAX_REGION_NODES: usize = 1_000_000;
 const MAX_REGION_DEPTH: usize = 256;
-const MAX_REGION_TRAVERSAL_WORK: usize = 1_000_000;
+// Qeynos2 v1 needs 3,890,421 units for its complete zone-line interior search.
+const MAX_REGION_TRAVERSAL_WORK: usize = 16_000_000;
 
 struct TraversalBudget {
     remaining: usize,
@@ -566,8 +567,8 @@ impl RegionMap {
     /// Walks the BSP once (O(nodes)), carrying an AABB tightened by each axis-aligned split plane
     /// (oblique planes are left as a superset), then grid-samples inside each zone-line leaf's AABB
     /// and validates every candidate with `zone_line_at`, so a slightly loose AABB can never yield a
-    /// wrong point — only fail to find one (logged). Sample count per leaf is capped, so the whole
-    /// pass shares a total budget of 1,000,000 node visits, projection constraints and samples.
+    /// wrong point — only fail to find one (logged). The entire pass shares a total budget of
+    /// 16,000,000 node visits, projection constraints and samples.
     /// On budget exhaustion it returns no points, rather than a partial enumeration.
     pub fn zone_line_region_points(&self, bounds: (f32, f32, f32, f32, f32, f32)) -> Vec<(i32, [f32; 3])> {
         let mut budget = TraversalBudget::new(MAX_REGION_TRAVERSAL_WORK);
@@ -762,7 +763,7 @@ impl RegionMap {
     /// correctness — the same argument as `zone_line_region_points`. Returns
     /// `(east:[min,max], north:[min,max], z:[min,max])` per water leaf. `bounds` =
     /// `(min_e, max_e, min_n, max_n, zmin, zmax)` (server coords), same shape as
-    /// `zone_line_region_points`. Shares a total 1,000,000-visit budget across both branches,
+    /// `zone_line_region_points`. Shares a total 16,000,000-visit budget across both branches,
     /// including fixture graphs which bypass loader validation. Exhaustion returns no boxes.
     pub fn water_region_aabbs(&self, bounds: (f32, f32, f32, f32, f32, f32)) -> Vec<([f32; 2], [f32; 2], [f32; 2])> {
         let mut budget = TraversalBudget::new(MAX_REGION_TRAVERSAL_WORK);

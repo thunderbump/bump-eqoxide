@@ -410,7 +410,6 @@ mod tests {
 
 #[cfg(test)]
 mod zone_fence_tests {
-    use super::*;
     #[tokio::test]
     async fn stale_target_inventory_chat_and_awaited_buy_do_not_leave_their_mailboxes() {
         let command=crate::CommandState::default();let tracker=command.actions();
