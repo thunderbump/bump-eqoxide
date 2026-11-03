@@ -383,6 +383,7 @@ impl Host {
                     self.outcome(&id, Status::Refused, Some("network_mailbox_busy"), None);
                     return;
                 }
+                self.action_ids.insert(context.id(), (id.clone(), false));
                 let control = self.control.clone();
                 tokio::spawn(async move {
                     complete_await(control, id, rx, "server_merchant_open", None).await;
@@ -415,6 +416,9 @@ impl Host {
                     self.outcome(&id, Status::Refused, Some("network_mailbox_busy"), None);
                     return;
                 }
+                // Keep correlation after the HTTP-style wait expires: a later pre-send refusal
+                // still proves the transaction did not happen and must release admission.
+                self.action_ids.insert(context.id(), (id.clone(), true));
                 let control = self.control.clone();
                 let uncertain = self.transaction_uncertain.clone();
                 uncertain.store(true, Ordering::Release);
@@ -1141,5 +1145,55 @@ mod execution_claim_tests {
         .await;
         assert!(!host.transaction_uncertain.load(Ordering::Acquire));
         assert_eq!(host.control.command("buy").unwrap().status, Status::Refused);
+    }
+}
+
+#[cfg(test)]
+mod delayed_awaited_refusal_tests {
+    use super::*;
+    use tower::ServiceExt;
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_after_the_receipt_deadline_reconciles_the_same_id() {
+        let mut host = super::tests::host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        host.control.router().oneshot(axum::http::Request::builder().method("PUT")
+            .uri("/v2/player/commands/late-buy").header("authorization","Bearer test-credential")
+            .header("content-type","application/json").body(axum::body::Body::from(json!({
+                "session":"test-session","zone_epoch":1,"operation":{"kind":"buy","slot":1,"quantity":1}}).to_string())).unwrap()).await.unwrap();
+        host.control.drain_actions();
+        host.control.mark_dispatched("late-buy").unwrap();
+        let tracker = host.command.actions();
+        let context = tracker.begin_for_zone("buy", 1);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            context
+                .scope(async { host.command.request_buy_await(7, 1, tx) })
+                .await
+        );
+        host.action_ids
+            .insert(context.id(), ("late-buy".into(), true));
+        host.transaction_uncertain.store(true, Ordering::Release);
+        // Tokio advances eight seconds without a reply, just like a long zone handshake.
+        complete_await(
+            host.control.clone(),
+            "late-buy".into(),
+            rx,
+            "server_buy_receipt",
+            Some(host.transaction_uncertain.clone()),
+        )
+        .await;
+        assert_eq!(
+            host.control.command("late-buy").unwrap().status,
+            Status::Unknown
+        );
+        tracker.set_zone_epoch(2);
+        assert!(host.command.take_buy_await().is_none());
+        host.update_knowledge(&GameState::new());
+        assert!(!host.transaction_uncertain.load(Ordering::Acquire));
+        assert_eq!(
+            host.control.command("late-buy").unwrap().status,
+            Status::Refused
+        );
     }
 }

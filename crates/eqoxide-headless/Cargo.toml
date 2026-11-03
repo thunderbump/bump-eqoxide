@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }
