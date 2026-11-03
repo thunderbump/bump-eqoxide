@@ -1697,7 +1697,14 @@ pub type OpenAwaitReq = Arc<Mutex<Option<(u32,
 /// client down cleanly (no linkdead) once the server's ~29s camp timer has elapsed. See
 /// `gameplay::camp_apply`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CampCmd { Start, Toggle }
+pub enum CampCmd { Start, Toggle, StartInZone(u64) }
+impl CampCmd {
+    /// Resolve a scoped CPU request only in the zone where it was admitted.
+    pub fn for_epoch(self,epoch:u64)->Option<Self> {
+        match self {Self::StartInZone(expected) if expected==epoch=>Some(Self::Start),
+            Self::StartInZone(_)=>None,cmd=>Some(cmd)}
+    }
+}
 pub type CampReq = Arc<Mutex<Option<CampCmd>>>;
 /// Set true by POST /v1/lifecycle/respawn to release a held-dead character back to its bind point
 /// (the client no longer auto-respawns — it holds the character slain until asked). (#284)

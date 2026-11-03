@@ -183,8 +183,9 @@ See [`docs/http-api.md`](docs/http-api.md) for the full endpoint reference and
 
 ## Bump evaluation
 
-This fork is preparing a CPU-only headless runtime using the existing network and HTTP crates.
-The shipped application still requires graphics. Upstream has not declared a project license;
+This fork includes a CPU-only player candidate using the existing network and HTTP crates.
+Build it with `scripts/build-headless`; see [the launch and control reference](docs/headless-player.md).
+The original `eqoxide` application still requires graphics. Upstream has not declared a project license;
 creating this fork does not resolve reuse licensing.
 
 Run the scoped library checks with `scripts/check-headless-crates`. It uses an explicitly pinned

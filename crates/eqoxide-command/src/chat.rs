@@ -19,7 +19,7 @@ impl CommandState {
     pub fn request_chat_send(&self, msg: ChatSend) {
         let mut queue = self.chat.chat_send.lock().unwrap();
         queue.push(msg);
-        self.actions.accept(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize, false, Action::ChatSend);
+        self.actions.accept_fifo(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize, Action::ChatSend);
     }
 
     // ── take_* : the MODEL (`ActionLoop::tick`'s `drain_chat`) drains this once per tick ───────────
@@ -28,8 +28,8 @@ impl CommandState {
     pub fn take_chat_send(&self) -> Vec<ChatSend> {
         let mut queue = self.chat.chat_send.lock().unwrap();
         let result = std::mem::take(&mut *queue);
-        if !self.actions.drain(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize) { return Vec::new(); }
-        result
+        let keep=self.actions.drain_fifo(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize,result.len());
+        result.into_iter().zip(keep).filter_map(|(message,keep)|keep.then_some(message)).collect()
     }
 }
 

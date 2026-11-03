@@ -220,7 +220,7 @@ pub async fn run_gameplay_phase(
         // alive (keepalives below still fire) until CAMP_DURATION elapses, then set `shutdown` so
         // the disconnect is clean (the server has set `instalog`, so no linkdead). Cancelling sends
         // a Standing `OP_SpawnAppearance`, which disables the server-side camp timer.
-        if let Some(cmd) = camp.lock().unwrap().take() {
+        if let Some(cmd) = camp.lock().unwrap().take().and_then(|cmd|cmd.for_epoch(gs.zone_epoch)) {
             let now      = std::time::Instant::now();
             let current  = *camp_until.lock().unwrap();
             let (next, action) = camp_apply(cmd, current, now, CAMP_DURATION);
@@ -1271,7 +1271,7 @@ pub fn camp_apply(
     match (cmd, current) {
         (_, None)                  => (Some(now + dur), CampAction::Started),
         (CampCmd::Toggle, Some(_)) => (None, CampAction::Cancelled),
-        (CampCmd::Start, Some(d))  => (Some(d), CampAction::NoOp),
+        (CampCmd::Start | CampCmd::StartInZone(_), Some(d))  => (Some(d), CampAction::NoOp),
     }
 }
 
@@ -3189,5 +3189,16 @@ mod shutdown_completion_tests {
         let credentials=WorldCredentials{lsid:0,ls_key:String::new(),world_host:"not-used".into(),world_port:0};
         tokio::time::timeout(Duration::from_secs(2),run_gameplay_phase(stream,rx,GameState::new(),"Synthetic".into(),
             ActionLoop::new(slots),credentials,lifecycle)).await.expect("host must observe logout completion");
+    }
+}
+
+#[cfg(test)]
+mod scoped_camp_tests {
+    #[test]
+    fn camp_cannot_cross_its_admission_epoch() {
+        use eqoxide_ipc::CampCmd;
+        assert!(CampCmd::StartInZone(1).for_epoch(2).is_none());
+        assert_eq!(CampCmd::StartInZone(2).for_epoch(2),Some(CampCmd::Start));
+        assert_eq!(CampCmd::Start.for_epoch(2),Some(CampCmd::Start));
     }
 }

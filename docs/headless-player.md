@@ -113,7 +113,9 @@ Unknown instance ID is null. Inventory includes local prediction and does not pr
 `GET /v2/player/events?after=SESSION:CURSOR&wait=5` long-polls for at most 5 seconds. Use the
 state's `event_cursor` verbatim. Gaps are explicit; reread state and outstanding commands after one.
 Received chat (including NPC say) carries packet provenance; other game events are labeled client events.
-Outbound local messages are not receipt evidence. Received spawn class is exposed as nullable `class_id`.
+Outbound local messages are not receipt evidence. `received_self_echo` records a server-returned
+self message with channel/sender/text and `recipient_delivery_confirmed:false`; it does not confirm
+delivery to another player. Legacy self-echo filtering remains unchanged. Received spawn class is exposed as nullable `class_id`.
 Automatic corpse looting and automatic zone-line requests are disabled for CPU sessions.
 Only explicit `loot` requests begin looting, including for the character's own kills.
 

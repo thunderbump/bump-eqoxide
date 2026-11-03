@@ -540,6 +540,12 @@ pub struct ChatLogEvent {
     pub text:     String,
 }
 
+/// A server-returned message from this player, distinct from recipient delivery.
+#[derive(Debug,Clone,PartialEq)]
+pub struct ReceivedSelfEcho {
+    pub id:u64, pub channel:u32, pub sender:String, pub text:String, pub truncated:bool,
+}
+
 /// One member of the player's current group (from OP_GroupUpdateB/OP_GroupUpdate/
 /// OP_GroupLeaderChange). `tank`/`assist`/`puller` are read-only role badges the server pushes —
 /// eqoxide does not expose a way to set them (v1 scope).
@@ -1501,6 +1507,7 @@ pub struct GameState {
 
     // Inter-agent chat events (tells/ooc/shout/group/gmsay) for the GET /events feed.
     pub chat_events:  VecDeque<ChatLogEvent>,
+    pub received_self_echoes: VecDeque<ReceivedSelfEcho>,
     pub next_chat_id: u64,
 
     // UCS (chat server) connection params from OP_SetChatServer; Some once received at zone-in.
@@ -1960,6 +1967,14 @@ impl GameState {
     /// Record an async event onto the `/v1/events/*` feed. `category` is the top-level bucket
     /// (chat/combat/navigate/system); `kind` the sub-type; `from` the originator ("" / "system" for
     /// non-player events); `directed` whether it concerns us specifically.
+    /// Keep a bounded received echo journal without changing legacy chat/self-echo filtering.
+    pub fn record_self_echo(&mut self,channel:u32,sender:&str,text:&str) {
+        let id=self.received_self_echoes.back().map_or(1,|e|e.id.checked_add(1).expect("echo id exhausted"));
+        if self.received_self_echoes.len()>=32 {self.received_self_echoes.pop_front();}
+        self.received_self_echoes.push_back(ReceivedSelfEcho {id,channel,sender:sender.chars().take(64).collect(),
+            text:text.chars().take(512).collect(),truncated:sender.chars().count()>64 || text.chars().count()>512});
+    }
+
     pub fn push_event(&mut self, category: &str, kind: &str, from: &str, directed: bool, text: &str) {
         // Ids are 1-based: the events endpoint filters `id > since` with `since=0` as the default
         // "haven't seen anything" cursor, so a 0-id first event would be permanently invisible.
@@ -4420,7 +4435,7 @@ pub(crate) mod tests {
             inventory: _, inventory_received: _, trade_ack_ready: _,
             tasks: _, completed_task_history: _,
             // Logs, feeds and session plumbing.
-            messages: _, chat_events: _, next_chat_id: _, last_book_text: _, ucs: _,
+            messages: _, chat_events: _, received_self_echoes: _, next_chat_id: _, last_book_text: _, ucs: _,
             // #925: `client_relocations` counts client-side body relocations for the life of the
             // session, exactly like `server_corrections` beside it. (The `last_relocation` detail it
             // pairs with IS zone-scoped — see the ZONE-SCOPED group above.)

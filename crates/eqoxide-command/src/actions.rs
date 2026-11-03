@@ -1,4 +1,4 @@
-use std::{collections::HashMap, future::Future, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
+use std::{collections::{HashMap, HashSet, VecDeque}, future::Future, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
 
 use tokio::time::Instant;
 
@@ -69,6 +69,7 @@ struct State {
     next: u64,
     zone_epoch: u64,
     fences: HashMap<usize, (u64, u64)>,
+    fifo_fences: HashMap<usize, VecDeque<Option<(u64,u64)>>>,
     pending: HashMap<u64, Pending>,
     queued: HashMap<usize, Vec<u64>>,
     names: HashMap<usize, Action>,
@@ -118,19 +119,44 @@ impl ActionTracker {
         for id in ids { self.finish(id, "unconfirmed", "outcome_timeout"); }
     }
     pub(crate) fn accept(&self, key: usize, awaited: bool, name: Action) {
-        let _ = CONTEXT.try_with(|context| {
-            if !Arc::ptr_eq(&self.0, &context.tracker.0) { return; }
-            let mut state = self.0.lock().unwrap();
-            state.names.insert(key, name);
-            if let Some(p) = state.pending.get_mut(&context.id) {
-                p.accepted = true;
-                p.deadline = Instant::now() + Duration::from_secs(30);
-                context.accepted.store(true, Ordering::Release);
-                let epoch = p.zone_epoch;
-                if let Some(epoch) = epoch { state.fences.insert(key, (epoch, context.id)); }
-                if !awaited { state.queued.entry(key).or_default().push(context.id); }
+        self.accept_mode(key,awaited,name,false);
+    }
+    pub(crate) fn accept_fifo(&self, key: usize, name: Action) {
+        self.accept_mode(key,false,name,true);
+    }
+    fn accept_mode(&self,key:usize,awaited:bool,name:Action,fifo:bool) {
+        let context = CONTEXT.try_with(Clone::clone).ok().filter(|c|Arc::ptr_eq(&self.0,&c.tracker.0));
+        let mut state=self.0.lock().unwrap();
+        let mut fence=None;
+        if let Some(context)=context {
+            state.names.insert(key,name);
+            if let Some(p)=state.pending.get_mut(&context.id) {
+                p.accepted=true;p.deadline=Instant::now()+Duration::from_secs(30);
+                context.accepted.store(true,Ordering::Release);
+                fence=p.zone_epoch.map(|epoch|(epoch,context.id));
+                if !awaited {state.queued.entry(key).or_default().push(context.id);}
             }
-        });
+        }
+        if fifo {state.fifo_fences.entry(key).or_default().push_back(fence);}
+        else if let Some(fence)=fence {state.fences.insert(key,fence);}
+    }
+    /// FIFO metadata has one entry per payload, including unscoped graphical messages.
+    pub(crate) fn drain_fifo(&self,key:usize,len:usize)->Vec<bool> {
+        let mut state=self.0.lock().unwrap();
+        let mut fences=state.fifo_fences.remove(&key).unwrap_or_default();
+        let mut stale=HashSet::new();
+        let keep=(0..len).map(|_| {
+            match fences.pop_front().flatten() {
+                Some((epoch,id)) if epoch!=state.zone_epoch=>{stale.insert(id);false},
+                _=>true,
+            }
+        }).collect();
+        if let Some(ids)=state.queued.remove(&key) {
+            state.drained.entry(key).or_default().extend(ids.into_iter().filter(|id|!stale.contains(id)));
+        }
+        drop(state);
+        for id in stale {self.finish(id,"refused","stale_zone_epoch_before_dispatch");}
+        keep
     }
     pub(crate) fn drain(&self, key: usize) -> bool {
         let mut state = self.0.lock().unwrap();
@@ -406,5 +432,20 @@ mod zone_fence_tests {
         let current=tracker.begin_for_zone("target",2);
         assert!(current.scope(async {command.request_target(7)}).await);
         assert_eq!(command.take_target(),Some(7));
+    }
+}
+
+#[cfg(test)]
+mod mixed_fifo_epoch_tests {
+    #[tokio::test]
+    async fn a_new_chat_cannot_authorize_a_departed_zones_message() {
+        let command=crate::CommandState::default();let tracker=command.actions();
+        for (epoch,text) in [(1,"stale"),(2,"current")] {
+            let context=tracker.begin_for_zone("tell",epoch);
+            context.scope(async {command.request_chat_send(eqoxide_ipc::ChatSend{chan:7,to:"Other".into(),text:text.into()})}).await;
+        }
+        tracker.set_zone_epoch(2);
+        let messages=command.take_chat_send();assert_eq!(messages.len(),1);assert_eq!(messages[0].text,"current");
+        let events=tracker.take_events();assert_eq!(events.len(),1);assert_eq!(events[0].result,"refused");
     }
 }

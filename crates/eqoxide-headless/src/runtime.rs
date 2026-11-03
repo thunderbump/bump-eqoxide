@@ -123,13 +123,14 @@ struct Host {
     heading: f32,
     motion: Option<Motion>,
     attack_until: Option<Instant>,
-    action_ids: HashMap<u64, String>,
+    action_ids: HashMap<u64, (String, bool)>,
     transaction_uncertain: Arc<AtomicBool>,
     inventory_revision: u64,
     merchant_revision: u64,
     inventory_value: Value,
     merchant_value: Value,
     last_event: u64,
+    last_echo: u64,
 }
 impl Host {
     fn outcome(&self, id: &str, status: Status, reason: Option<&str>, evidence: Option<Value>) {
@@ -234,17 +235,28 @@ impl Host {
         if let Some(event) = gs.chat_events.back() {
             self.last_event = event.id;
         }
+        for echo in gs
+            .received_self_echoes
+            .iter()
+            .filter(|echo| echo.id > self.last_echo)
+        {
+            self.control.publish_event(json!({"kind":"received_self_echo","source":"received_packet",
+                "channel":echo.channel,"sender":echo.sender,"text":echo.text,"truncated":echo.truncated,
+                "recipient_delivery_confirmed":false}));
+        }
+        if let Some(echo) = gs.received_self_echoes.back() {
+            self.last_echo = echo.id;
+        }
         for event in self.command.actions().take_events() {
-            if let Some(id) = self.action_ids.remove(&event.id) {
+            if let Some((id, transaction)) = self.action_ids.remove(&event.id) {
                 let status = match event.result.as_str() {
                     "confirmed" => Status::Confirmed,
                     "refused" => Status::Refused,
                     _ => Status::Unknown,
                 };
-                if status == Status::Unknown
-                    && (event.kind.contains("sell") || event.kind.contains("inventory"))
-                {
-                    self.transaction_uncertain.store(true, Ordering::Release);
+                if transaction {
+                    self.transaction_uncertain
+                        .store(status == Status::Unknown, Ordering::Release);
                 }
                 let evidence = (status==Status::Confirmed).then(||json!({"kind":"server_action_receipt","action":event.kind,"detail":event.reason}));
                 self.outcome(&id, status, Some(&event.reason), evidence);
@@ -496,7 +508,8 @@ impl Host {
                             }
                             Operation::Camp => {
                                 self.halt("camp");
-                                self.command.request_camp(ipc::CampCmd::Start);
+                                self.command
+                                    .request_camp(ipc::CampCmd::StartInZone(self.epoch));
                                 true
                             }
                             _ => false,
@@ -508,7 +521,7 @@ impl Host {
                     if transaction {
                         self.transaction_uncertain.store(true, Ordering::Release);
                     }
-                    self.action_ids.insert(context.id(), id);
+                    self.action_ids.insert(context.id(), (id, transaction));
                 } else {
                     tracker.discard(context.id());
                     self.outcome(
@@ -632,6 +645,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         inventory_value: Value::Null,
         merchant_value: Value::Null,
         last_event: 0,
+        last_echo: 0,
     };
     let (net_tx, mut net) = tokio::sync::oneshot::channel();
     let config = profile.login_config();
@@ -842,6 +856,7 @@ mod tests {
             inventory_value: Value::Null,
             merchant_value: Value::Null,
             last_event: 0,
+            last_echo: 0,
         }
     }
     fn floor() -> Collision {
@@ -970,6 +985,7 @@ mod transaction_admission_tests {
             inventory_value: Value::Null,
             merchant_value: Value::Null,
             last_event: 0,
+            last_echo: 0,
         };
         let mut gs = GameState::new();
         gs.inventory_received = true;
@@ -1002,5 +1018,20 @@ mod transaction_admission_tests {
             .await;
             assert!(!host.transaction_uncertain.load(Ordering::Acquire));
         }
+        // A command accepted into a mailbox can still be definitively rejected before send.
+        let tracker = host.command.actions();
+        let context = tracker.begin_for_zone("inventory", 1);
+        assert!(
+            context
+                .scope(async { host.command.request_inventory_move(23, 24) })
+                .await
+        );
+        host.action_ids
+            .insert(context.id(), ("queued-tx".into(), true));
+        host.transaction_uncertain.store(true, Ordering::Release);
+        tracker.set_zone_epoch(2);
+        assert!(host.command.take_inventory_move().is_none());
+        host.update_knowledge(&gs);
+        assert!(!host.transaction_uncertain.load(Ordering::Acquire));
     }
 }

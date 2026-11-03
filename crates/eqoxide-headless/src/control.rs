@@ -559,7 +559,11 @@ impl Control {
                             | (Operation::AttackOff, Operation::Attack { .. })
                     );
                     if cancel && entry.receipt.status == CommandStatus::Accepted {
-                        entry.receipt.status = CommandStatus::Refused;
+                        entry.receipt.status = if entry.dispatched {
+                            CommandStatus::Unknown
+                        } else {
+                            CommandStatus::Refused
+                        };
                         entry.receipt.reason = Some("superseded_by_safety_command".into());
                         superseded.push(entry.receipt.clone());
                     }

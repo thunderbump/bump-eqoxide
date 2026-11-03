@@ -2297,6 +2297,7 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         && !sender.is_empty()
         && sender.eq_ignore_ascii_case(&gs.player_name);
     if is_self_echo {
+        gs.record_self_echo(chan_num,&sender,&msg);
         tracing::debug!("chat: dropped self-echo from server (chan {chan_num}): {msg}");
         return;
     }
@@ -9307,5 +9308,21 @@ mod explicit_loot_policy_tests {
         let mut death=vec![0;32];death[0..4].copy_from_slice(&42u32.to_le_bytes());death[4..8].copy_from_slice(&1u32.to_le_bytes());
         apply_death(&mut gs,&death);
         assert!(gs.world.entities[&42].dead);assert!(gs.pending_loot.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod received_self_echo_tests {
+    use super::*;
+    #[test]
+    fn actual_inbound_echo_is_retained_separately_from_chat_delivery() {
+        let mut gs=GameState::new();gs.player_name="Tester".into();
+        let mut payload=b"Tester\0Tester\0".to_vec();
+        payload.extend_from_slice(&[0;8]);payload.extend_from_slice(&7u32.to_le_bytes());payload.extend_from_slice(&[0;9]);
+        payload.extend_from_slice(b"exact-server-nonce\0");
+        apply_channel_message(&mut gs,&payload);
+        assert!(gs.chat_events.is_empty());assert!(gs.messages.is_empty());
+        let echo=gs.received_self_echoes.back().unwrap();assert_eq!(echo.channel,7);
+        assert_eq!(echo.sender,"Tester");assert_eq!(echo.text,"exact-server-nonce");
     }
 }

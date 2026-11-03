@@ -599,3 +599,28 @@ async fn fence_after_dispatch_is_unknown_and_accepts_a_late_server_receipt() {
         CommandStatus::Confirmed
     );
 }
+
+#[tokio::test]
+async fn safety_supersession_does_not_promise_a_dispatched_attack_was_refused() {
+    let control = control(8, 16);
+    authorized(
+        &control,
+        "PUT",
+        "/v2/player/commands/attack",
+        Some(request(json!({"kind":"attack","lease_ms":1000}))),
+    )
+    .await;
+    control.drain_actions();
+    control.mark_dispatched("attack").unwrap();
+    authorized(
+        &control,
+        "PUT",
+        "/v2/player/commands/off",
+        Some(request(json!({"kind":"attack_off"}))),
+    )
+    .await;
+    assert_eq!(
+        control.command("attack").unwrap().status,
+        CommandStatus::Unknown
+    );
+}
