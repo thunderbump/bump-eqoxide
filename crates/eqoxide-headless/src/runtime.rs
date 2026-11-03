@@ -281,6 +281,11 @@ impl Host {
             );
             return;
         }
+        // Claim under the journal lock before any side effect. A priority command may have
+        // superseded this drained entry while the host was waiting to dispatch it.
+        if self.control.mark_dispatched(&id).is_err() {
+            return;
+        }
         let operation = req.operation;
         if matches!(
             operation,
@@ -378,7 +383,6 @@ impl Host {
                     self.outcome(&id, Status::Refused, Some("network_mailbox_busy"), None);
                     return;
                 }
-                let _ = self.control.mark_dispatched(&id);
                 let control = self.control.clone();
                 tokio::spawn(async move {
                     complete_await(control, id, rx, "server_merchant_open", None).await;
@@ -412,7 +416,6 @@ impl Host {
                     return;
                 }
                 let control = self.control.clone();
-                let _ = self.control.mark_dispatched(&id);
                 let uncertain = self.transaction_uncertain.clone();
                 uncertain.store(true, Ordering::Release);
                 tokio::spawn(async move {
@@ -517,7 +520,6 @@ impl Host {
                     })
                     .await;
                 if accepted && context.accepted() {
-                    let _ = self.control.mark_dispatched(&id);
                     if transaction {
                         self.transaction_uncertain.store(true, Ordering::Release);
                     }
@@ -836,7 +838,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
 mod tests {
     use super::*;
     use eqoxide_zone_geometry::collision::ServerTriangle;
-    fn host() -> Host {
+    pub(super) fn host() -> Host {
         let wiring = Wiring::new(std::path::PathBuf::from("/unused"));
         Host {
             control: Control::new("test-session".into(), "test-credential".into(), 16, 32).unwrap(),
@@ -989,7 +991,11 @@ mod transaction_admission_tests {
         };
         let mut gs = GameState::new();
         gs.inventory_received = true;
-        for operation in [
+        host.control
+            .publish_state(1, json!({"phase":"ready"}))
+            .unwrap();
+        host.control.set_ready(true);
+        for (index, operation) in [
             Operation::Sell {
                 slot: 23,
                 quantity: 1,
@@ -999,23 +1005,40 @@ mod transaction_admission_tests {
                 to_slot: 24,
                 quantity: 1,
             },
-        ] {
-            host.dispatch(
-                AdmittedCommand {
-                    id: "rejected".into(),
-                    request: crate::control::CommandRequest {
-                        session: "s".into(),
-                        zone_epoch: 1,
-                        inventory_revision: Some(0),
-                        merchant_revision: Some(0),
-                        operation,
-                    },
-                },
-                &gs,
-                true,
-                Instant::now(),
-            )
-            .await;
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            use tower::ServiceExt;
+            let id = format!("rejected-{index}");
+            let request = crate::control::CommandRequest {
+                session: "s".into(),
+                zone_epoch: 1,
+                inventory_revision: Some(0),
+                merchant_revision: Some(0),
+                operation: operation.clone(),
+            };
+            host.control
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri(format!("/v2/player/commands/{id}"))
+                        .header("authorization", "Bearer credential")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::to_vec(&request).unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let admitted = host
+                .control
+                .drain_actions()
+                .pop()
+                .expect("admitted test transaction");
+            host.dispatch(admitted, &gs, true, Instant::now()).await;
             assert!(!host.transaction_uncertain.load(Ordering::Acquire));
         }
         // A command accepted into a mailbox can still be definitively rejected before send.
@@ -1033,5 +1056,90 @@ mod transaction_admission_tests {
         assert!(host.command.take_inventory_move().is_none());
         host.update_knowledge(&gs);
         assert!(!host.transaction_uncertain.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod execution_claim_tests {
+    use super::*;
+    use tower::ServiceExt;
+    async fn put(control: &Control, id: &str, operation: Value) {
+        control
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v2/player/commands/{id}"))
+                    .header("authorization", "Bearer test-credential")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                "session":"test-session","zone_epoch":1,"operation":operation})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn superseded_drained_attack_never_enters_network_mailbox() {
+        let mut host = super::tests::host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(
+            &host.control,
+            "attack",
+            json!({"kind":"attack","lease_ms":1000}),
+        )
+        .await;
+        let attack = host.control.drain_actions().pop().unwrap();
+        put(&host.control, "off", json!({"kind":"attack_off"})).await;
+        let mut gs = GameState::new();
+        gs.target_id = Some(7);
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(
+            7, "rat", 0.0, 0.0, 0.0, true,
+        ));
+        host.dispatch(attack, &gs, true, Instant::now()).await;
+        assert!(host.combat.attack.lock().unwrap().is_none());
+        assert_eq!(
+            host.control.command("attack").unwrap().status,
+            Status::Refused
+        );
+    }
+    #[tokio::test]
+    async fn stale_awaited_buy_returns_definite_refusal_and_releases_transaction_latch() {
+        let host = super::tests::host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(
+            &host.control,
+            "buy",
+            json!({"kind":"buy","slot":1,"quantity":1}),
+        )
+        .await;
+        host.control.drain_actions();
+        host.control.mark_dispatched("buy").unwrap();
+        let tracker = host.command.actions();
+        let context = tracker.begin_for_zone("buy", 1);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            context
+                .scope(async { host.command.request_buy_await(7, 1, tx) })
+                .await
+        );
+        host.transaction_uncertain.store(true, Ordering::Release);
+        tracker.set_zone_epoch(2);
+        assert!(host.command.take_buy_await().is_none());
+        complete_await(
+            host.control.clone(),
+            "buy".into(),
+            rx,
+            "server_buy_receipt",
+            Some(host.transaction_uncertain.clone()),
+        )
+        .await;
+        assert!(!host.transaction_uncertain.load(Ordering::Acquire));
+        assert_eq!(host.control.command("buy").unwrap().status, Status::Refused);
     }
 }

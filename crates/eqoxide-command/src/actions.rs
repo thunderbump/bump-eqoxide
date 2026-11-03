@@ -215,10 +215,16 @@ impl crate::CommandState {
         true
     }
     pub(crate) fn dequeue<T>(&self, slot: &Mutex<Option<T>>) -> Option<T> {
-        let mut value = slot.lock().unwrap();
-        let result = value.take();
-        if result.is_some() && !self.actions.drain(slot as *const _ as usize) { return None; }
-        result
+        self.dequeue_checked(slot).ok().flatten()
+    }
+    /// Return a rejected payload to awaited domains so they can answer the caller explicitly.
+    pub(crate) fn dequeue_checked<T>(&self, slot: &Mutex<Option<T>>) -> Result<Option<T>,T> {
+        let mut value=slot.lock().unwrap();
+        let result=value.take();
+        if result.is_some() && !self.actions.drain(slot as *const _ as usize) {
+            return Err(result.unwrap());
+        }
+        Ok(result)
     }
 }
 
@@ -425,7 +431,7 @@ mod zone_fence_tests {
         tracker.set_zone_epoch(2);
         assert!(command.take_target().is_none());assert!(command.take_inventory_move().is_none());
         assert!(command.take_chat_send().is_empty());assert!(command.take_buy_await().is_none());
-        assert!(matches!(rx.try_recv(),Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
+        assert!(matches!(rx.try_recv(),Ok(eqoxide_ipc::CommandResult::Refused(reason)) if reason=="stale_zone_epoch_before_dispatch"));
         let events=tracker.take_events();assert_eq!(events.len(),4);
         assert!(events.iter().all(|e| e.result=="refused" && e.reason=="stale_zone_epoch_before_dispatch"));
         let current=tracker.begin_for_zone("target",2);

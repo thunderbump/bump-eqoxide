@@ -339,7 +339,7 @@ impl Control {
             .collect()
     }
 
-    /// Queue admission has no packet-send evidence, but cancellation can no longer promise refusal.
+    /// Atomically claim execution before side effects. This supplies no packet-send evidence.
     pub fn mark_dispatched(&self, id: &str) -> Result<(), String> {
         let mut journal = self.shared.journal.lock().unwrap();
         let entry = journal.entries.get_mut(id).ok_or("unknown command id")?;

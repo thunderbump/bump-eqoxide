@@ -2332,6 +2332,8 @@ impl ControllerSlots {
     /// reaching the new zone's `last_relocation` on the first net tick.
     pub fn begin_zone_in(&self, gs: &mut eqoxide_core::game_state::GameState) {
         gs.begin_zone_in();
+        // The sole network writer clears departed-zone corrections before publishing new entry.
+        self.pos_correction.lock().unwrap().take();
         let mut view = self.controller_view.lock().unwrap();
         if view.zone_epoch.is_some() { view.initialized = false; }
         view.invalidate_disclosures();
@@ -3024,3 +3026,17 @@ mod world_roster_tests_643 {
 }
 
 mod event_feed;
+
+#[cfg(test)]
+mod correction_epoch_tests {
+    #[test]
+    fn zone_entry_discards_a_departed_zone_correction_before_new_seed() {
+        let slots=super::ControllerSlots::default();
+        *slots.pos_correction.lock().unwrap()=Some([10.0,20.0,300.0]);
+        slots.controller_view.lock().unwrap().zone_epoch=Some(1);
+        let mut gs=eqoxide_core::game_state::GameState::new();gs.zone_epoch=1;
+        slots.begin_zone_in(&mut gs);
+        assert_eq!(gs.zone_epoch,2);assert!(slots.pos_correction.lock().unwrap().is_none());
+        assert!(!slots.controller_view.lock().unwrap().initialized);
+    }
+}
