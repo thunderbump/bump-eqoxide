@@ -16,6 +16,7 @@ name = "render_model"
 path = "src/bin/render_model.rs"
 
 [dependencies]
+eqoxide-physics = { path = "crates/eqoxide-physics" }
 eqoxide-core = { path = "crates/eqoxide-core" }
 eqoxide-ipc = { path = "crates/eqoxide-ipc" }
 eqoxide-assets = { path = "crates/eqoxide-assets" }
@@ -96,4 +97,4 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 
 [workspace]
-members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-zone-geometry", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-telemetry", "crates/eqoxide-http", "crates/eqoxide-net", "crates/eqoxide-renderer", "crates/eqoxide-ui", "crates/eqoxide-agent-protocol", "crates/eqoxide-agent-vision-filter", "crates/eqoxide-agent-plugin-host"]
+members = ["crates/eqoxide-physics", "crates/eqoxide-headless", "tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-zone-geometry", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-telemetry", "crates/eqoxide-http", "crates/eqoxide-net", "crates/eqoxide-renderer", "crates/eqoxide-ui", "crates/eqoxide-agent-protocol", "crates/eqoxide-agent-vision-filter", "crates/eqoxide-agent-plugin-host"]

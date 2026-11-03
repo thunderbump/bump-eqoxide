@@ -11,3 +11,5 @@ pub mod collision;
 pub mod diagnostics;
 pub mod water_grid;
 pub mod zone_assets;
+
+pub mod native_map;

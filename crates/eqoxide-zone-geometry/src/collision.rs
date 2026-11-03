@@ -12,7 +12,7 @@ use eqoxide_assets::{expand_objects, MeshData, ZoneAssets, COLLISION_MESH_TAG};
 
 /// Precomputed collision geometry for fast spatial queries against a zone.
 ///
-/// All zone triangles are flattened once into absolute GPU world space
+/// All zone triangles are flattened once into absolute server/query space
 /// `[east, north, height]` and bucketed into a uniform XY grid. Queries (floor
 /// raycast for grounding, segment raycast for camera collision and nameplate
 /// occlusion) visit only the grid cells their XY footprint overlaps instead of
@@ -30,6 +30,19 @@ pub struct Hit {
     pub t:      f32,
     pub normal: [f32; 3],
 }
+
+/// A triangle whose vertices are already `[server_x, server_y, height]`.
+/// Native maps must use this type, since the asset constructor permutes asset axes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerTriangle(pub [[f32; 3]; 3]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollisionBuildError(pub &'static str);
+
+impl std::fmt::Display for CollisionBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.0) }
+}
+impl std::error::Error for CollisionBuildError {}
 
 pub struct Collision {
     tris:      Vec<[[f32; 3]; 3]>,
@@ -77,7 +90,8 @@ pub struct Collision {
                   eqoxide_core::region_map::RegionDataAbsent>,
     /// True when the terrain triangles came from a dedicated `__collision__` mesh (SOLID +
     /// INVIS faces, PASSABLE excluded). False for legacy zones with no baked collision mesh,
-    /// where the rendered terrain is used as a fallback. Diagnostic/provenance only.
+    /// where the rendered terrain is used as a fallback. Also true for native solid-map geometry.
+    /// Diagnostic/provenance only.
     pub from_collision_mesh: bool,
     /// Precomputed `(zone_line_index, [east, north, z])` for each zone-line region, built once from
     /// the water map at `set_water` (zone load). Lets `find_zone_line_near` be an O(1) cache read
@@ -484,6 +498,63 @@ impl Collision {
             }
         }
 
+        Self::build_triangles(tris, cell_size, from_collision_mesh,
+            crate::climb::volumes_from_objects(&assets.objects))
+    }
+
+    /// Build native geometry without asset-axis conversion or winding changes.
+    /// Rejects non-finite coordinates and absolute coordinates above 1,000,000 EQ units.
+    /// Caps triangles at 2,000,000, cells at 1,000,000 and cell references at 16,000,000.
+    pub fn from_server_triangles(
+        triangles: Vec<ServerTriangle>, cell_size: f32,
+    ) -> Result<Self, CollisionBuildError> {
+        if !cell_size.is_finite() || cell_size < 1.0 {
+            return Err(CollisionBuildError("cell size must be finite and at least one"));
+        }
+        if triangles.len() > 2_000_000 {
+            return Err(CollisionBuildError("triangle limit exceeded"));
+        }
+        let mut min = [f32::MAX; 2];
+        let mut max = [f32::MIN; 2];
+        for triangle in &triangles {
+            for v in triangle.0 {
+                if v.iter().any(|x| !x.is_finite() || x.abs() > 1_000_000.0) {
+                    return Err(CollisionBuildError("invalid server coordinate"));
+                }
+                for axis in 0..2 {
+                    min[axis] = min[axis].min(v[axis]);
+                    max[axis] = max[axis].max(v[axis]);
+                }
+            }
+        }
+        if !triangles.is_empty() {
+            let cols = ((max[0] - min[0]) / cell_size).ceil() as usize + 1;
+            let rows = ((max[1] - min[1]) / cell_size).ceil() as usize + 1;
+            if cols.checked_mul(rows).is_none_or(|n| n > 1_000_000) {
+                return Err(CollisionBuildError("grid cell limit exceeded"));
+            }
+            let mut references = 0usize;
+            for triangle in &triangles {
+                let mut spans = [0usize; 2];
+                for axis in 0..2 {
+                    let lo = triangle.0.iter().map(|v| v[axis]).fold(f32::MAX, f32::min);
+                    let hi = triangle.0.iter().map(|v| v[axis]).fold(f32::MIN, f32::max);
+                    spans[axis] = ((hi - min[axis]) / cell_size) as usize
+                        - ((lo - min[axis]) / cell_size) as usize + 1;
+                }
+                references = references.checked_add(spans[0] * spans[1])
+                    .ok_or(CollisionBuildError("grid reference overflow"))?;
+                if references > 16_000_000 {
+                    return Err(CollisionBuildError("grid reference limit exceeded"));
+                }
+            }
+        }
+        Ok(Self::build_triangles(triangles.into_iter().map(|t| t.0).collect(),
+            cell_size, true, Vec::new()))
+    }
+
+    fn build_triangles(tris: Vec<[[f32; 3]; 3]>, cell_size: f32,
+        from_collision_mesh: bool, climb_volumes: Vec<crate::climb::ClimbVolume>) -> Self {
         // XY bounds (for the broad-phase grid) and Z bounds (so a column probe can span the whole
         // mesh — see `z_min`/`z_max`).
         let mut min = [f32::MAX; 2];
@@ -560,7 +631,7 @@ impl Collision {
             facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
             water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
             from_collision_mesh, zone_line_regions: Vec::new(),
-            climb_volumes: crate::climb::volumes_from_objects(&assets.objects),
+            climb_volumes,
             climb_plans: Default::default(),
             clearance: Default::default(), water_grid: None }
     }

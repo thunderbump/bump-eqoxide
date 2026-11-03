@@ -77,5 +77,5 @@ timeout --signal=TERM --kill-after=30s 900s \
   -e TMPDIR=/work/tmp -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target \
   -e CARGO_BUILD_JOBS=2 -e CARGO_BUILD_RUSTC_WRAPPER= -e RUSTFLAGS= -e CARGO_ENCODED_RUSTFLAGS= \
   "$image" cargo test "${cargo_options[@]}" \
-  -p eqoxide-protocol -p eqoxide-net -p eqoxide-http -p eqoxide-zone-geometry \
+  -p eqoxide-protocol -p eqoxide-net -p eqoxide-http -p eqoxide-zone-geometry -p eqoxide-physics -p eqoxide-headless \
   -- --test-threads=2 2>&1 | tee "$run_dir/output.log"

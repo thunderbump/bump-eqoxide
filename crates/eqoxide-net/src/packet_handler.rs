@@ -3508,6 +3508,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // model-origin datum ~3.1u above the floor. Converting here seeds the controller at
         // (approximately) the collision floor, so zone-in no longer starts with a phantom 3u fall.
         gs.player_z       = info.z - eqoxide_core::coord::WIRE_Z_OFFSET;
+        gs.player_pos_known = true; // received self spawn establishes this zone's position
         gs.player_heading = info.heading;
         gs.player_level   = info.level as u32;
         gs.player_race    = eq_race_to_code(info.race).to_string();

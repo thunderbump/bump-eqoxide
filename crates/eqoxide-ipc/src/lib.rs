@@ -93,6 +93,8 @@ pub struct MoveIntent {
 /// output (#1044 review round 1, finding D).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ControllerView {
+    /// CPU host fence; graphical publishers retain the legacy unfenced mode.
+    pub zone_epoch: Option<u64>,
     pub pos:     [f32; 3],
     pub heading: f32,
     /// False until the render thread has spawned and seeded the controller. The net streamer must
@@ -2324,6 +2326,7 @@ impl ControllerSlots {
     pub fn begin_zone_in(&self, gs: &mut eqoxide_core::game_state::GameState) {
         gs.begin_zone_in();
         let mut view = self.controller_view.lock().unwrap();
+        if view.zone_epoch.is_some() { view.initialized = false; }
         view.invalidate_disclosures();
         // #925: the relocation really happened, so it still counts — but its destination named a
         // point in the zone we just left, and `gs.begin_zone_in()` above already cleared

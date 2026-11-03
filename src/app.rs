@@ -1853,7 +1853,7 @@ impl App {
 
         {
             // EQ character run speed is ~35 EQ-units/sec; higher values trigger server rubber-band.
-            const MOVE_SPEED: f32 = 35.0;
+            const MOVE_SPEED: f32 = crate::movement::DEFAULT_MOVE_SPEED;
             // Classic EQ turn speed — about 3 full rotations per second feels right.
             const TURN_SPEED: f32 = 120.0; // degrees per second
 

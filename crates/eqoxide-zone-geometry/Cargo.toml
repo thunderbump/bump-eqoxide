@@ -19,6 +19,7 @@ test-fixtures = []
 eqoxide-core = { path = "../eqoxide-core" }
 eqoxide-assets = { path = "../eqoxide-assets" }
 tracing = "0.1"
+miniz_oxide = "0.8"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

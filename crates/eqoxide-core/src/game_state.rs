@@ -1141,6 +1141,8 @@ pub enum ServerAck {
 /// published render state, so it is intentionally not a field here.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct GameState {
+    /// Increments on every zone-server entry, including same-zone re-entry.
+    pub zone_epoch: u64,
     // Player
     pub player_id: u32,
     pub player_name: String,
@@ -1730,6 +1732,7 @@ impl GameState {
     /// what the comments on those two lines claim to achieve. This function cannot reach the view
     /// itself (`eqoxide-core` sits below `eqoxide-ipc`), so the pairing lives there.
     pub fn begin_zone_in(&mut self) {
+        self.zone_epoch = self.zone_epoch.checked_add(1).expect("zone epoch exhausted");
         self.world.entities.clear();
         self.world.doors.clear();
         // #513: the previous zone's coordinates say nothing about where we are in the new one, so
@@ -4377,7 +4380,7 @@ pub(crate) mod tests {
             // Drained by `ActionLoop::tick` every tick; a stale ack matches no held request.
             server_acks: _,
             // Identity + character sheet: the same character, in a different zone.
-            player_id: _, player_name: _, player_level: _, player_race: _, player_class: _,
+            zone_epoch: _, player_id: _, player_name: _, player_level: _, player_race: _, player_class: _,
             player_gender: _, player_face: _, player_hairstyle: _, player_haircolor: _,
             player_guild_id: _, player_guild_rank: _, stats: _, player_skills: _,
             player_equipment: _, player_equipment_tint: _, mem_spells: _,

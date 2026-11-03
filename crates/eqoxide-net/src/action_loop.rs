@@ -2604,7 +2604,7 @@ impl ActionLoop {
     fn stream_position(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         let view = *self.controller.controller_view.lock().unwrap();
         // Don't stream/mirror until the render controller has spawned (else we'd push origin).
-        if !view.initialized { return; }
+        if !view.initialized || view.zone_epoch.is_some_and(|epoch| epoch != gs.zone_epoch) { return; }
         // #724 review B1: mirror the controller's "I have stopped the body and cannot resume" state
         // alongside its position, on the same tick and under the same init gate, so `player.hold` on
         // `GET /v1/observe` is exactly as fresh as the `pos` beside it. Level-triggered — the view is
