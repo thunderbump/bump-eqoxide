@@ -1,8 +1,10 @@
 //! Take items listed by the currently opened corpse, never by a received spawn alone.
 //! RoF2 ItemPacketLoot lists corpse slots. LootingItem_Struct is a 20-byte client request;
 //! the returned OP_LootItem acknowledges it, while separate inventory packets report acquisition.
-//! Native reference: Server common/patches/rof2.cpp and rof2_structs.h@5dc093fe5,
-//! zone/corpse.cpp MakeLootRequestPackets/LootCorpseItem@5dc093fe5.
+//! Native references: eqemu:common/patches/rof2.cpp@5dc093fe5:6466 (SerializeItem),
+//! eqemu:common/patches/rof2_structs.h@5dc093fe5:2058 (LootingItem_Struct), and
+//! eqemu:zone/corpse.cpp@5dc093fe5:1403 (catalog),
+//! eqemu:zone/corpse.cpp@5dc093fe5:1420 (LootCorpseItem).
 use crate::{
     item::parse_rof2_item,
     protocol::{OP_ITEM_PACKET, OP_LOOT_ITEM},

@@ -815,7 +815,14 @@ fn apply_group_acknowledge(gs: &mut GameState, _p: &[u8]) {
 /// gs.inventory (and `/v1/observe/inventory`) and are movable via the same MoveItem path as any
 /// other slot. RoF2 bags don't nest, so one level is enough. (eqoxide#201)
 fn push_item_and_contents(out: &mut Vec<eqoxide_core::game_state::InvItem>, item: crate::item::RoF2Item) {
-    let parent_slot = item.main_slot as i32;
+    // Individual inventory packets can address an item inside a bag. Its main_slot is the
+    // container, not the acquired item's destination. Never replace that container on a subslot.
+    let parent_slot = if item.sub_slot == u16::MAX {
+        item.main_slot as i32
+    } else {
+        let Some(flat) = eqoxide_core::game_state::bag_wire_slot(item.main_slot as i32, item.sub_slot as u32) else { return };
+        flat
+    };
     let bag_contents = item.bag_contents; // move the Vec out before consuming the rest of `item`
     out.push(eqoxide_core::game_state::InvItem {
         slot:    parent_slot,
@@ -9289,5 +9296,51 @@ mod corpse_catalog_inventory_tests {
             "an actual server inventory item still applies"
         );
         assert_eq!(gs.inventory[0].slot, 23);
+    }
+}
+
+#[cfg(test)]
+mod received_bag_item_tests {
+    use super::*;
+    fn deliver(gs: &mut GameState, blob: Vec<u8>) {
+        let mut payload = 0x68u32.to_le_bytes().to_vec();
+        payload.extend(blob);
+        apply_packet(
+            gs,
+            &crate::transport::AppPacket {
+                opcode: OP_ITEM_PACKET,
+                payload,
+            },
+        );
+    }
+    #[test]
+    fn received_bag_destination_preserves_the_container() {
+        let mut gs = GameState::new();
+        deliver(&mut gs, crate::item::tests::fixture());
+        let mut inside = crate::item::tests::fixture2();
+        inside[26..28].copy_from_slice(&23u16.to_le_bytes());
+        inside[28..30].copy_from_slice(&0u16.to_le_bytes());
+        deliver(&mut gs, inside.clone());
+        deliver(&mut gs, inside);
+        assert_eq!(
+            gs.inventory.iter().find(|i| i.slot == 23).unwrap().item_id,
+            1001
+        );
+        assert_eq!(
+            gs.inventory.iter().find(|i| i.slot == 251).unwrap().item_id,
+            2002
+        );
+        assert_eq!(gs.inventory.len(), 2);
+    }
+    #[test]
+    fn unsupported_subslot_never_overwrites_the_parent() {
+        let mut gs = GameState::new();
+        deliver(&mut gs, crate::item::tests::fixture());
+        let mut invalid = crate::item::tests::fixture2();
+        invalid[26..28].copy_from_slice(&23u16.to_le_bytes());
+        invalid[28..30].copy_from_slice(&10u16.to_le_bytes());
+        deliver(&mut gs, invalid);
+        assert_eq!(gs.inventory.len(), 1);
+        assert_eq!(gs.inventory[0].item_id, 1001);
     }
 }
