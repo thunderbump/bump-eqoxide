@@ -101,8 +101,10 @@ it does not manufacture a send receipt. Buy and merchant-open confirmation comes
 server echo. Most other network commands can report `unknown` after dispatch because the protocol
 provides no correlated receipt. Local attack toggles do not prove landed melee; local chat echoes
 do not prove delivery. Sell/inventory writes block further transactions until a fresh process;
-an ambiguous buy does too. Use normal camp/save/relog to reconcile. This process provides no
-exactly-once guarantee across a crash.
+an ambiguous buy does too. A buy that exceeds the eight-second receipt wait stays blocked
+until a fresh process, even if a later zone fence proves that no packet was sent. Late in-process
+transaction recovery is unsupported in this POC. Use normal camp/save/relog to reconcile. This
+process provides no exactly-once guarantee across a crash.
 
 State contains one published revision, native geometry digest, network tick/inbound/link ages,
 predicted feet position, vitals, inventory and catalog revisions. The roster is received knowledge
