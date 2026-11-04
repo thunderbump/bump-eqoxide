@@ -12,6 +12,7 @@
 //! existing `crate::eq_net::…` / `eqoxide::eq_net::…` path (main.rs spawns the net thread; app.rs,
 //! ui/*, model.rs read published state) keeps resolving unchanged.
 
+mod corpse_loot;
 pub mod gameplay;
 pub mod item;
 pub mod login;

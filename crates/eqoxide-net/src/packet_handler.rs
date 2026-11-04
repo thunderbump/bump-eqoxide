@@ -875,11 +875,11 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
 /// OP_ItemPacket — a single item. The 4-byte header is the `ItemPacketType` (Titanium): 0x64 =
 /// Merchant (an item the open merchant offers), 0x66 = Loot, 0x69 = CharInventory, etc. Merchant
 /// items are routed to `gs.merchant_items` (for `GET /trade/list` + the HUD merchant window);
-/// everything else upserts into the player inventory by slot.
+/// corpse loot is catalog data, while inventory packets upsert by their received slot.
 fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
     // RoF2 OP_ItemPacket: ItemPacket_Struct = PacketType (u32) + one binary-serialized item.
     // (Titanium sent pipe-delimited text; RoF2 uses the packed SerializeItem format — see
-    // crate::item.) 0x64 = Merchant, others (0x66 Loot, 0x69 CharInventory…) are items.
+    // crate::item.) 0x64 = Merchant, 0x66 = corpse catalog, 0x69 = CharInventory.
     const ITEM_PACKET_MERCHANT: u32 = 0x64;
     if p.len() < 4 { return; }
     let packet_type = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
@@ -899,19 +899,9 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
     } else {
         const ITEM_PACKET_LOOT: u32 = 0x66;
         if packet_type == ITEM_PACKET_LOOT {
-            // A Loot item's `main_slot` is NOT a safe inventory destination — it collides with
-            // occupied general-inventory wire slots and would evict a real item (eqoxide#56).
-            let it = eqoxide_core::game_state::InvItem {
-                slot:    item.main_slot as i32,
-                item_id: item.id,
-                name:    item.name,
-                icon:    item.icon,
-                charges: (item.stacksize as i32).max(1),
-                idfile:  item.idfile,
-                click_spell_id: item.click_spell_id,
-                filename: item.filename,
-            };
-            apply_looted_item(gs, it);
+            // Corpse catalog only. Actual acquisition arrives as a separate inventory packet.
+            // The gameplay owner requests each listed slot once for an explicitly opened corpse.
+            return;
         } else {
             // OP_CharInventory / equip / cursor etc.: `main_slot` IS the authoritative slot.
             // Expand bag contents too, so a container delivered here shows its items. (eqoxide#201)
@@ -957,35 +947,6 @@ fn apply_delete_item(gs: &mut GameState, p: &[u8]) {
         }
     }
 }
-
-/// General-inventory wire slots (rof2_limits.h): 23..=32. Loot lands here (or a bag, not modelled).
-const GENERAL_BEGIN: i32 = 23;
-const GENERAL_END:   i32 = 32;
-
-/// Place a freshly-looted item into the client inventory model WITHOUT trusting the loot packet's
-/// `main_slot` (eqoxide#56). Merge into an existing stack of the same item in general inventory, else
-/// drop it into the first free general slot. The server holds the authoritative inventory and a
-/// resync (OP_CharInventory on relog / next sync) reconciles anything approximate here.
-fn apply_looted_item(gs: &mut GameState, mut it: eqoxide_core::game_state::InvItem) {
-    // Stack-merge: same item already sitting in a general-inventory slot → add to its quantity.
-    // Restricted to general slots so we never merge into an EQUIPPED item that shares the id.
-    if let Some(stack) = gs.inventory.iter_mut()
-        .find(|x| x.item_id == it.item_id && (GENERAL_BEGIN..=GENERAL_END).contains(&x.slot))
-    {
-        stack.charges = stack.charges.saturating_add(it.charges.max(1));
-        return;
-    }
-    // Otherwise the first free general slot (never an occupied one → no eviction).
-    let occupied: std::collections::HashSet<i32> = gs.inventory.iter().map(|x| x.slot).collect();
-    if let Some(free) = (GENERAL_BEGIN..=GENERAL_END).find(|s| !occupied.contains(s)) {
-        it.slot = free;
-    }
-    // else: general inventory full (item really went to a bag) — leave main_slot as a best effort;
-    // the next server inventory sync corrects it. Don't retain-evict here.
-    gs.inventory.retain(|x| x.slot != it.slot);
-    gs.inventory.push(it);
-}
-
 
 /// OP_ShopPlayerBuy (server→client echo) — confirms a purchase completed. On success the RoF2
 /// server echoes the SAME opcode with the SAME 32-byte Merchant_Sell_Struct sent in the request
@@ -4604,38 +4565,6 @@ mod tests {
         let m = last(&gs);
         assert!(m.contains("for 40 damage"), "genuine spell damage still shows the amount: {m}");
         assert!(!m.contains("misses"), "genuine spell must not read as a melee miss: {m}");
-    }
-
-    #[test]
-    fn looted_item_places_in_free_slot_and_stacks_never_overwrites() {
-        // eqoxide#56: loot must not evict an occupied slot, and stackable loot should merge.
-        use super::apply_looted_item;
-        use eqoxide_core::game_state::InvItem;
-        let inv = |slot: i32, id: u32, ch: i32| InvItem {
-            slot, item_id: id, name: String::new(), icon: 0, charges: ch, idfile: String::new(),
-            click_spell_id: 0, filename: String::new(),
-        };
-        let mut gs = GameState::new();
-        // Skin of Milk x20 @23, Bread Cakes x20 @24, Rat Whiskers x1 @25.
-        gs.inventory = vec![inv(23, 9990, 20), inv(24, 9991, 20), inv(25, 13071, 1)];
-
-        // Loot another Rat Whiskers; the packet's main_slot bogusly names an occupied slot (23).
-        apply_looted_item(&mut gs, inv(23, 13071, 1));
-        assert_eq!(gs.inventory.iter().find(|x| x.slot == 23).map(|x| x.item_id), Some(9990),
-            "Skin of Milk must not be overwritten");
-        assert_eq!(gs.inventory.iter().find(|x| x.slot == 24).map(|x| x.item_id), Some(9991),
-            "Bread Cakes must not be overwritten");
-        let rw: Vec<_> = gs.inventory.iter().filter(|x| x.item_id == 13071).collect();
-        assert_eq!(rw.len(), 1, "Rat Whiskers should stack into one slot, not split");
-        assert_eq!(rw[0].charges, 2, "stack quantity should merge to 2");
-
-        // Loot a brand-new item with a bogus main_slot (24) → first FREE general slot (26).
-        apply_looted_item(&mut gs, inv(24, 9131, 1));
-        assert_eq!(gs.inventory.iter().find(|x| x.slot == 24).map(|x| x.item_id), Some(9991),
-            "Bread Cakes still untouched");
-        assert_eq!(gs.inventory.iter().find(|x| x.item_id == 9131).unwrap().slot, 26,
-            "new loot goes to the first free general slot");
-        assert_eq!(gs.inventory.len(), 4);
     }
 
     #[test]
@@ -9324,5 +9253,41 @@ mod received_self_echo_tests {
         assert!(gs.chat_events.is_empty());assert!(gs.messages.is_empty());
         let echo=gs.received_self_echoes.back().unwrap();assert_eq!(echo.channel,7);
         assert_eq!(echo.sender,"Tester");assert_eq!(echo.text,"exact-server-nonce");
+    }
+}
+
+#[cfg(test)]
+mod corpse_catalog_inventory_tests {
+    use super::*;
+    #[test]
+    fn corpse_catalog_packets_never_acquire_or_stack_player_inventory() {
+        let mut gs = GameState::new();
+        let mut catalog = 0x66u32.to_le_bytes().to_vec();
+        catalog.extend(crate::item::tests::fixture());
+        let packet = crate::transport::AppPacket {
+            opcode: OP_ITEM_PACKET,
+            payload: catalog,
+        };
+        apply_packet(&mut gs, &packet);
+        apply_packet(&mut gs, &packet);
+        assert!(
+            gs.inventory.is_empty(),
+            "a corpse listing is not an acquired inventory item"
+        );
+        let mut acquired = 0x68u32.to_le_bytes().to_vec();
+        acquired.extend(crate::item::tests::fixture());
+        apply_packet(
+            &mut gs,
+            &crate::transport::AppPacket {
+                opcode: OP_ITEM_PACKET,
+                payload: acquired,
+            },
+        );
+        assert_eq!(
+            gs.inventory.len(),
+            1,
+            "an actual server inventory item still applies"
+        );
+        assert_eq!(gs.inventory[0].slot, 23);
     }
 }

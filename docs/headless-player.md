@@ -119,7 +119,11 @@ Outbound local messages are not receipt evidence. `received_self_echo` records a
 self message with channel/sender/text and `recipient_delivery_confirmed:false`; it does not confirm
 delivery to another player. Legacy self-echo filtering remains unchanged. Received spawn class is exposed as nullable `class_id`.
 Automatic corpse looting and automatic zone-line requests are disabled for CPU sessions.
-Only explicit `loot` requests begin looting, including for the character's own kills.
+Only explicit `loot` requests begin looting, including for the character's own kills. The ordinary
+flow requests each received corpse catalog slot once, one item at a time. An unacknowledged take
+is never retried automatically. `confirmed` with `corpse_opened` proves the open handshake only.
+Corpse catalog packets and take acknowledgements never credit player inventory; acquisition needs
+a separate server inventory packet, and persistence still needs normal save/relog evidence.
 
 ## Limits
 

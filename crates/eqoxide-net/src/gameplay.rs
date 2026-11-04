@@ -174,6 +174,7 @@ pub async fn run_gameplay_phase(
     // The OP_RespawnWindow payload the server sent when we died, held (NOT auto-answered) until the
     // agent POSTs /v1/lifecycle/respawn (#284).
     let mut pending_respawn: Option<Vec<u8>> = None;
+    let mut corpse_loot = crate::corpse_loot::CorpseLoot::default();
 
     loop {
         let s  = stream.as_mut().expect("stream always Some in loop");
@@ -270,6 +271,7 @@ pub async fn run_gameplay_phase(
                 }
             }
             apply_packet(&mut gs, &packet);
+            corpse_loot.observe(&mut gs, &packet, std::time::Instant::now());
             record_app_packet(&mut net_health.lock().unwrap(), std::time::Instant::now());
             action_loop.sync_entities(&gs);
             action_loop.sync_zone_points(&gs);
@@ -340,13 +342,6 @@ pub async fn run_gameplay_phase(
                         gs.log_msg("trade", "Accepting incoming trade request.");
                         tracing::info!("EQ: trade: acked incoming OP_TradeRequest from mob_id={}", from_mob_id);
                     }
-                }
-                // Server listed a lootable item — echo back immediately to take it.
-                OP_LOOT_ITEM => {
-                    gs.loot_last_activity = Some(std::time::Instant::now());
-                    gs.log_msg("loot", "Looting item...");
-                    s.send_app_packet(OP_LOOT_ITEM, &packet.payload);
-                    tracing::info!("EQ: auto-loot: taking item (echoed OP_LootItem)");
                 }
                 // Player died: the server opened the respawn hover window and holds us as a corpse
                 // until we pick an option. #284: DON'T auto-respawn — keep the character slain so a
@@ -517,6 +512,10 @@ pub async fn run_gameplay_phase(
                 }
                 _ => {}
             }
+        }
+
+        if let Some(request) = corpse_loot.next_request(&mut gs, std::time::Instant::now()) {
+            s.send_app_packet(OP_LOOT_ITEM, &request);
         }
 
         // ── Auto-loot ──────────────────────────────────────────────────────────
