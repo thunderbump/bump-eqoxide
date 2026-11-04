@@ -1,0 +1,26 @@
+[package]
+name = "eqoxide-headless"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eqoxide-core = { path = "../eqoxide-core" }
+eqoxide-ipc = { path = "../eqoxide-ipc" }
+eqoxide-command = { path = "../eqoxide-command" }
+eqoxide-net = { path = "../eqoxide-net" }
+eqoxide-physics = { path = "../eqoxide-physics" }
+eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry" }
+arc-swap = "1"
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }
+eqoxide-zone-geometry = { path = "../eqoxide-zone-geometry", features = ["test-fixtures"] }

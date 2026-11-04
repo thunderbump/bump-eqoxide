@@ -123,10 +123,11 @@ impl Gait {
 /// A single entity in the zone (NPC or PC, not the player themselves).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
+    /// Raw received spawn class; None when no class was received.
+    pub class_id: Option<u8>,
     pub spawn_id: u32,
     pub name: String,
     pub level: u32,
-    #[allow(dead_code)]
     pub is_npc: bool,
     pub x: f32,
     pub y: f32,
@@ -235,8 +236,8 @@ pub struct ZoneFog {
 /// How much the server has actually disclosed about one task objective.
 ///
 /// RoF2 sends `OP_TaskActivity` in **two different shapes that carry different amounts of truth**
-/// (EQEmu `zone/task_manager.cpp:972` `SendTaskActivityShort` vs `zone/task_manager.cpp:989`
-/// `SendTaskActivityLong` → `common/tasks.h:141` `SerializeObjective`). The short form is exactly
+/// (EQEmu `eqemu:zone/task_manager.cpp@491b1edd1:972` `SendTaskActivityShort` vs `eqemu:zone/task_manager.cpp@491b1edd1:989`
+/// `SendTaskActivityLong` → `eqemu:common/tasks.h@491b1edd1:141` `SerializeObjective`). The short form is exactly
 /// 25 bytes and contains **no** activity type, **no** target name and **no** counts at all — it is
 /// what the real client renders as `???` for an activity that has not been unlocked yet.
 ///
@@ -253,12 +254,12 @@ pub struct ZoneFog {
 pub enum ActivityProgress {
     /// Long form: the server disclosed the objective and its live progress.
     Known {
-        /// EQEmu `TaskActivityType` (`common/tasks.h:46`) — declared `: int32_t`, and written with
-        /// `WriteInt32` (`common/tasks.h:152`), so it is **signed** here too. 0 None, 1 Deliver,
+        /// EQEmu `TaskActivityType` (`eqemu:common/tasks.h@491b1edd1:46`) — declared `: int32_t`, and written with
+        /// `WriteInt32` (`eqemu:common/tasks.h@491b1edd1:152`), so it is **signed** here too. 0 None, 1 Deliver,
         /// 2 Kill, 3 Loot, 4 SpeakWith, 5 Explore, 6 TradeSkill, 7 Fish, 8 Forage, 9 CastOn,
         /// 10 SkillOn, 11 Touch, 13 Collect, 100 GiveCash.
         ///
-        /// **Type 100 (GiveCash) repurposes the two counts** (`common/tasks.h:143-150`): the
+        /// **Type 100 (GiveCash) repurposes the two counts** (`eqemu:common/tasks.h@491b1edd1:143-150`): the
         /// server forces `goal_count` to 1 and sends `done_count` as a 0/1 *flag*, not a tally.
         /// The cash amount is not on the wire at all. Read `0/1` there as "not yet delivered",
         /// not as "0 of 1 items".
@@ -482,7 +483,7 @@ pub struct LastConsider {
 /// ## This encodes a TIMING ASSUMPTION — state it, don't hide it (see eqoxide#356)
 /// The assumption: the explaining packet is queued in the SAME server tick as the OP_ManaChange
 /// that ends the cast — `SendSpellBarEnable` then `MemorizeSpell` are back-to-back in
-/// `Mob::SpellFinished` (zone/spells.cpp:1817,1824), and `InterruptSpell` likewise emits
+/// `Mob::SpellFinished` (eqemu:zone/spells.cpp@7ab909ee4:1817,1824), and `InterruptSpell` likewise emits
 /// OP_InterruptCast immediately before its OP_ManaChange (:1306-1314). So this window only has to
 /// outlast network jitter, not a game tick, and 400ms is generous for a LAN/loopback server.
 ///
@@ -499,21 +500,21 @@ pub const CAST_HINT_FRESH: std::time::Duration = std::time::Duration::from_milli
 
 // ── Cast-outcome string ids (EQEmu zone/string_ids.h) ─────────────────────────────────────────
 // The server reports a cast that never started, or that ended badly, as an eqstr id: either inside
-// OP_InterruptCast (`InterruptCast_Struct.messageid`, common/eq_packet_structs.h:446) or as a bare
-// OP_SimpleMessage (`Client::MessageString`, zone/client.cpp:3803-3823). These are the ids that
+// OP_InterruptCast (`InterruptCast_Struct.messageid`, eqemu:common/eq_packet_structs.h@5dc093fe5:446) or as a bare
+// OP_SimpleMessage (`Client::MessageString`, eqemu:zone/client.cpp@5dc093fe5:3803-3823). These are the ids that
 // mean "your cast did not happen / did not finish".
-/// 173 — "Your spell fizzles!" (zone/string_ids.h:69; raised by the CheckFizzle path, zone/spells.cpp:318-345).
+/// 173 — "Your spell fizzles!" (eqemu:zone/string_ids.h@7ab909ee4:69; raised by the CheckFizzle path, eqemu:zone/spells.cpp@7ab909ee4:318-345).
 pub const SPELL_FIZZLE: u32 = 173;
-/// 180 — "You miss a note, bringing your song to a close!" (the bard fizzle, zone/string_ids.h:71).
+/// 180 — "You miss a note, bringing your song to a close!" (the bard fizzle, eqemu:zone/string_ids.h@7ab909ee4:71).
 pub const MISS_NOTE: u32 = 180;
-/// 439 — "Your spell is interrupted." (zone/string_ids.h:177; the default `InterruptSpell` message).
+/// 439 — "Your spell is interrupted." (eqemu:zone/string_ids.h@7ab909ee4:177; the default `InterruptSpell` message).
 pub const INTERRUPT_SPELL: u32 = 439;
 /// Cast-start refusals: the server never begins the cast and only says so as an OP_SimpleMessage.
-///   197 "Your spell is too powerful for your intended target."  (zone/spells.cpp:3487)
-///   199 "Insufficient Mana to cast this spell!"                 (zone/spells.cpp:490)
-///   214 "You must first select a target for this spell!"        (zone/spells.cpp:494 area)
-///   236 "Spell recast time not yet met."                        (zone/spells.cpp:1421,
-///                                                                zone/client_packet.cpp:9685,9689)
+///   197 "Your spell is too powerful for your intended target."  (eqemu:zone/spells.cpp@7ab909ee4:3487)
+///   199 "Insufficient Mana to cast this spell!"                 (eqemu:zone/spells.cpp@7ab909ee4:490)
+///   214 "You must first select a target for this spell!"        (eqemu:zone/spells.cpp@7ab909ee4:494 area)
+///   236 "Spell recast time not yet met."                        (eqemu:zone/spells.cpp@7ab909ee4:1421,
+///                                                                eqemu:zone/client_packet.cpp@ca704c7f8:9685,9689)
 ///
 /// Every id here has a REAL sender in the server. Ids with no sender were removed: 106
 /// ("This spell does not work here.") and 237 ("Spell recovery time not yet met.") appear in
@@ -537,6 +538,12 @@ pub struct ChatLogEvent {
     pub from:     String,
     pub directed: bool,
     pub text:     String,
+}
+
+/// A server-returned message from this player, distinct from recipient delivery.
+#[derive(Debug,Clone,PartialEq)]
+pub struct ReceivedSelfEcho {
+    pub id:u64, pub channel:u32, pub sender:String, pub text:String, pub truncated:bool,
 }
 
 /// One member of the player's current group (from OP_GroupUpdateB/OP_GroupUpdate/
@@ -982,7 +989,7 @@ pub enum ControllerHoldReason {
     /// good position to fall back to, and — since #845 — the zone-wide last-resort search also
     /// found nowhere. While
     /// it lasts, `depenetrate` returns `true` every frame, so the whole rest of the step is skipped:
-    /// the body cannot move at all, in any direction, under any driver (WASD, `/goto`, `/move`).
+    /// the body cannot move at all, in any direction, under any driver (keyboard or `/v1/move/manual`).
     EmbeddedNoRecovery,
     /// The #150 fall-through guard refused a descent to/below the zone's underworld floor and had
     /// no banked good position to restore. The body hangs at the height it reached, not falling and
@@ -1104,56 +1111,6 @@ pub struct Relocation {
     pub distance: f32,
 }
 
-/// The distance `ActionLoop::drive_auto_engage_melee` stops closing at and starts holding
-/// position/facing, for a character with no pet. Mirrored here (not just in `eqoxide-net`) so
-/// [`GameState::target_in_melee_range`] can describe that driver's behavior for `/observe/debug`
-/// without eqoxide-core depending on eqoxide-net. Keep this in lock-step with the `MELEE` literal
-/// in `drive_auto_engage_melee` — see that method's doc.
-pub const MELEE_ENGAGE_RANGE: f32 = 5.0;
-/// Same as [`MELEE_ENGAGE_RANGE`], for a character WITH a pet — the pet tanks, so the player
-/// stands off outside the mob's own melee range instead of closing to melee itself. Mirrors
-/// `drive_auto_engage_melee`'s `PET_STANDOFF` literal.
-pub const PET_STANDOFF_RANGE: f32 = 25.0;
-
-/// Max Z the target may sit ABOVE the player for melee auto-engage to treat it as reachable by
-/// DIRECT chase (#1119). `ActionLoop::drive_auto_engage_melee` steers purely in the XY plane
-/// (`wish_vspeed` is always `0.0`) and relies on ground contact to close ordinary terrain relief —
-/// it does no real pathfinding. A target this far above the player sits on a tier that only real
-/// pathfinding (climb/jump planning) could reach; chasing it directly just walks the character to
-/// the base of the ledge and stalls there while `nav_state` keeps claiming `engaging`.
-///
-/// Chosen to match `STEP_H` in `crates/eqoxide-nav/src/collision.rs` (currently `20.0`, duplicated
-/// as several function-local consts there rather than a single shared export — nothing enforces
-/// these literals staying equal beyond this comment, so if you change one, grep the other file for
-/// `STEP_H` and update it too). **This is a heuristic, not an exact match for what the real
-/// planner can climb**: per `collision.rs`'s own comment above its `STEP_H`/`MAX_STEP_DOWN`
-/// definitions, what actually bounds a walkable climb there is the feet-level `path_clear` grade
-/// check along the whole route (`MAX_WALK_GRADE`), which has no flat aggregate-elevation cap for a
-/// smooth ramp — `STEP_H` only bounds a single discrete riser. A long, gentle ramp rising well past
-/// 20u is legitimately walkable to the real planner but will be declined here; that tradeoff is
-/// deliberate — never claim `engaging` on a target this XY-only driver cannot actually reach, at
-/// the cost of occasionally declining a target reachable only via a long ramp.
-pub const MELEE_ENGAGE_MAX_Z_GAP: f32 = 20.0;
-
-/// Max Z the target may sit BELOW the player for melee auto-engage to treat it as reachable by
-/// direct chase (#1119 follow-up). Larger than [`MELEE_ENGAGE_MAX_Z_GAP`] because descending is
-/// gravity-assisted — the controller's own ground-contact/falling physics closes a drop for free
-/// as the character walks off an edge, whereas closing a rise requires the step-up physics to
-/// actually climb it, which this driver's `wish_vspeed: 0.0` steering never asks for directly.
-/// Matches `MAX_STEP_DOWN` in `collision.rs` (currently `60.0`, same no-shared-export caveat as
-/// above) — the real planner's own cap on how far a single step may drop.
-pub const MELEE_ENGAGE_MAX_Z_DROP: f32 = 60.0;
-
-/// Whether a target this far above/below the player (`dz = target_z - player_z`) is one
-/// [`MELEE_ENGAGE_MAX_Z_GAP`]/[`MELEE_ENGAGE_MAX_Z_DROP`] together call reachable by direct
-/// chase — asymmetric because closing a drop is gravity-assisted and closing a rise is not (see
-/// those constants' docs). Shared by [`GameState::target_in_melee_range`] and
-/// `eqoxide_net::ActionLoop::melee_chase_plausible` so the two cannot independently drift on the
-/// Z-gap rule the way the pre-#1119 XY-only checks drifted on the XY one.
-pub fn melee_z_reachable_by_chase(dz: f32) -> bool {
-    if dz >= 0.0 { dz <= MELEE_ENGAGE_MAX_Z_GAP } else { -dz <= MELEE_ENGAGE_MAX_Z_DROP }
-}
-
 /// All state the renderer needs for one frame.
 ///
 /// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
@@ -1163,6 +1120,26 @@ pub fn melee_z_reachable_by_chase(dz: f32) -> bool {
 /// (inbound packet OR a client-initiated HTTP request handled by `ActionLoop::tick`), and a
 /// genuinely idle world lets the event loop sleep instead of spinning.
 ///
+/// A server echo that proves (or disproves) a queued action — the input to
+/// `ActionTracker::settle_held` (#347). Only echoes that identify the request are listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerAck {
+    /// OP_GroupAcknowledge: the server put us in a group.
+    GroupJoined,
+    /// OP_MoveDoor for this door: the server acted on the click.
+    DoorMoved { door_id: u8 },
+    /// OP_MoneyOnCorpse accepted the loot request for this corpse.
+    LootOpened { corpse_id: u32 },
+    /// OP_MoneyOnCorpse refused the loot request for this corpse.
+    LootRefused { corpse_id: u32, reason: &'static str },
+    /// No OP_MoneyOnCorpse arrived in time for this corpse.
+    LootOpenTimedOut { corpse_id: u32 },
+    /// OP_MemorizeSpell put a spell in this gem (`scribing == 1`).
+    SpellMemorized { slot: u32 },
+    /// OP_MemorizeSpell emptied this gem (`scribing == 2`).
+    SpellUnmemorized { slot: u32 },
+}
+
 /// ## MVC structure (increment C1, #451)
 /// `GameState = { world: WorldState (Model-only server truth) , the client PREDICTION , … }`.
 /// `world` (see [`WorldState`]) is the server-authoritative world the Model writes and Views only
@@ -1172,6 +1149,11 @@ pub fn melee_z_reachable_by_chase(dz: f32) -> bool {
 /// published render state, so it is intentionally not a field here.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct GameState {
+    /// Increments on every zone-server entry, including same-zone re-entry.
+    pub zone_epoch: u64,
+    /// Legacy graphical policies; CPU control disables these before gameplay begins.
+    pub automatic_loot: bool,
+    pub automatic_zone_crossing: bool,
     // Player
     pub player_id: u32,
     pub player_name: String,
@@ -1208,8 +1190,6 @@ pub struct GameState {
     ///   - self `OP_ClientUpdate` (`packet_handler.rs`) — server-authoritative.
     ///   - bind-point respawn (`apply_bind_respawn`, `packet_handler.rs`) — server-authoritative.
     ///   - a same-zone teleport (`gameplay.rs`) — server-driven destination.
-    ///   - `MockModel::publish_snapshot` (`model.rs`) — offline/testzone, where the Model itself
-    ///     IS the position authority, so its published position is real by definition.
     ///   - the controller mirror in `ActionLoop::stream_position` (`action_loop.rs`) — the
     ///     controller's own PREDICTED position, on the normal (non-correction) path, once the
     ///     controller has actually been placed in this zone. This one is deliberate, not a leak:
@@ -1241,7 +1221,7 @@ pub struct GameState {
     /// `zone: "qeynos"` with a qeynos2 `pos` — well-formed, confident, mutually inconsistent, and
     /// unmarked. It is marked now.
     ///
-    /// Client-side writers (nav, the HTTP move API) do NOT clear it — they are not evidence about
+    /// Client-side writers (the HTTP move API) do NOT clear it — they are not evidence about
     /// where the server thinks we are.
     pub position_provisional_since: Option<std::time::Instant>,
     /// #713 item 1 — auto-cross attempts during the current continuous stand on zone-line geometry
@@ -1263,15 +1243,6 @@ pub struct GameState {
     /// the cooldown was sampled ON the line at both ends and cleared nothing at all. See
     /// `ActionLoop::drain_zone_cross`.
     pub zone_cross_attempts: Option<crate::zone_cross::CrossAttempts>,
-    /// #713 item 2 — what the most recently drained `POST /v1/move/zone_cross` decided to do, and
-    /// in particular whether it degraded to the #683 best-effort fallback (walk to a line whose
-    /// destination only the server knows). `None` = no request has been resolved to a zone line in
-    /// this zone. See [`crate::zone_cross::ZoneCrossPlan`].
-    ///
-    /// Also client-side-decision state rather than server truth, so also not in [`WorldState`].
-    /// Cleared at the start of every resolution (a request that located no line leaves no stale
-    /// plan) and by [`GameState::begin_zone_in`].
-    pub zone_cross_plan: Option<crate::zone_cross::ZoneCrossPlan>,
     /// **#724 review B1: the render controller is holding the body still and cannot resume.**
     /// `None` = it is not (which includes "it is simply standing still because nothing asked it to
     /// move"); `Some` = a recovery path has frozen the body and has nothing to restore it onto. See
@@ -1502,8 +1473,7 @@ pub struct GameState {
     pub target_attitude: Option<String>,
     /// #1007 follow-up (live-test-drive finding): WHY `target_id` is currently null. `None` while
     /// a target IS set, and also `None` if no target has ever been cleared this session (fresh
-    /// `GameState`) — both read the same as "nothing to report" on purpose, the same convention
-    /// `nav_reason` uses beside `nav_state`. Set to `Some(reason)` by every `clear_target` call,
+    /// `GameState`) — both read the same as "nothing to report" on purpose. Set to `Some(reason)` by every `clear_target` call,
     /// and reset to `None` by `set_target` the moment a new target lands.
     ///
     /// Exists because `auto_attack:true` + `target_id:null` was otherwise a silent, honest-looking
@@ -1537,6 +1507,7 @@ pub struct GameState {
 
     // Inter-agent chat events (tells/ooc/shout/group/gmsay) for the GET /events feed.
     pub chat_events:  VecDeque<ChatLogEvent>,
+    pub received_self_echoes: VecDeque<ReceivedSelfEcho>,
     pub next_chat_id: u64,
 
     // UCS (chat server) connection params from OP_SetChatServer; Some once received at zone-in.
@@ -1548,7 +1519,6 @@ pub struct GameState {
     pub strategy: String,
 
     /// True from the moment the PLAYER is slain until HP is restored (revive / respawn / heal).
-    /// The nav walker checks this to stop driving a corpse toward a stale /goto (eqoxide#61).
     pub player_dead: bool,
 
     /// Count of server rubber-band corrections (horizontal position deltas > 12 units, i.e. past
@@ -1609,6 +1579,10 @@ pub struct GameState {
     /// `apply_loot_complete`'s branch 0 and `apply_money_on_corpse`'s stale-ack gate.
     pub loot_defensive_close_at: Option<std::time::Instant>,
 
+    /// Server echoes that settle a queued HTTP action (#347). Packet handlers are pure and cannot
+    /// reach the action tracker, so they record the echo here and `ActionLoop::tick` drains it.
+    pub server_acks: Vec<ServerAck>,
+
     // Quest log (native EQ Task system) — server-pushed via OP_TaskDescription / OP_TaskActivity.
     /// All task quests keyed by task_id (any status), with their objectives + live progress.
     pub tasks: std::collections::HashMap<u32, ActiveTask>,
@@ -1630,8 +1604,8 @@ pub struct GameState {
     pub inventory_received: bool,
 
     /// Set true when the server sends OP_TradeRequestAck — the trade session now exists, so the
-    /// nav thread may move the cursor item into the NPC trade slot and accept. Cleared once the
-    /// give state machine consumes it (or on timeout). See navigation.rs.
+    /// net thread may move the cursor item into the NPC trade slot and accept. Cleared once the
+    /// give state machine consumes it (or on timeout). See action_loop.rs.
     pub trade_ack_ready: bool,
 
     // Spellcasting / posture
@@ -1654,16 +1628,16 @@ pub struct GameState {
     /// of `/v1/observe/debug` still learns the outcome it missed on the event feed.
     pub last_cast: Option<CastOutcome>,
     /// spell_id of the cast the server most recently told us STOPPED, and when it said so — from
-    /// OP_ManaChange with `keepcasting == 0`, which both `Mob::StopCasting` (zone/spells.cpp:1369)
-    /// and `Mob::SendSpellBarEnable` (zone/spells.cpp:5752) send with `spell_id = the cast that
+    /// OP_ManaChange with `keepcasting == 0`, which both `Mob::StopCasting` (eqemu:zone/spells.cpp@7ab909ee4:1369)
+    /// and `Mob::SendSpellBarEnable` (eqemu:zone/spells.cpp@7ab909ee4:5752) send with `spell_id = the cast that
     /// ended`. It is the ONLY way to name the spell in a *fizzle*: EQEmu decides a fizzle in
-    /// `DoCastSpell` (zone/spells.cpp:320) **before** it ever sends OP_BeginCast
-    /// (zone/spells.cpp:450), so `casting` is still `None` when the fizzle message arrives.
+    /// `DoCastSpell` (eqemu:zone/spells.cpp@7ab909ee4:320) **before** it ever sends OP_BeginCast
+    /// (eqemu:zone/spells.cpp@7ab909ee4:450), so `casting` is still `None` when the fizzle message arrives.
     ///
     /// Consumed (taken) by [`GameState::finish_cast`] AND time-scoped ([`CAST_HINT_FRESH`]): the
     /// server re-arms this on the SendSpellBarEnable that TRAILS an interrupt/refusal
-    /// (zone/spells.cpp:1314) and on the Lua-only `ResetAllCastbarCooldowns` burst
-    /// (zone/spells.cpp:7246), so an un-scoped hint would pin a stale, unrelated spell name on the
+    /// (eqemu:zone/spells.cpp@7ab909ee4:1314) and on the Lua-only `ResetAllCastbarCooldowns` burst
+    /// (eqemu:zone/spells.cpp@7ab909ee4:7246), so an un-scoped hint would pin a stale, unrelated spell name on the
     /// next failure. (eqoxide#348)
     pub ended_cast_spell: Option<(u32, std::time::Instant)>,
     /// A cast the server has ENDED (OP_ManaChange `keepcasting=0`) but not yet EXPLAINED. Armed
@@ -1674,7 +1648,7 @@ pub struct GameState {
     pub pending_cast_end: Option<std::time::Instant>,
     /// Ignore the next OP_ManaChange(`keepcasting=0`), because we have ALREADY reported the outcome
     /// it belongs to. `Mob::InterruptSpell` sends OP_InterruptCast and THEN `SendSpellBarEnable`
-    /// (zone/spells.cpp:1299-1314); a cast-start refusal likewise sends its OP_SimpleMessage and
+    /// (eqemu:zone/spells.cpp@7ab909ee4:1299-1314); a cast-start refusal likewise sends its OP_SimpleMessage and
     /// then `StopCastSpell` → `SendSpellBarEnable`. Without this, that trailing ManaChange would
     /// re-arm `ended_cast_spell` with a spell we just finished reporting, and the next unnamed
     /// failure would inherit it.
@@ -1683,7 +1657,7 @@ pub struct GameState {
     /// A counter here would be a landmine. Its correctness would rest on a conservation law that is
     /// FALSE: "every refusal is followed by exactly one OP_ManaChange". `Mob::CastSpell` sets
     /// `send_spellbar_enable = false` for an instant-cast item clicky or an AA
-    /// (`(item_slot != -1 && cast_time == 0) || aa_id` — zone/spells.cpp:158-161), so
+    /// (`(item_slot != -1 && cast_time == 0) || aa_id` — eqemu:zone/spells.cpp@7ab909ee4:158-161), so
     /// `StopCastSpell` skips `SendSpellBarEnable` ENTIRELY and no terminal ManaChange is ever sent.
     /// SPELL_TOO_POWERFUL (197) reaches exactly that path, and eqoxide has an item-clicky cast path
     /// (`/v1/combat/cast {"item_slot":N}`).
@@ -1698,13 +1672,10 @@ pub struct GameState {
     pub suppress_cast_end: bool,
     /// True when the player is sitting.
     pub sitting: bool,
-    /// Run/walk toggle (#625): `true` = run, `false` = walk. Governs the LOCAL movement speed the
-    /// controller/nav-walker drives at (`eqoxide_core::physics::RUN_SPEED` vs `WALK_SPEED`), and
-    /// mirrors the last `OP_SetRunMode` (0x009f) this client sent — the server itself never echoes
-    /// this flag back (no ack packet exists for it), so this is our own send-time intent, exactly
-    /// like `sitting`/`auto_attack` above track the last posture/attack request we sent, not a
-    /// server confirmation. Defaults to `true` (running) in [`GameState::new`], matching this
-    /// client's behavior before #625: every driver always moved at `RUN_SPEED`.
+    /// Run/walk toggle (#625): `true` = run, `false` = walk. Mirrors the last `OP_SetRunMode` (0x009f) this client sent. The server never echoes
+    /// this flag back (no ack packet exists for it), so this is the send-time intent, exactly
+    /// like `sitting`/`auto_attack` above track the last posture/attack request sent, not a
+    /// server confirmation. Defaults to `true` (running) in [`GameState::new`].
     pub run_mode: bool,
     /// When the player's own death was first observed (OP_Death for our spawn), or None
     /// while alive. Used to (a) dedupe the duplicate OP_Death the server sometimes sends
@@ -1751,6 +1722,8 @@ impl GameState {
             // `false` (walk) — deliberately overridden here, the same way `messages` overrides its
             // derived-empty-`VecDeque` default just above.
             run_mode: true,
+            automatic_loot: true,
+            automatic_zone_crossing: true,
             ..Default::default()
         }
     }
@@ -1773,6 +1746,7 @@ impl GameState {
     /// what the comments on those two lines claim to achieve. This function cannot reach the view
     /// itself (`eqoxide-core` sits below `eqoxide-ipc`), so the pairing lives there.
     pub fn begin_zone_in(&mut self) {
+        self.zone_epoch = self.zone_epoch.checked_add(1).expect("zone epoch exhausted");
         self.world.entities.clear();
         self.world.doors.clear();
         // #513: the previous zone's coordinates say nothing about where we are in the new one, so
@@ -1785,10 +1759,9 @@ impl GameState {
         // `player_pos_known = false`, not "provisional". Verified live that without this clear the
         // marker stayed `true` in the new zone for 30s+ while `pos` was already correct.
         self.position_provisional_since = None;
-        // #713: both zone-cross facts are about the zone we are LEAVING, and both key on per-zone
-        // namespaces (region index, advertised destination zone id). See their field docs.
+        // #713: the tally is about the zone we are LEAVING and keys on a per-zone namespace
+        // (region index). See its field docs.
         self.zone_cross_attempts = None;
-        self.zone_cross_plan = None;
         // #724/#776/#801: a hold and an afloat stall both describe collision geometry — the stall
         // by naming an ANCHOR in the departed zone's coordinate frame — that this zone-in drops.
         //
@@ -1951,10 +1924,8 @@ impl GameState {
     /// Is the player slain? Detected the SAME way the render/anim path picks the dead pose
     /// (`cur_hp <= 0` with a known `max_hp`) OR via the OP_Death `player_dead` flag. Using cur_hp —
     /// not just `player_dead` — catches an HP-to-0 update that lands before OP_Death arrives, which
-    /// is the window in which a corpse was seen still walking (#238). Shared by the nav walker
-    /// (`nav::walker::Walker::nav_halt_if_dead`) and the auto zone-cross guard
-    /// (`eq_net::action_loop::ActionLoop::drain_zone_cross`) — moved here (out of `ActionLoop`) so
-    /// both can call it without one depending on the other's private items (M1 walker extraction).
+    /// is the window in which a corpse was seen still walking (#238). Read by the auto zone-cross guard
+    /// (`eq_net::action_loop::ActionLoop::drain_zone_cross`).
     pub fn is_player_dead(&self) -> bool {
         self.player_dead || (self.cur_hp <= 0 && self.max_hp > 0)
     }
@@ -1996,6 +1967,14 @@ impl GameState {
     /// Record an async event onto the `/v1/events/*` feed. `category` is the top-level bucket
     /// (chat/combat/navigate/system); `kind` the sub-type; `from` the originator ("" / "system" for
     /// non-player events); `directed` whether it concerns us specifically.
+    /// Keep a bounded received echo journal without changing legacy chat/self-echo filtering.
+    pub fn record_self_echo(&mut self,channel:u32,sender:&str,text:&str) {
+        let id=self.received_self_echoes.back().map_or(1,|e|e.id.checked_add(1).expect("echo id exhausted"));
+        if self.received_self_echoes.len()>=32 {self.received_self_echoes.pop_front();}
+        self.received_self_echoes.push_back(ReceivedSelfEcho {id,channel,sender:sender.chars().take(64).collect(),
+            text:text.chars().take(512).collect(),truncated:sender.chars().count()>64 || text.chars().count()>512});
+    }
+
     pub fn push_event(&mut self, category: &str, kind: &str, from: &str, directed: bool, text: &str) {
         // Ids are 1-based: the events endpoint filters `id > since` with `since=0` as the default
         // "haven't seen anything" cursor, so a 0-id first event would be permanently invisible.
@@ -2012,6 +1991,14 @@ impl GameState {
             directed,
             text: text.to_string(),
         });
+    }
+
+    /// Record a server echo for `ActionLoop::tick` to settle against held requests (#347). Bounded
+    /// because the login phase applies packets without a tick draining this.
+    pub fn push_ack(&mut self, ack: ServerAck) {
+        const MAX_PENDING_ACKS: usize = 64;
+        if self.server_acks.len() >= MAX_PENDING_ACKS { self.server_acks.remove(0); }
+        self.server_acks.push(ack);
     }
 
     /// The player's own cast bar has started (their OP_BeginCast came back). Publishes a
@@ -2068,7 +2055,7 @@ impl GameState {
     /// over) and start the grace window in which a following packet may still explain it.
     ///
     /// Clearing here is what makes `casting` un-stickable. `Mob::SpellFinished` can return false —
-    /// a beneficial buff that won't stack is the common case (zone/spells.cpp:2590 → :1744-1751) —
+    /// a beneficial buff that won't stack is the common case (eqemu:zone/spells.cpp@7ab909ee4:2590 → :1744-1751) —
     /// and then `CastedSpellFinished` calls `StopCasting()`, which sends this ManaChange and
     /// **nothing else**: no memorize, no interrupt, no message. Without a terminal here, re-buffing
     /// an already-buffed target left `casting` set forever. (eqoxide#348)
@@ -2219,7 +2206,7 @@ impl GameState {
     /// Reconcile the local coin snapshot against the server's authoritative figure, carried by
     /// every OP_PlayerProfile (#361). Two merchant-buy refusal paths — inventory-full and a LORE
     /// conflict — send no echo of any kind, and for inventory-full the server takes the coin
-    /// anyway (EQEmu's own source comments at zone/client_packet.cpp:14258-14259 and :14286 admit
+    /// anyway (EQEmu's own source comments at eqemu:zone/client_packet.cpp@ca704c7f8:14258-14259 and :14286 admit
     /// the bug), so a silently-refused buy can leave `coin` diverged from the real balance with
     /// nothing else to correct it.
     ///
@@ -2341,44 +2328,6 @@ impl GameState {
         self.target_cleared_reason = Some(reason);
     }
 
-    /// #1007 follow-up (live-test-drive finding): is the current target within the SAME
-    /// engage ring `ActionLoop::drive_auto_engage_melee` stops closing at? `None` when there is
-    /// nothing to judge (no target, target dead, or its spawn id no longer resolves in
-    /// `world.entities`); `Some(true)`/`Some(false)` otherwise.
-    ///
-    /// Exists to disambiguate a flat `target_hp_pct` under `nav_state: "engaging"`: without this,
-    /// "still walking into range" and "standing there, swings not landing" render identically on
-    /// `/observe/debug` — both are just `engaging` beside an HP number that hasn't moved. This
-    /// answers which one it is.
-    ///
-    /// `MELEE_ENGAGE_RANGE`/`PET_STANDOFF_RANGE` MUST stay in lock-step with the literals
-    /// `drive_auto_engage_melee` checks its own `dist > engage` against — this predicate only
-    /// describes that driver's behavior, it does not govern it (that driver has its own copy, on
-    /// the other side of the eqoxide-net/eqoxide-core boundary).
-    ///
-    /// **Genuinely 3-D (#1119).** Distance is [`Entity::dist_to`], not an XY-only measure: a
-    /// target on a ledge tens of units above the player can sit well inside the XY ring while
-    /// being physically out of weapon reach, and `drive_auto_engage_melee`'s steering is XY-only
-    /// (never sets `wish_vspeed`) — it can never actually close that gap. Reporting `true` there
-    /// would tell a caller driving combat off this field that swings should be landing when the
-    /// character cannot even touch the target.
-    ///
-    /// Also gated by [`melee_z_reachable_by_chase`], not just the engage radius (#1119 follow-up):
-    /// `PET_STANDOFF_RANGE` (25.0) is wider than `MELEE_ENGAGE_MAX_Z_GAP` (20.0), so without this a
-    /// pet-mode target sitting directly overhead at e.g. `dz=22` would read `true` here (within
-    /// 25.0 of 3-D distance) while `drive_auto_engage_melee` silently declines to chase it at all
-    /// — a caller would see "in range" for a target the driver never even attempts to approach.
-    pub fn target_in_melee_range(&self) -> Option<bool> {
-        let tid = self.target_id?;
-        let e = self.world.entities.get(&tid).filter(|e| !e.dead)?;
-        if !melee_z_reachable_by_chase(e.z - self.player_z) {
-            return Some(false);
-        }
-        let dist = e.dist_to(self.player_x, self.player_y, self.player_z);
-        let engage = if self.pet_id.is_some() { PET_STANDOFF_RANGE } else { MELEE_ENGAGE_RANGE };
-        Some(dist <= engage)
-    }
-
     pub fn upsert_door(&mut self, d: Door) {
         self.world.doors.insert(d.door_id, d);
     }
@@ -2410,7 +2359,7 @@ impl GameState {
 
     fn write_hp(&mut self, spawn_id: u32, cur_hp: i32, max_hp: i32, from_server: bool) {
         if spawn_id == self.player_id {
-            self.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
+            self.hp_pct = hp_percent(cur_hp, max_hp);
             self.cur_hp = cur_hp;
             self.max_hp = max_hp;
             // #1005: a server OP_HPUpdate is the ONLY thing that can clear the estimate debt — it
@@ -2429,7 +2378,7 @@ impl GameState {
         } else if let Some(e) = self.world.entities.get_mut(&spawn_id) {
             e.cur_hp = cur_hp;
             e.max_hp = max_hp;
-            e.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
+            e.hp_pct = hp_percent(cur_hp, max_hp);
         }
         // Keep the target HUD's HP gauge live: target_hp_pct is a stored snapshot (seeded
         // when the target is selected — see ActionLoop::tick), not derived fresh from
@@ -2557,6 +2506,16 @@ impl GameState {
 /// Split NPC dialogue text into runs, flagging `[bracketed]` quest keywords.
 /// An unterminated `[` run is treated as plain text. Shared by the dialogue
 /// window (clickable keywords) and the HTTP message feed (keyword extraction).
+/// Published HP percentage. The server pins a dead character's HP negative (-100 while dead, -500
+/// on the death blow), so `cur_hp <= 0` reads as 0 rather than a negative percent. The raw
+/// `cur_hp` stays signed; only the percentage is bounded (#1027).
+fn hp_percent(cur_hp: i32, max_hp: i32) -> f32 {
+    if cur_hp <= 0 {
+        return 0.0;
+    }
+    (cur_hp as f32 / max_hp.max(1) as f32) * 100.0
+}
+
 pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -2616,7 +2575,7 @@ pub fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) ->
         dead: false,
         equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
         face: 0, hairstyle: 0, haircolor: 0,
-        pose: Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0,
+        pose: Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0, class_id: None,
     }
 }
 
@@ -2699,7 +2658,7 @@ mod pose_tests_643 {
 pub(crate) mod tests {
     use super::{BuffSlot, CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door,
                 GameState, HeldMotion, LastConsider, MerchantItem, Relocation, TaskOffer, ZonePoint,
-                make_entity, melee_z_reachable_by_chase};
+                make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -2891,83 +2850,6 @@ pub(crate) mod tests {
         assert!((d - 0.0).abs() < 1e-5, "expected 0.0, got {d}");
     }
 
-    // --- GameState::target_in_melee_range ---
-
-    /// #1119 — a target on an elevated ledge, well inside the XY ring but ~42u above the player
-    /// (the issue's own reproduction gap), must NOT report in melee range. Mutation check: revert
-    /// `target_in_melee_range` to its old XY-only `(dx*dx+dy*dy).sqrt()` → this goes RED, since 2u
-    /// of XY separation alone is inside `MELEE_ENGAGE_RANGE`.
-    #[test]
-    fn target_in_melee_range_is_false_across_an_unreachable_z_gap_1119() {
-        let mut gs = GameState::new();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(make_entity(9, "a ledge rat", 2.0, 0.0, 42.0, true));
-        gs.set_target(9);
-        assert_eq!(gs.target_in_melee_range(), Some(false),
-            "2u of XY separation is inside MELEE_ENGAGE_RANGE, but the ~42u vertical gap makes the \
-             target physically unreachable — a 3-D distance check must catch this");
-    }
-
-    /// CONTROL for the test above: the same 2u XY gap with NO vertical separation must still read
-    /// `true`, or the 1119 test proves nothing about the Z axis specifically.
-    #[test]
-    fn target_in_melee_range_is_true_at_the_same_xy_gap_with_no_z_gap() {
-        let mut gs = GameState::new();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.upsert_entity(make_entity(9, "a ground rat", 2.0, 0.0, 0.0, true));
-        gs.set_target(9);
-        assert_eq!(gs.target_in_melee_range(), Some(true));
-    }
-
-    /// #1119 follow-up (review finding): a pet-mode target sitting directly overhead at `dz=22`
-    /// is within `PET_STANDOFF_RANGE` (25.0) by raw 3-D distance, but past `MELEE_ENGAGE_MAX_Z_GAP`
-    /// (20.0) — the Z bound `drive_auto_engage_melee` actually chases against. Without the Z-gap
-    /// gate here, this predicate would say `true` ("in range") for a target the driver never even
-    /// attempts to approach, since it declines the chase entirely on the Z bound.
-    #[test]
-    fn target_in_melee_range_is_false_for_a_pet_mode_target_within_standoff_but_past_the_z_gap() {
-        let mut gs = GameState::new();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.pet_id = Some(64);
-        gs.upsert_entity(make_entity(9, "an overhead rat", 0.0, 0.0, 22.0, true));
-        gs.set_target(9);
-        assert_eq!(gs.target_in_melee_range(), Some(false),
-            "dz=22 is within PET_STANDOFF_RANGE(25) by raw distance but past \
-             MELEE_ENGAGE_MAX_Z_GAP(20) — the driver declines this chase, so the predicate must \
-             not claim it's in range");
-    }
-
-    /// CONTROL for the test above: the same pet-mode setup at `dz=18` (inside the Z-gap cap) must
-    /// still read `true`, or the test above proves nothing about the Z-gap gate specifically.
-    #[test]
-    fn target_in_melee_range_is_true_for_a_pet_mode_target_within_both_standoff_and_z_gap() {
-        let mut gs = GameState::new();
-        gs.player_x = 0.0;
-        gs.player_y = 0.0;
-        gs.player_z = 0.0;
-        gs.pet_id = Some(64);
-        gs.upsert_entity(make_entity(9, "an overhead rat", 0.0, 0.0, 18.0, true));
-        gs.set_target(9);
-        assert_eq!(gs.target_in_melee_range(), Some(true));
-    }
-
-    // --- GameState::melee_z_reachable_by_chase ---
-
-    #[test]
-    fn melee_z_reachable_by_chase_is_asymmetric_at_its_boundaries() {
-        assert!(melee_z_reachable_by_chase(20.0), "climb boundary is inclusive");
-        assert!(!melee_z_reachable_by_chase(20.01), "just past the climb cap must be false");
-        assert!(melee_z_reachable_by_chase(-60.0), "drop boundary is inclusive");
-        assert!(!melee_z_reachable_by_chase(-60.01), "just past the drop cap must be false");
-        assert!(melee_z_reachable_by_chase(0.0));
-    }
-
     // --- GameState::log_msg ---
 
     #[test]
@@ -3001,7 +2883,7 @@ pub(crate) mod tests {
     fn begin_shop_open_clears_a_stale_previous_merchant() {
         // #360: sending a NEW OP_ShopRequest (for merchant B) must not leave `merchant_open`
         // reporting the PREVIOUS merchant (A) if B's request is refused silently (no echo at
-        // all — out-of-range/non-merchant, EQEmu client_packet.cpp:14605-14612). Clearing at
+        // all — out-of-range/non-merchant, EQEmu eqemu:zone/client_packet.cpp@ca704c7f8:14605-14612). Clearing at
         // send time means a request that never gets answered reads as "not open", never "still
         // open on A".
         let mut gs = GameState::new();
@@ -3184,6 +3066,35 @@ pub(crate) mod tests {
             "the self-target readout must not stay at 100 while hp_pct reads 0");
         assert!(!gs.hp_verified(),
             "target_hp_pct is self-HP while self-targeted, so the same flag has to cover it");
+    }
+
+    /// #1027 — the server pins a dead character's HP to -100 (and -500 on the death blow). The
+    /// published percent must read 0, not -7.8% or -39%, while `cur_hp` keeps the raw signed value.
+    #[test]
+    fn self_hp_pct_is_floored_at_zero_while_cur_hp_stays_signed_1027() {
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.set_target(7);
+        for pinned in [-100, -500] {
+            gs.update_hp(7, pinned, 1284);
+            assert_eq!(gs.cur_hp, pinned, "the raw value is the honest one and is not clamped");
+            assert_eq!(gs.hp_pct, 0.0);
+            assert_eq!(gs.target_hp_pct, Some(0.0));
+        }
+        gs.update_hp(7, 642, 1284);
+        assert_eq!(gs.hp_pct, 50.0, "a positive value still computes normally");
+    }
+
+    /// #1027 — same floor for the entity branch.
+    #[test]
+    fn entity_hp_pct_is_floored_at_zero_while_cur_hp_stays_signed_1027() {
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.world.entities.insert(9, make_entity(9, "a_gnoll", 0.0, 0.0, 0.0, true));
+        gs.update_hp(9, -100, 200);
+        let e = &gs.world.entities[&9];
+        assert_eq!(e.cur_hp, -100);
+        assert_eq!(e.hp_pct, 0.0);
     }
 
     /// #1005 — the counter saturates rather than wrapping. A `u32` that wrapped to 0 would hand an
@@ -3958,60 +3869,6 @@ pub(crate) mod tests {
              trapped swimmer at coordinates that belong to a different zone");
     }
 
-    /// #757 — `zone_cross_attempts` and `zone_cross_plan` must NOT survive a zone-in.
-    ///
-    /// Both fields are per-zone-namespace facts — see their doc comments. The fixture below is built
-    /// to actually REACH the blocking / best-effort states, not merely a `Some(..)` that happens to
-    /// clear.
-    ///
-    /// Before this test, dropping either clear still compiled and passed the whole suite;
-    /// `player_hold`'s sibling clear was the one exception, because `..._hold_724` above already
-    /// guarded it. Mutation check (each run independently, verbatim output in the #757 PR body):
-    /// drop `self.zone_cross_attempts = None;` from `begin_zone_in` → RED at the first assertion;
-    /// restore it, then drop `self.zone_cross_plan = None;` → RED at the second.
-    #[test]
-    fn begin_zone_in_clears_the_previous_zones_cross_attempts_and_plan_757() {
-        use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
-
-        let mut gs = GameState::new();
-        // Build a tally that has actually REACHED the bound (`blocks() == true`), not just any
-        // `Some`. `CrossAttempts`'s own doc ("why the tally is NOT per region index") establishes
-        // the count is a per-stand total, not keyed to whichever index was last attempted — the
-        // predicate that matters here is `blocks()`, so the fixture drives it there directly rather
-        // than asserting a claim about the type that its own docs disclaim.
-        let mut tally = None;
-        for index in 0..MAX_CROSS_ATTEMPTS as i32 {
-            tally = Some(CrossAttempts::record(tally, index));
-        }
-        gs.zone_cross_attempts = tally;
-        assert!(gs.zone_cross_attempts.unwrap().blocks(),
-            "test setup: the fixture must reach the actual blocking bound, or this test does not \
-             exercise the harm its assertion describes");
-        gs.zone_cross_plan = Some(ZoneCrossPlan {
-            requested_zone_id: Some(181),
-            index: 3,
-            resolution: ZoneCrossResolution::ServerResolved,
-        });
-        assert!(gs.zone_cross_plan.unwrap().resolution.is_best_effort(),
-            "test setup: the fixture must be the best-effort case, since that is the only case \
-             GET /v1/observe/debug discloses (`observe.rs`'s `.filter(|p| p.resolution.is_best_effort())`)");
-
-        gs.begin_zone_in();
-
-        assert!(gs.zone_cross_attempts.is_none(),
-            "a cross-attempt tally counts attempts made during ONE continuous stand and blocks \
-             further auto-cross once the count reaches MAX_CROSS_ATTEMPTS — carried into a new \
-             zone, an already-blocked tally would leave the new zone's auto-cross gate stuck \
-             refusing to retry for a limit the OLD zone's stand reached, not this one's; a \
-             zone-in must clear it so the new zone starts unblocked");
-        assert!(gs.zone_cross_plan.is_none(),
-            "a zone-cross plan's index and requested zone id are only meaningful against the zone \
-             that produced them, and a best-effort resolution left in place would keep \
-             /v1/observe/debug reporting a degraded-destination crossing for a request the new \
-             zone never made — a zone-in must clear it so that disclosure reads null until this \
-             zone resolves a crossing of its own");
-    }
-
     /// #883 — the previous zone's `last_consider` must NOT survive a zone-in.
     ///
     /// `last_consider` is spawn-scoped exactly like `target_id`/`target_con*`, but it is deliberately
@@ -4066,7 +3923,7 @@ pub(crate) mod tests {
     /// guard, not an assertion.
     #[test]
     fn begin_zone_in_clears_every_field_it_owns_at_once_883() {
-        use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
+        use crate::zone_cross::{CrossAttempts, MAX_CROSS_ATTEMPTS};
         use crate::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
 
         let mut gs = GameState::new();
@@ -4083,11 +3940,6 @@ pub(crate) mod tests {
             tally = Some(CrossAttempts::record(tally, index));
         }
         gs.zone_cross_attempts = tally;
-        gs.zone_cross_plan = Some(ZoneCrossPlan {
-            requested_zone_id: Some(181),
-            index: 3,
-            resolution: ZoneCrossResolution::ServerResolved,
-        });
         gs.player_hold = Some(ControllerHold {
             reason: ControllerHoldReason::EmbeddedNoRecovery,
             secs: 9.5,
@@ -4148,7 +4000,6 @@ pub(crate) mod tests {
         assert!(!gs.player_pos_known, "player_pos_known");
         assert!(gs.position_provisional_since.is_none(), "position_provisional_since");
         assert!(gs.zone_cross_attempts.is_none(), "zone_cross_attempts");
-        assert!(gs.zone_cross_plan.is_none(), "zone_cross_plan");
         assert!(gs.player_hold.is_none(), "player_hold");
         assert!(gs.player_afloat_stall.is_none(), "player_afloat_stall");
         assert!(gs.last_relocation.is_none(), "last_relocation");
@@ -4526,7 +4377,7 @@ pub(crate) mod tests {
             // `begin_zone_in`'s comment on `zone_in_failed`.)
             world: _,
             player_pos_known: _, position_provisional_since: _,
-            zone_cross_attempts: _, zone_cross_plan: _,
+            zone_cross_attempts: _,
             player_hold: _, player_afloat_stall: _,
             // #925: `last_relocation.to` is a coordinate in the departed zone. The
             // `client_relocations` COUNTER beside it is NOT here — it is session-monotonic; see the
@@ -4548,8 +4399,10 @@ pub(crate) mod tests {
             task_offers: _,
 
             // ── NOT ZONE-SCOPED: survives a zone line by design. ──
+            // Drained by `ActionLoop::tick` every tick; a stale ack matches no held request.
+            server_acks: _,
             // Identity + character sheet: the same character, in a different zone.
-            player_id: _, player_name: _, player_level: _, player_race: _, player_class: _,
+            zone_epoch: _, automatic_loot: _, automatic_zone_crossing: _, player_id: _, player_name: _, player_level: _, player_race: _, player_class: _,
             player_gender: _, player_face: _, player_hairstyle: _, player_haircolor: _,
             player_guild_id: _, player_guild_rank: _, stats: _, player_skills: _,
             player_equipment: _, player_equipment_tint: _, mem_spells: _,
@@ -4582,7 +4435,7 @@ pub(crate) mod tests {
             inventory: _, inventory_received: _, trade_ack_ready: _,
             tasks: _, completed_task_history: _,
             // Logs, feeds and session plumbing.
-            messages: _, chat_events: _, next_chat_id: _, last_book_text: _, ucs: _,
+            messages: _, chat_events: _, received_self_echoes: _, next_chat_id: _, last_book_text: _, ucs: _,
             // #925: `client_relocations` counts client-side body relocations for the life of the
             // session, exactly like `server_corrections` beside it. (The `last_relocation` detail it
             // pairs with IS zone-scoped — see the ZONE-SCOPED group above.)

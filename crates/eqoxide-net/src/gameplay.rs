@@ -174,6 +174,7 @@ pub async fn run_gameplay_phase(
     // The OP_RespawnWindow payload the server sent when we died, held (NOT auto-answered) until the
     // agent POSTs /v1/lifecycle/respawn (#284).
     let mut pending_respawn: Option<Vec<u8>> = None;
+    let mut corpse_loot = crate::corpse_loot::CorpseLoot::default();
 
     loop {
         let s  = stream.as_mut().expect("stream always Some in loop");
@@ -185,9 +186,9 @@ pub async fn run_gameplay_phase(
         // dependency on other data published by the setter (/exit or window-close).
         if shutdown.load(Ordering::Relaxed) {
             perform_clean_shutdown(s, rx).await;
-            // Logout sent. Idle until the main thread exits the process (it owns the winit/Wayland
-            // teardown). Do NOT return — returning would let run_login_flow retry and reconnect.
-            loop { sleep(Duration::from_millis(200)).await; }
+            // run_login_flow returns after gameplay; it never retries a completed session.
+            // Returning lets CPU hosts finish shutdown while graphical owners tear down their UI.
+            return;
         }
 
         // ── Server-side session drop (#642) ──────────────────────────────────
@@ -220,7 +221,7 @@ pub async fn run_gameplay_phase(
         // alive (keepalives below still fire) until CAMP_DURATION elapses, then set `shutdown` so
         // the disconnect is clean (the server has set `instalog`, so no linkdead). Cancelling sends
         // a Standing `OP_SpawnAppearance`, which disables the server-side camp timer.
-        if let Some(cmd) = camp.lock().unwrap().take() {
+        if let Some(cmd) = camp.lock().unwrap().take().and_then(|cmd|cmd.for_epoch(gs.zone_epoch)) {
             let now      = std::time::Instant::now();
             let current  = *camp_until.lock().unwrap();
             let (next, action) = camp_apply(cmd, current, now, CAMP_DURATION);
@@ -270,6 +271,7 @@ pub async fn run_gameplay_phase(
                 }
             }
             apply_packet(&mut gs, &packet);
+            corpse_loot.observe(&mut gs, &packet, std::time::Instant::now());
             record_app_packet(&mut net_health.lock().unwrap(), std::time::Instant::now());
             action_loop.sync_entities(&gs);
             action_loop.sync_zone_points(&gs);
@@ -340,13 +342,6 @@ pub async fn run_gameplay_phase(
                         gs.log_msg("trade", "Accepting incoming trade request.");
                         tracing::info!("EQ: trade: acked incoming OP_TradeRequest from mob_id={}", from_mob_id);
                     }
-                }
-                // Server listed a lootable item — echo back immediately to take it.
-                OP_LOOT_ITEM => {
-                    gs.loot_last_activity = Some(std::time::Instant::now());
-                    gs.log_msg("loot", "Looting item...");
-                    s.send_app_packet(OP_LOOT_ITEM, &packet.payload);
-                    tracing::info!("EQ: auto-loot: taking item (echoed OP_LootItem)");
                 }
                 // Player died: the server opened the respawn hover window and holds us as a corpse
                 // until we pick an option. #284: DON'T auto-respawn — keep the character slain so a
@@ -429,7 +424,7 @@ pub async fn run_gameplay_phase(
                         // Same-zone teleport (e.g. #goto x y z, #zone 0).
                         // The server expects the client to just move — it clears zone_mode
                         // before we respond, so sending OP_ZONE_CHANGE would cause a cancel
-                        // and a spurious world reconnect (see zoning.cpp:1056-1068).
+                        // and a spurious world reconnect (see eqemu:zone/zoning.cpp@7ab909ee4:1056-1068).
                         // Wire y = server_y = east = gs.player_y; wire x = server_x = north = gs.player_x.
                         gs.player_x = x;
                         gs.player_y = y;
@@ -519,6 +514,10 @@ pub async fn run_gameplay_phase(
             }
         }
 
+        if let Some(request) = corpse_loot.next_request(&mut gs, std::time::Instant::now()) {
+            s.send_app_packet(OP_LOOT_ITEM, &request);
+        }
+
         // ── Auto-loot ──────────────────────────────────────────────────────────
         // `loot_tick_action` is the pure decision (no I/O, no gs); this loop performs whatever it
         // decides and applies the resulting state. The one thing it NEVER decides is "Looting
@@ -552,7 +551,7 @@ pub async fn run_gameplay_phase(
                 // Payload MUST be the corpse's spawn_id (4 bytes) — EQEmu's Handle_OP_EndLootRequest
                 // drops any OP_EndLootRequest whose size != sizeof(uint32) without replying, so the
                 // old empty-payload send could never have produced an OP_LootComplete at all
-                // (client_packet.cpp:6266).
+                // (eqemu:zone/client_packet.cpp@ca704c7f8:6266).
                 s.send_app_packet(OP_END_LOOT_REQUEST, &corpse_id.to_le_bytes());
                 gs.loot_end_requested_at = Some(std::time::Instant::now());
                 tracing::info!(
@@ -564,7 +563,7 @@ pub async fn run_gameplay_phase(
                 apply_loot_open_timeout(&mut gs, corpse_id);
                 // #414: release the server-side loot lock speculatively even though this corpse
                 // never confirmed open — `Corpse::EndLoot` doesn't check ownership (verified
-                // against EQEmu zone/corpse.cpp:1787-1802 via eq-client-expert), so this is safe.
+                // against EQEmu eqemu:zone/corpse.cpp@7ab909ee4:1787-1802 via eq-client-expert), so this is safe.
                 // Waiting for it to resolve (loot_defensive_close_at, set inside
                 // apply_loot_open_timeout) before opening the next corpse narrows the window in
                 // which a late OP_MoneyOnCorpse for THIS corpse could land on a later session.
@@ -1116,13 +1115,11 @@ async fn run_zone_entry_handshake(
     // `publish_snapshot` runs every 10 ms and keeps the HTTP session live and answering:
     //
     //   * the roster quartet backs NAME → SPAWN-ID resolution — GET /v1/observe/entities,
-    //     POST /v1/interact/hail, /v1/merchant/open|buy|sell, /v1/trainer/open, /v1/move/goto by
-    //     name, and the "is this spawn known?" gate on /v1/combat/target and /v1/combat/consider —
+    //     POST /v1/interact/hail, /v1/merchant/open|buy|sell, /v1/trainer/open, and the "is this spawn known?" gate on /v1/combat/target and /v1/combat/consider —
     //     so a call issued during the window resolves a name against the zone we just left and
     //     addresses a spawn id that means something else here, or nothing.
     //   * `zone_points` is served by GET /v1/observe/zone_entrances (and its `/zone_points` alias)
-    //     and is what POST /v1/move/zone_cross validates a requested `zone_id` against, so during
-    //     the window the exits answered are the departed zone's. GET /v1/observe/zone_exits reads
+    //     so during the window the exits answered are the departed zone's. GET /v1/observe/zone_exits reads
     //     the same list too (#1063 review round 1, finding 5 — it was missing from this list): for
     //     `dest_of` and to feed `classify_unresolved_cross`. On the cleared list it reports every
     //     exit as `"zone_id": null` (documented as honestly UNKNOWN, #683) with `gated: true`,
@@ -1273,7 +1270,7 @@ pub fn camp_apply(
     match (cmd, current) {
         (_, None)                  => (Some(now + dur), CampAction::Started),
         (CampCmd::Toggle, Some(_)) => (None, CampAction::Cancelled),
-        (CampCmd::Start, Some(d))  => (Some(d), CampAction::NoOp),
+        (CampCmd::Start | CampCmd::StartInZone(_), Some(d))  => (Some(d), CampAction::NoOp),
     }
 }
 
@@ -1438,6 +1435,7 @@ pub fn loot_tick_action(state: &LootTickState, now: std::time::Instant) -> LootT
 /// `OP_EndLootRequest` resolves (see `loot_tick_action`'s `defensive_close_at` branch) keeps
 /// `apply_money_on_corpse`'s stale-ack gate correctly closed until then.
 fn apply_loot_open_timeout(gs: &mut GameState, corpse_id: u32) {
+    gs.push_ack(eqoxide_core::game_state::ServerAck::LootOpenTimedOut { corpse_id });
     gs.loot_confirmed = false;
     gs.loot_last_activity = None;
     gs.loot_end_requested_at = None;
@@ -2677,7 +2675,7 @@ mod zone_entry_handshake_publish_tests {
     /// `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s) — while `publish_snapshot`
     /// ran every 10 ms and kept the HTTP session live. That roster is what name → spawn-id
     /// resolution reads, so `POST /v1/interact/hail {"name":"…"}`, `/v1/merchant/open`,
-    /// `/v1/trainer/open`, `/v1/move/goto` by name and the "is this spawn known?" gate on
+    /// `/v1/trainer/open` and the "is this spawn known?" gate on
     /// `/v1/combat/target` all resolved a name against the zone we had just left and addressed a
     /// spawn id that means something else here, or nothing.
     ///
@@ -2752,7 +2750,7 @@ mod zone_entry_handshake_publish_tests {
                  handshake whose deadline is 30s (positions={p} ids={i} poses={o} dead={d}) — an \
                  agent polling GET /v1/observe/entities reads a complete, well-formed roster of a \
                  zone it is no longer in, and every name → spawn-id resolution built on it (hail, \
-                 merchant, trainer, goto-by-name, combat target) addresses a departed spawn id \
+                 merchant, trainer, combat target) addresses a departed spawn id \
                  (#1010)");
             sleep(Duration::from_millis(10)).await;
         }
@@ -2765,10 +2763,8 @@ mod zone_entry_handshake_publish_tests {
     /// Same shape and same reason as the roster test above, for the other `WorldSlots` group.
     /// `GameState::begin_zone_in` clears `gs.world.zone_points` (#683 review F2); the published
     /// list it is mirrored into is what
-    /// `GET /v1/observe/zone_entrances` (and its `/zone_points` alias) serves and what
-    /// `POST /v1/move/zone_cross` validates a requested `zone_id` against — so for the whole
-    /// zone-in window the exits an agent reads, and the reachability its crossing request is judged
-    /// by, are the DEPARTED zone's.
+    /// `GET /v1/observe/zone_entrances` (and its `/zone_points` alias) serves — so for the whole
+    /// zone-in window the exits an agent reads are the DEPARTED zone's.
     ///
     /// Isolated in its own test rather than folded into the roster one, for the reason #1004's
     /// review gave for the merchant/task-offer split: with both groups asserted in one test an
@@ -2829,8 +2825,7 @@ mod zone_entry_handshake_publish_tests {
             assert!(std::time::Instant::now() < deadline,
                 "the published zone_points list still held {left} of the departed zone's exit \
                  points 1s into a handshake whose deadline is 30s — GET /v1/observe/zone_entrances \
-                 serves them as this zone's exits and POST /v1/move/zone_cross judges a requested \
-                 zone_id reachable against them (#1010)");
+                 serves them as this zone's exits (#1010)");
             sleep(Duration::from_millis(10)).await;
         }
 
@@ -3174,3 +3169,35 @@ mod wedge_timeline_tests {
     }
 }
 
+
+#[cfg(test)]
+mod shutdown_completion_tests {
+    use super::*;
+    #[tokio::test]
+    async fn clean_logout_returns_to_the_host_without_reconnecting() {
+        let(stream,rx)=crate::transport::test_stream(0,0).await;
+        let slots=crate::action_loop::ActionLoopSlots {
+            world:Default::default(),quest:Default::default(),group_slots:Default::default(),command:Default::default(),
+            social:Default::default(),merchant_slots:Default::default(),inventory_slots:Default::default(),
+            interact:Default::default(),chat:Default::default(),controller:Default::default(),guild_slots:Default::default(),
+            collision:Arc::new(std::sync::RwLock::new(None)),maps_dir:"/unused".into(),
+        };
+        let lifecycle=GameplayLifecycle {shutdown:Arc::new(AtomicBool::new(true)),camp:Default::default(),
+            camp_until:Default::default(),respawn:Default::default(),
+            game_state_snapshot:Arc::new(arc_swap::ArcSwap::from_pointee(GameState::new())),net_health:Default::default()};
+        let credentials=WorldCredentials{lsid:0,ls_key:String::new(),world_host:"not-used".into(),world_port:0};
+        tokio::time::timeout(Duration::from_secs(2),run_gameplay_phase(stream,rx,GameState::new(),"Synthetic".into(),
+            ActionLoop::new(slots),credentials,lifecycle)).await.expect("host must observe logout completion");
+    }
+}
+
+#[cfg(test)]
+mod scoped_camp_tests {
+    #[test]
+    fn camp_cannot_cross_its_admission_epoch() {
+        use eqoxide_ipc::CampCmd;
+        assert!(CampCmd::StartInZone(1).for_epoch(2).is_none());
+        assert_eq!(CampCmd::StartInZone(2).for_epoch(2),Some(CampCmd::Start));
+        assert_eq!(CampCmd::Start.for_epoch(2),Some(CampCmd::Start));
+    }
+}

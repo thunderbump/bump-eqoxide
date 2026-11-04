@@ -3,12 +3,12 @@
 //! Loads config + the EQ string table, creates the shared request slots (`Arc<Mutex<…>>`) and the
 //! mpsc packet channel, then starts the three concurrent halves: the EQ network thread
 //! (`run_login_flow`, skipped with `--testzone`), the HTTP API server, and the winit/wgpu render
-//! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the nav
+//! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the net
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
 use eqoxide::{camera_state, config, eqstr, http, ipc};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use winit::event_loop::EventLoop;
 
 // Shared by `parse_cli` (prints it on a parse error / `-h`/`--help`) and `main` (prints it when a
@@ -26,99 +26,35 @@ OPTIONS:
                            under ~/.config/eqoxide/; a value with a '/' is used as a literal path.
                            Omit to use the default ~/.config/eqoxide/config.yaml.
     --testzone             Run the renderer offline (no server) for asset/zone debugging.
+    --preview-glb <PATH>   Inspect a unified static visual GLB without account/config or asset sync.
+                           Only --api-port is accepted with this mode. The default preview API
+                           uses an ephemeral loopback port, printed as API_PORT=N.
     --profile              Enable the per-phase frame-timing HUD overlay.
-    --nav-debug            Show the nav diagnostics overlay at startup (#608): a depth-tested 3D
-                           pass drawing the snapshot navigation PUBLISHES — the planner's own
-                           per-edge accept/reject trace, the walker's committed route, clearance
-                           spokes, pads. Same data as GET /v1/observe/nav_debug. Toggle with F11.
     --api-port <N>         Bind the agent HTTP API to exactly TCP port N (1-65535), instead of
-                           scanning upward from the config base port. The launch's API is
-                           disabled if N is already in use. Use a port you've reserved via a
+                           scanning upward from the config base port. A busy explicit port
+                           fails startup in every mode. Use a port you've reserved via a
                            /tmp lockfile so concurrent test clients don't collide.
+    --agent-socket <PATH>  Bind the Agent Plugin API to this Unix socket path. The API is
+                           disabled entirely unless this flag is given.
     -h, --help             Show this help and exit.
 ";
 
-/// Parsed command-line flags, as produced by [`parse_cli`].
-struct CliArgs {
-    testzone: bool,
-    profile: bool,
-    nav_debug: bool,
-    config: Option<String>,
-    api_port: Option<u16>,
-}
+mod cli;
+use cli::{CliArgs, ParsedCli, StartupMode};
 
-/// Parse + STRICTLY validate `std::env::args()`. Errors out (printing [`USAGE`] and exiting via
-/// `eqoxide::crash::exit`) on anything malformed or unrecognized rather than silently falling
-/// back to defaults — a silent fallback once made the client log into the wrong account when
-/// `--config` pointed at a missing file.
+/// Parse startup flags before config resolution or any mode-specific work.
 fn parse_cli() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
-    let mut testzone_mode = false;
-    let mut profile_flag  = false;
-    let mut nav_debug_flag = false;
-    let mut login_cfg_arg: Option<String> = None;
-    let mut api_port_arg: Option<u16> = None;
-    let mut idx = 1; // skip argv[0] (program name)
-    while idx < args.len() {
-        let arg = args[idx].as_str();
-        match arg {
-            "--testzone" => testzone_mode = true,
-            "--profile"  => profile_flag  = true,
-            "--nav-debug" => nav_debug_flag = true,
-            "-h" | "--help" => { print!("{USAGE}"); eqoxide::crash::exit("help", 0); }
-            // accept both "--config <value>" and "--config=<value>"
-            _ if arg == "--config" || arg.starts_with("--config=") => {
-                let value = if let Some(v) = arg.strip_prefix("--config=") {
-                    v.to_string()
-                } else {
-                    match args.get(idx + 1) {
-                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
-                        _ => {
-                            eprintln!("error: --config requires a value (a profile name or config file path)\n\n{USAGE}");
-                            eqoxide::crash::exit("bad-args", 2);
-                        }
-                    }
-                };
-                if value.is_empty() {
-                    eprintln!("error: --config requires a non-empty value\n\n{USAGE}");
-                    eqoxide::crash::exit("bad-args", 2);
-                }
-                login_cfg_arg = Some(value);
-            }
-            // accept both "--api-port <value>" and "--api-port=<value>"
-            _ if arg == "--api-port" || arg.starts_with("--api-port=") => {
-                let value = if let Some(v) = arg.strip_prefix("--api-port=") {
-                    v.to_string()
-                } else {
-                    match args.get(idx + 1) {
-                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
-                        _ => {
-                            eprintln!("error: --api-port requires a value (a TCP port 1-65535)\n\n{USAGE}");
-                            eqoxide::crash::exit("bad-args", 2);
-                        }
-                    }
-                };
-                match value.parse::<u16>() {
-                    Ok(p) if p > 0 => api_port_arg = Some(p),
-                    _ => {
-                        eprintln!("error: --api-port must be a number 1-65535, got '{value}'\n\n{USAGE}");
-                        eqoxide::crash::exit("bad-args", 2);
-                    }
-                }
-            }
-            other => {
-                eprintln!("error: unrecognized argument '{other}'\n\n{USAGE}");
-                eqoxide::crash::exit("bad-args", 2);
-            }
+    match cli::parse_args(&args) {
+        Ok(ParsedCli::Run(cli)) => cli,
+        Ok(ParsedCli::Help) => {
+            print!("{USAGE}");
+            eqoxide::crash::exit("help", 0);
         }
-        idx += 1;
-    }
-    CliArgs {
-        testzone: testzone_mode,
-        profile: profile_flag,
-        nav_debug: nav_debug_flag,
-        config: login_cfg_arg,
-        api_port: api_port_arg,
+        Err(error) => {
+            eprintln!("error: {error}\n\n{USAGE}");
+            eqoxide::crash::exit("bad-args", 2);
+        }
     }
 }
 
@@ -129,8 +65,23 @@ fn main() {
     eqoxide::crash::install();
 
     let cli = parse_cli();
-    let testzone_mode = cli.testzone;
-    let nav_debug_flag = cli.nav_debug;
+    if let StartupMode::Preview(path) = &cli.mode {
+        match eqoxide::preview::run(
+            path.clone(),
+            eqoxide::preview::PreviewOptions {
+                api_port: cli.api_port,
+            },
+        ) {
+            Ok(()) => {
+                eqoxide::crash::exit("clean", 0);
+            }
+            Err(error) => {
+                eprintln!("error: static visual preview failed: {error:#}");
+                eqoxide::crash::exit("preview-failed", 1);
+            }
+        }
+    }
+    let testzone_mode = matches!(cli.mode, StartupMode::TestZone);
 
     // `--profile` (or EQ_PROFILE=1) enables the lightweight per-phase frame-timing HUD overlay.
     let profile_mode = cli.profile
@@ -278,13 +229,6 @@ fn main() {
             manual_move: Arc::new(Mutex::new(None)),
         }
     };
-    let nav = ipc::NavSlots {
-        goto_target:   Arc::new(Mutex::new(None)),
-        goto_entity:   Arc::new(Mutex::new(None)),
-        zone_cross:    Arc::new(Mutex::new(None)),
-        nav_avoid:     Arc::new(Mutex::new(ipc::AggroAvoidOpts::default())),
-        nav_state:     Arc::new(Mutex::new(ipc::NavStatus::default())),
-    };
     // #643: built via `Default` rather than field-by-field, because `Roster` has no public
     // constructor — only `eqoxide-ipc` can produce the empty roster maps, which is what makes
     // `WorldSlots::publish_entities` the sole writer. All fields are empty here either way.
@@ -358,18 +302,11 @@ fn main() {
         game_event_cursor: Default::default(),
     };
     // Single-authority movement (Component A): the render thread owns the CharacterController and
-    // publishes `controller_view`; the nav thread streams it and writes `nav_intent` for /goto;
-    // `pos_correction` hands a server correction back to the controller.
+    // publishes `controller_view`; `pos_correction` hands a server correction back to the controller.
     let controller = ipc::ControllerSlots {
         controller_view: Arc::new(Mutex::new(eqoxide::movement::ControllerView::default())),
-        nav_intent:      Arc::new(Mutex::new(None)),
         pos_correction:  Arc::new(Mutex::new(None)),
     };
-    // The nav diagnostics snapshot slot (#608): the walker (nav thread) is the ONLY writer; the
-    // render overlay (`App` → `scene.nav_debug`) and `GET /v1/observe/nav_debug` (`HttpState`)
-    // read it. Defined in `eqoxide-nav` (it names nav types, which `eqoxide-ipc` sits below) and
-    // constructed ONCE here like every other cross-thread slot.
-    let nav_debug_view: eqoxide::nav::diagnostics::NavDebugView = Default::default();
     // Guild roster/identity published for GET /v1/guild/roster + /observe/debug, and the guild-action
     // request slot for POST /v1/guild/{invite,accept,leave,remove} (#295).
     let guild_slots = ipc::GuildSlots {
@@ -395,7 +332,7 @@ fn main() {
     let command = eqoxide::command_state::CommandState::new(
         combat.clone(), merchant_slots.clone(), inventory_slots.clone(), interact.clone(),
         quest.clone(), group_slots.clone(), guild_slots.clone(), trainer.clone(), social.clone(),
-        chat.clone(), nav.clone(), lifecycle.clone(),
+        chat.clone(), lifecycle.clone(),
     );
 
     // spells_us.txt is an EQ data file; default to the configured assets dir,
@@ -404,15 +341,15 @@ fn main() {
         .unwrap_or_else(|_| data_dir.join("spells_us.txt").to_string_lossy().into_owned());
     let spells: std::sync::Arc<eqoxide::spells::SpellDb> =
         std::sync::Arc::new(eqoxide::spells::SpellDb::load(&spells_path));
-    // Publish globally so the nav thread can resolve spell target types for self-cast (eqoxide#95).
+    // Publish globally so the net thread can resolve spell target types for self-cast (eqoxide#95).
     eqoxide::spells::set_global(spells.clone());
-    let shared_collision: eqoxide::nav::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
+    let shared_collision: eqoxide_zone_geometry::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     // #579 (agent-honesty): the zone terrain+collision LOAD STATE. The app thread (which owns the
     // zone loader) is its only writer; the HTTP layer reads it so a mid-load observation is an
     // explicit `pending`, never a false "empty world". Starts `Idle` — nothing loaded, nothing
     // loading — which is itself distinct from both.
-    let zone_assets: eqoxide::nav::zone_assets::ZoneAssetStateShared =
-        Arc::new(Mutex::new(eqoxide::nav::zone_assets::ZoneAssetState::Idle));
+    let zone_assets: eqoxide_zone_geometry::zone_assets::ZoneAssetStateShared =
+        Arc::new(Mutex::new(eqoxide_zone_geometry::zone_assets::ZoneAssetState::Idle));
     // Terminal background-worker failures (#616, agent-honesty). Constructed ONCE here, exactly like
     // `zone_assets` above, and the SAME `Arc` cloned into both `App::new` (the sole writer — see
     // `run_common_asset_loader` / `run_model_sync_worker` in `src/app.rs`) and `spawn_camera_server`
@@ -458,7 +395,6 @@ fn main() {
         // Each bundle below is a shallow `.clone()` of the Arc handles constructed once above —
         // this thread gets the SAME underlying channels as `HttpState` (wired below), preserving
         // the cross-thread sharing the flat per-field clones used to provide.
-        let nav_b             = nav.clone();
         let world_b           = world.clone();
         let quest_b           = quest.clone();
         let group_slots_b     = group_slots.clone();
@@ -471,7 +407,6 @@ fn main() {
         let controller_b      = controller.clone();
         let guild_slots_b     = guild_slots.clone();
         let sc  = shared_collision.clone();
-        let za  = zone_assets.clone(); // #600: the walker reads this SAME load-state handle for its gate
         let sd  = shutdown.clone();
         let cp  = lifecycle.camp.clone();
         let cu  = lifecycle.camp_until.clone();
@@ -492,7 +427,6 @@ fn main() {
         let model = eqoxide::model::ServerModel::new(login_cfg, 10);
         let model_ctx = eqoxide::model::ModelContext {
             slots: eqoxide::eq_net::action_loop::ActionLoopSlots {
-                nav:             nav_b,
                 world:           world_b,
                 quest:           quest_b,
                 group_slots:     group_slots_b,
@@ -505,8 +439,6 @@ fn main() {
                 controller:      controller_b,
                 guild_slots:     guild_slots_b,
                 collision:       sc,
-                nav_debug:       nav_debug_view.clone(),
-                zone_assets:     za,
                 maps_dir:        md,
             },
             lifecycle: eqoxide::eq_net::gameplay::GameplayLifecycle {
@@ -552,7 +484,7 @@ fn main() {
 
     // HTTP server
     // All the request slots UI windows can write, bundled (#162). These are the
-    // same slots the HTTP API and nav/gameplay threads share. This is a PRE-EXISTING bundle
+    // same slots the HTTP API and net threads share. This is a PRE-EXISTING bundle
     // (separate from the M4 domain bundles above); its fields are individual `.clone()`s pulled
     // out of the M4 bundles so it keeps sharing the same underlying Arcs.
     let app_actions = eqoxide::ui::Actions {
@@ -590,11 +522,27 @@ fn main() {
         },
         None => None,
     };
+    // --agent-socket PATH: bind it now and FAIL THE LAUNCH if it's unavailable, mirroring
+    // --api-port's precedent just above — a background thread failing to bind with nothing but a
+    // tracing line to show for it left a launch that looked successful but had no agent socket.
+    let agent_listener: Option<std::os::unix::net::UnixListener> = match cli.agent_socket.as_ref() {
+        Some(path) => match eqoxide_agent_plugin_host::bind_agent_socket(path) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "error: --agent-socket {} is unavailable ({e}). Free the path or choose another.",
+                    path.display()
+                );
+                eqoxide::crash::exit("agent-socket-unavailable", 1);
+            }
+        },
+        None => None,
+    };
+    // Cloned here because `net_thread_dead` (below) is MOVED into `http::spawn_camera_server`.
+    let net_thread_dead_for_agent = net_thread_dead.clone();
     http::spawn_camera_server(
         camera.clone(),
-        nav.clone(),
         world,
-        shared_collision.clone(),
         zone_assets.clone(),
         common_assets_failed.clone(),
         model_sync_dead.clone(),
@@ -614,11 +562,26 @@ fn main() {
         group_slots,
         lifecycle.clone(),
         guild_slots,
-        nav_debug_view.clone(),
         skin_cap_downgrades_shared.clone(),
         app_cfg.http_port,
         exact_listener,
     );
+
+    // Off by default (spec §4): an unauthenticated local control-plane socket must be opt-in, not
+    // something every launch exposes via an undocumented default path.
+    if let (Some(agent_socket_path), Some(agent_listener)) = (cli.agent_socket.clone(), agent_listener) {
+        eqoxide_agent_plugin_host::spawn_agent_plugin_host(
+            camera.clone(),
+            command.clone(),
+            game_state_snapshot.clone(),
+            shared_collision.clone(),
+            spells.clone(),
+            net_thread_dead_for_agent,
+            agent_socket_path,
+            agent_listener,
+            data_dir.clone(),
+        );
+    }
 
     let event_loop = EventLoop::new().expect("event loop");
     let mut application = eqoxide::app::App::new(
@@ -626,13 +589,12 @@ fn main() {
             models_path: app_cfg.models_path,
             character_name,
             testzone_mode,
-            nav_debug: nav_debug_flag,
             eq_ui_dir: app_cfg.eq_ui_dir,
             shutdown: shutdown.clone(),
         },
         camera,
         controller,
-        eqoxide::app::NavHandles { shared_collision, zone_assets, nav_debug_view },
+        eqoxide::app::ZoneHandles { shared_collision, zone_assets },
         eqoxide::app::SessionHandles {
             game_state_snapshot: game_state_snapshot.clone(),
             net_health: net_health_shared.clone(),

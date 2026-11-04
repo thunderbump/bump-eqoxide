@@ -3,8 +3,15 @@
 [![Asset server: eqoxide_asset_server](https://img.shields.io/badge/asset%20server-eqoxide__asset__server-blue?logo=github)](https://github.com/djhenry/eqoxide_asset_server)
 
 A lightweight **EQEmu** client. It connects to an
-EQEmu server, relies on eqoxide asset server for content, renders the zone in 3D (wgpu), and exposes a local **HTTP API** so an agent (or
-any script) can drive the client — move, hail NPCs, target, fight, buy, capture frames, and more.
+EQEmu server, relies on eqoxide asset server for content, renders the zone in 3D (wgpu), and gives an
+agent (or any script) two ways to drive it: a local **HTTP API** (move, hail NPCs, target, fight, buy,
+capture frames, and more) and the **Agent Plugin API**, a low-latency Unix domain socket for RL-style
+agent control (see [`docs/agent-api.md`](docs/agent-api.md)). The Agent Plugin API is becoming
+eqoxide's primary programmatic interface; see
+[`docs/specs/2026-09-21-agent-harness-separation-design.md`](docs/specs/2026-09-21-agent-harness-separation-design.md)
+for the plan and [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar)
+for a reference agent harness that drives eqoxide entirely over that socket, including A* navigation
+and chase-and-engage combat positioning that used to live in the HTTP API.
 It targets **EQEmu servers only** (it is not for, and does not work with, official EverQuest servers).
 It can log in as a **GM observer** or as a **regular player character** that actually plays
 (see [`docs/autonomous-play.md`](docs/autonomous-play.md)).
@@ -20,8 +27,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | Login as a regular player character | ✅ | Plays for real; per-character config in `~/.config/eqoxide/` |
 | Multiple instances side-by-side | ✅ | Auto-binds next free HTTP port from 8765; prints `API_PORT=` |
 | Graceful shutdown (`POST /v1/lifecycle/exit`) | ✅ | Per-instance; never `pkill` |
-| Zone-line travel (`POST /v1/navigate/zone_cross`) | ✅ | Sends target zone id; verified both ways (e.g. qcat↔qeynos) |
-| Auto walk-into a zone line | 🐞 | Rarely fires — server sends arrival, not trigger, coords; use `/v1/navigate/zone_cross` |
+| Auto walk-into a zone line | 🐞 | Rarely fires — server sends arrival, not trigger, coords |
 | Derived-asset sync from `eqoxide_asset_server` | ✅ | Models, textures, string table, maps fetched over HTTP into XDG cache |
 
 ### Rendering
@@ -42,8 +48,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 ### Gameplay & automation (HTTP API)
 | Feature | Status | Notes |
 |---|---|---|
-| Movement: walk `POST /v1/navigate/goto` (A* pathfinding) | ✅ | Routes around walls within connected areas; stalls across closed doors |
-| Movement: teleport `POST /v1/navigate/warp` | ✅ | Anti-cheat capped (~50–95u/hop); small hops from a synced state |
+| Movement: pathfinding (`goto`/`follow`) | harness | Lives in [eqoxide-agent-harness-example-http-astar](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar); eqoxide keeps the character controller and `/v1/move/manual`/`jump` |
 | Combat: auto-attack / auto-face | ✅ | Heading-scale fix made melee land. Swings at the target you set and only that one — the client never re-picks it (#1109); retargeting and grind policy live in the driving agent |
 | Spell casting (`POST /v1/combat/cast`, gems, cast bar) | ✅ | `OP_CastSpell` + begin/mana/interrupt feedback |
 | Scribe / memorize spells (`POST /v1/combat/scribe`, `/v1/combat/memorize`) | ✅ | |
@@ -54,8 +59,8 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | Quest hand-in (`POST /v1/interact/give`) + quest log (`/v1/quests/log`) | ✅ | Trade items to an NPC for turn-ins; also: completed history, task offer/accept/cancel |
 | Inventory read / move (`GET /v1/observe/inventory`, `/v1/inventory/move`) | ✅ | |
 | Doors API (`GET /v1/observe/doors`, `POST /v1/interact/click_door`) | ✅ | |
-| Water-region detection + swim navigation | ✅ | `.wtr` BSP; swim-descent in `find_path` |
-| Controlled-fall navigation + fall damage | 🟡 | Drop off ledges to a lower floor + client-side `OP_EnvDamage`; not yet exhaustively live-tested (curve tuning, water/levitate negation) |
+| Water-region detection + swim navigation | ✅ | `.wtr` BSP region lookup; swimming in the character controller |
+| Controlled fall + fall damage | 🟡 | Drop off ledges to a lower floor + client-side `OP_EnvDamage`; not yet exhaustively live-tested (curve tuning, water/levitate negation) |
 
 ### HUD / UI
 | Feature | Status | Notes |
@@ -164,8 +169,31 @@ See [`docs/http-api.md`](docs/http-api.md) for the full endpoint reference and
 
 - [`docs/architecture.md`](docs/architecture.md) — thread model, shared types, data flow
 - [`docs/http-api.md`](docs/http-api.md) — REST API reference (port discovery, `/v1/lifecycle/exit`, all endpoints)
+- [`docs/agent-api.md`](docs/agent-api.md) — Agent Plugin API reference (the `--agent-socket` protocol)
 - [`docs/dev-workflow.md`](docs/dev-workflow.md) — building, running, multi-instance, verify loop
 - [`docs/autonomous-play.md`](docs/autonomous-play.md) — playing as a real character
 - [`docs/protocol-notes.md`](docs/protocol-notes.md) — EQ RoF2 wire protocol notes
 - [`docs/collision-system.md`](docs/collision-system.md), [`docs/zone-rendering.md`](docs/zone-rendering.md),
   [`docs/character-models.md`](docs/character-models.md) — rendering internals
+- [`docs/specs/2026-09-21-agent-harness-separation-design.md`](docs/specs/2026-09-21-agent-harness-separation-design.md) —
+  the plan to make the Agent Plugin API eqoxide's sole programmatic interface, with A* navigation and
+  chase-and-engage combat positioning in
+  [`eqoxide-agent-harness-example-http-astar`](https://github.com/djhenry/eqoxide-agent-harness-example-http-astar)
+
+
+## Bump evaluation
+
+This fork includes a CPU-only player candidate using the existing network and HTTP crates.
+Build it with `scripts/build-headless`; see [the launch and control reference](docs/headless-player.md).
+The original `eqoxide` application still requires graphics. Upstream has not declared a project license;
+creating this fork does not resolve reuse licensing.
+
+Run the scoped library checks with `scripts/check-headless-crates`. It uses an explicitly pinned
+Rust container, defaults to offline operation, and leaves the source read-only. Use `--online`
+only to download missing locked Cargo dependencies. `EQOXIDE_CHECK_CACHE` selects a dedicated
+build/cache directory. These checks do not launch a player or qualify a live session.
+
+The authoritative evaluation and session-test brief live in the
+[EQEmu operations worklog](http://localhost:8081/projects/bump-eqemu/worklog/).
+The combined artifact/fixture preparation manifest belongs to `thunderbump/bump-akk-stack`,
+under `validation/session-test/preparation.json` on its preparation branch.

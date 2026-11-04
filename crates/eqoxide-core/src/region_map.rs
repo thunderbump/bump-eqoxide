@@ -18,10 +18,29 @@
 //! so our `is_water(server_x, server_y, server_z)` passes `(server_y, server_x, server_z)` as the
 //! BSP location to match the server's classification exactly.
 
-use std::path::Path;
+use std::{io::Read, path::Path};
 
 /// EQEmu region type for a zone-line region.
 const REGION_ZONE_LINE: i32 = 3;
+
+// Tree validation and query traversal have independent bounds: test fixtures bypass loading.
+const MAX_REGION_NODES: usize = 1_000_000;
+const MAX_REGION_DEPTH: usize = 256;
+// Qeynos2 v1 needs 3,890,421 units for its complete zone-line interior search.
+const MAX_REGION_TRAVERSAL_WORK: usize = 16_000_000;
+
+struct TraversalBudget {
+    remaining: usize,
+    exhausted: bool,
+}
+impl TraversalBudget {
+    fn new(remaining: usize) -> Self { Self { remaining, exhausted: false } }
+    fn spend(&mut self) -> bool {
+        if self.remaining == 0 { self.exhausted = true; return false; }
+        self.remaining -= 1;
+        true
+    }
+}
 
 /// **Why a zone's `.wtr` region data is NOT available** — the fact the old lossy
 /// `RegionMap::load`'s `Option` threw away (#762; that function is now deleted, #803).
@@ -36,7 +55,7 @@ const REGION_ZONE_LINE: i32 = 3;
 /// perfect score.
 ///
 /// So the load failure is a VALUE now. [`RegionMap::try_load`] returns it; carry it (see
-/// `eqoxide_nav::water_grid::ZoneWater`) rather than discarding it into a `None`.
+/// `eqoxide_zone_geometry::water_grid::ZoneWater`) rather than discarding it into a `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegionLoadError {
     /// No readable `.wtr` at `<dir>/<zone>.wtr` — specifically, `std::fs::read` failed with
@@ -50,8 +69,10 @@ pub enum RegionLoadError {
     /// message names what actually happened.
     Unreadable(std::io::ErrorKind),
     /// The file exists but is not region data: shorter than the 18-byte header (10-byte magic + u32
-    /// version + u32 node count), or wrong magic.
+    /// version + u32 node count), wrong magic, or an invalid BSP tree.
     NotRegionData,
+    /// Bounded input or node expansion exceeded the caller's budget.
+    LimitExceeded,
     /// A `.wtr` format version this build cannot read (only v1 and v2 are supported).
     UnsupportedVersion(u32),
     /// The header declares more BSP nodes than the file actually carries.
@@ -65,7 +86,8 @@ impl std::fmt::Display for RegionLoadError {
         match self {
             Self::Missing => write!(f, "no .wtr file for this zone"),
             Self::Unreadable(kind) => write!(f, ".wtr present but unreadable ({kind:?}), not confirmed absent"),
-            Self::NotRegionData => write!(f, ".wtr present but not region data (bad magic/header)"),
+            Self::LimitExceeded => write!(f, ".wtr exceeds the bounded input/node budget"),
+            Self::NotRegionData => write!(f, ".wtr present but not region data (bad magic/header/tree)"),
             Self::UnsupportedVersion(v) => write!(f, ".wtr is v{v}; only v1/v2 are supported"),
             Self::Truncated { declared_nodes, bytes } =>
                 write!(f, ".wtr is truncated: header declares {declared_nodes} BSP nodes, file is {bytes} bytes"),
@@ -106,6 +128,7 @@ impl RegionDataAbsent {
         match self {
             Self::NotAttached => "region_data_not_attached",
             Self::LoadFailed(e) => match e {
+                RegionLoadError::LimitExceeded      => "region_data_limit_exceeded",
                 RegionLoadError::Missing            => "region_data_missing",
                 RegionLoadError::Unreadable(_)      => "region_data_unreadable",
                 RegionLoadError::NotRegionData      => "region_data_not_region_data",
@@ -358,12 +381,21 @@ impl RegionMap {
     /// `Option`-returning wrapper it used to share this impl with was deleted in #803, so a caller
     /// can no longer answer off data it never read without first writing the discard by hand.
     pub fn try_load(dir: &Path, zone: &str) -> Result<RegionMap, RegionLoadError> {
+        Self::try_load_bounded(dir, zone, 64 * 1024 * 1024)
+    }
+
+    /// Limit native region input before allocating; v1 zero-index exits remain valid.
+    pub fn try_load_bounded(dir: &Path, zone: &str, max_file_bytes: usize) -> Result<RegionMap, RegionLoadError> {
         let path = dir.join(format!("{zone}.wtr"));
-        let d = std::fs::read(&path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
+        let file = std::fs::File::open(&path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
             RegionLoadError::Missing
         } else {
             RegionLoadError::Unreadable(e.kind())
         })?;
+        let cap = max_file_bytes.checked_add(1).ok_or(RegionLoadError::LimitExceeded)?;
+        let mut d = Vec::new();
+        file.take(cap as u64).read_to_end(&mut d).map_err(|e|RegionLoadError::Unreadable(e.kind()))?;
+        if d.len() > max_file_bytes { return Err(RegionLoadError::LimitExceeded); }
         if d.len() < 18 || &d[..10] != b"EQEMUWATER" { return Err(RegionLoadError::NotRegionData); }
         let version = u32::from_le_bytes(d[10..14].try_into().unwrap());
         // v1 = 36-byte nodes (no zone-line index); v2 = 40-byte nodes (trailing index).
@@ -375,9 +407,11 @@ impl RegionMap {
                 return Err(RegionLoadError::UnsupportedVersion(version));
             }
         };
-        let mut off = 14;
+        let mut off: usize = 14;
         let count = u32::from_le_bytes(d[off..off + 4].try_into().unwrap()) as usize; off += 4;
-        if d.len() < off + count * stride {
+        if count > MAX_REGION_NODES { return Err(RegionLoadError::LimitExceeded); }
+        let end = count.checked_mul(stride).and_then(|n|off.checked_add(n)).ok_or(RegionLoadError::LimitExceeded)?;
+        if d.len() < end {
             return Err(RegionLoadError::Truncated { declared_nodes: count, bytes: d.len() });
         }
         let mut nodes = Vec::with_capacity(count);
@@ -385,6 +419,10 @@ impl RegionMap {
             // ZBSP_Node: i32 node_number, f32 normal[3], f32 split, i32 region, i32 special, i32 left, i32 right [, i32 zone_line_index]
             let rd_f = |o: usize| f32::from_le_bytes(d[o..o + 4].try_into().unwrap());
             let rd_i = |o: usize| i32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+            if [rd_f(off+4),rd_f(off+8),rd_f(off+12),rd_f(off+16)].iter().any(|v|!v.is_finite())
+                || [rd_i(off+28),rd_i(off+32)].iter().any(|&index|index < 0 || index as usize > count) {
+                return Err(RegionLoadError::NotRegionData);
+            }
             nodes.push(BspNode {
                 normal:  [rd_f(off + 4), rd_f(off + 8), rd_f(off + 12)],
                 split:   rd_f(off + 16),
@@ -395,8 +433,41 @@ impl RegionMap {
             });
             off += stride;
         }
+        Self::validate_tree(&nodes)?;
         tracing::info!("region_map: loaded {} (v{version}, {} BSP nodes)", path.display(), nodes.len());
         Ok(RegionMap { nodes })
+    }
+
+    /// Native BSP records must form one rooted tree. A shared child can amplify
+    /// enumeration exponentially even when the graph is acyclic.
+    fn validate_tree(nodes: &[BspNode]) -> Result<(), RegionLoadError> {
+        if nodes.is_empty() { return Ok(()); }
+        let mut has_parent = vec![false; nodes.len()];
+        for node in nodes {
+            for child in [node.left, node.right] {
+                if child == 0 { continue; }
+                let index = child.checked_sub(1).and_then(|n| usize::try_from(n).ok())
+                    .filter(|&i| i < nodes.len()).ok_or(RegionLoadError::NotRegionData)?;
+                if index == 0 || has_parent[index] { return Err(RegionLoadError::NotRegionData); }
+                has_parent[index] = true;
+            }
+        }
+        if has_parent[1..].iter().any(|&present| !present) {
+            return Err(RegionLoadError::NotRegionData);
+        }
+        // Unique parents exclude reachable cycles; a disconnected cycle remains
+        // possible, so require every record to be reachable from node 1 as well.
+        let mut stack = vec![(0usize, 0usize)];
+        let mut visited = 0;
+        while let Some((index, depth)) = stack.pop() {
+            if depth >= MAX_REGION_DEPTH { return Err(RegionLoadError::LimitExceeded); }
+            visited += 1;
+            for child in [nodes[index].left, nodes[index].right] {
+                if child != 0 { stack.push(((child - 1) as usize, depth + 1)); }
+            }
+        }
+        if visited != nodes.len() { return Err(RegionLoadError::NotRegionData); }
+        Ok(())
     }
 
     // `RegionMap::load` — `try_load` with the failure discarded — WAS here. It is gone (#803), not
@@ -413,11 +484,19 @@ impl RegionMap {
     /// matches EQEmu's WaterMapV1::ReturnRegionType. Returns `None` if the tree is empty or the walk
     /// falls off (degenerate node / missing child).
     fn leaf_at(&self, sx: f32, sy: f32, sz: f32) -> Option<&BspNode> {
-        if self.nodes.is_empty() { return None; }
+        let mut budget = TraversalBudget::new(MAX_REGION_DEPTH);
+        self.leaf_at_bounded(sx, sy, sz, &mut budget)
+    }
+
+    fn leaf_at_bounded(&self, sx: f32, sy: f32, sz: f32,
+        budget: &mut TraversalBudget) -> Option<&BspNode> {
+        if self.nodes.is_empty() || [sx, sy, sz].iter().any(|v| !v.is_finite()) { return None; }
         let (lx, ly, lz) = (sy, sx, sz);
         let mut nn: i32 = 1;
-        for _ in 0..256 { // depth guard
-            let node = self.nodes.get((nn - 1) as usize)?;
+        for _ in 0..MAX_REGION_DEPTH {
+            if !budget.spend() { return None; }
+            let index = nn.checked_sub(1).and_then(|n| usize::try_from(n).ok())?;
+            let node = self.nodes.get(index)?;
             if node.left == 0 && node.right == 0 { return Some(node); }
             let dist = lx * node.normal[0] + ly * node.normal[1] + lz * node.normal[2] + node.split;
             if dist == 0.0 { return None; }
@@ -467,6 +546,7 @@ impl RegionMap {
     /// included (#683): it is a real exit whose destination only the server can resolve, not a
     /// non-exit.
     pub fn zone_line_indices(&self) -> Vec<i32> {
+        if self.nodes.len() > MAX_REGION_NODES { return Vec::new(); }
         let mut v: Vec<i32> = self
             .nodes
             .iter()
@@ -487,16 +567,28 @@ impl RegionMap {
     /// Walks the BSP once (O(nodes)), carrying an AABB tightened by each axis-aligned split plane
     /// (oblique planes are left as a superset), then grid-samples inside each zone-line leaf's AABB
     /// and validates every candidate with `zone_line_at`, so a slightly loose AABB can never yield a
-    /// wrong point — only fail to find one (logged). Sample count per leaf is capped, so the whole
-    /// pass is bounded regardless of zone size.
+    /// wrong point — only fail to find one (logged). The entire pass shares a total budget of
+    /// 16,000,000 node visits, projection constraints and samples.
+    /// On budget exhaustion it returns no points, rather than a partial enumeration.
     pub fn zone_line_region_points(&self, bounds: (f32, f32, f32, f32, f32, f32)) -> Vec<(i32, [f32; 3])> {
+        let mut budget = TraversalBudget::new(MAX_REGION_TRAVERSAL_WORK);
+        self.zone_line_region_points_bounded(bounds, &mut budget)
+    }
+
+    fn zone_line_region_points_bounded(&self, bounds: (f32, f32, f32, f32, f32, f32),
+        budget: &mut TraversalBudget) -> Vec<(i32, [f32; 3])> {
         let (min_e, max_e, min_n, max_n, zmin, zmax) = bounds;
-        if self.nodes.is_empty() || min_e > max_e || min_n > max_n || zmin > zmax { return Vec::new(); }
+        if self.nodes.is_empty() || [min_e, max_e, min_n, max_n, zmin, zmax].iter().any(|v| !v.is_finite())
+            || min_e > max_e || min_n > max_n || zmin > zmax { return Vec::new(); }
         // BSP axes (leaf_at swaps to `(sy, sx, sz)`): axis0 = north, axis1 = east, axis2 = z.
         let root = [[min_n, max_n], [min_e, max_e], [zmin, zmax]];
         let mut out = Vec::new();
         let mut obliques: Vec<([f32; 3], f32, bool)> = Vec::new();
-        self.collect_zone_line_leaves(1, root, &mut obliques, 0, &mut out);
+        self.collect_zone_line_leaves(1, root, &mut obliques, 0, &mut out, budget);
+        if budget.exhausted {
+            tracing::warn!("region_map: zone-line enumeration exceeded its total work budget");
+            out.clear();
+        }
         out
     }
 
@@ -522,14 +614,15 @@ impl RegionMap {
     /// OBLIQUE half-space constraints on the current leaf (which the AABB can't represent). At each
     /// zone-line leaf, find a point inside its convex region for the O(1) find_zone_line_near lookup.
     fn collect_zone_line_leaves(&self, nn: i32, aabb: [[f32; 2]; 3],
-        obliques: &mut Vec<([f32; 3], f32, bool)>, depth: u32, out: &mut Vec<(i32, [f32; 3])>) {
-        if nn <= 0 || depth > 256 { return; }
+        obliques: &mut Vec<([f32; 3], f32, bool)>, depth: u32, out: &mut Vec<(i32, [f32; 3])>,
+        budget: &mut TraversalBudget) {
+        if !budget.spend() || nn <= 0 || depth as usize >= MAX_REGION_DEPTH { return; }
         let Some(node) = self.nodes.get((nn - 1) as usize) else { return; };
         if node.left == 0 && node.right == 0 {
             // Index 0 leaves are included (#683): an index-0 zone line is still an exit, and the
             // precomputed point is what lets `find_zone_line_near`/the auto-cross reach it.
             if node.special == REGION_ZONE_LINE {
-                match self.find_interior_point(node.zone_line_index, aabb, obliques) {
+                match self.find_interior_point(node.zone_line_index, aabb, obliques, budget) {
                     Some(p) => out.push((node.zone_line_index, p)),
                     None => tracing::warn!(
                         "region_map: no interior point found for zone-line index {} (AABB {:?}) — /zone_cross to it may fail",
@@ -541,9 +634,10 @@ impl RegionMap {
         let oblique = !Self::is_axis_aligned(node.normal);
         // left child: dist > 0 (positive side); right child: dist < 0.
         for (child, positive) in [(node.left, true), (node.right, false)] {
+            if budget.exhausted { return; }
             let child_aabb = Self::tighten_aabb(aabb, node.normal, node.split, positive);
             if oblique { obliques.push((node.normal, node.split, positive)); }
-            self.collect_zone_line_leaves(child, child_aabb, obliques, depth + 1, out);
+            self.collect_zone_line_leaves(child, child_aabb, obliques, depth + 1, out, budget);
             if oblique { obliques.pop(); }
         }
     }
@@ -553,14 +647,17 @@ impl RegionMap {
     /// project onto any violated oblique constraint (re-clamping into the AABB each round), which
     /// converges to an interior point of the convex region. Validate with `zone_line_at`; if that
     /// somehow fails, fall back to the old grid sample. Returns `[east, north, z]`. #230
-    fn find_interior_point(&self, index: i32, aabb: [[f32; 2]; 3], obliques: &[([f32; 3], f32, bool)]) -> Option<[f32; 3]> {
-        if (0..3).any(|k| aabb[k][1] < aabb[k][0]) { return None; }
+    fn find_interior_point(&self, index: i32, aabb: [[f32; 2]; 3], obliques: &[([f32; 3], f32, bool)],
+        budget: &mut TraversalBudget) -> Option<[f32; 3]> {
+        if aabb.iter().flatten().any(|v| !v.is_finite())
+            || (0..3).any(|k| aabb[k][1] < aabb[k][0]) { return None; }
         // BSP space p = (north, east, z) (leaf_at's (sy,sx,sz) swap).
-        let mut p = [(aabb[0][0] + aabb[0][1]) * 0.5, (aabb[1][0] + aabb[1][1]) * 0.5, (aabb[2][0] + aabb[2][1]) * 0.5];
+        let mut p = std::array::from_fn::<_, 3, _>(|i| aabb[i][0] * 0.5 + aabb[i][1] * 0.5);
         const MARGIN: f32 = 1.0; // aim a little inside the plane, not exactly on it
         for _ in 0..48 {
             let mut moved = false;
             for &(n, s, positive) in obliques {
+                if !budget.spend() { return None; }
                 let d = n[0] * p[0] + n[1] * p[1] + n[2] * p[2] + s;
                 let inside = if positive { d > 0.0 } else { d < 0.0 };
                 if !inside {
@@ -576,16 +673,22 @@ impl RegionMap {
             if !moved { break; }
         }
         let cand = [p[1], p[0], p[2]]; // (east, north, z)
-        if self.zone_line_at(cand[0], cand[1], cand[2]) == Some(index) {
+        if self.zone_line_at_bounded(cand[0], cand[1], cand[2], budget) == Some(index) {
             return Some(cand);
         }
-        self.sample_region_point(index, aabb)
+        self.sample_region_point(index, aabb, budget)
+    }
+
+    fn zone_line_at_bounded(&self, sx: f32, sy: f32, sz: f32,
+        budget: &mut TraversalBudget) -> Option<i32> {
+        let node = self.leaf_at_bounded(sx, sy, sz, budget)?;
+        (node.special == REGION_ZONE_LINE).then_some(node.zone_line_index)
     }
 
     /// Grid-sample `aabb` (`[north, east, z]` ranges) for points classifying as zone-line `index`;
     /// return their centroid as `[east, north, z]`. Step is chosen to cap total samples (bounded
     /// work even for a loose AABB). `None` if the region isn't hit (too small for the step).
-    fn sample_region_point(&self, index: i32, aabb: [[f32; 2]; 3]) -> Option<[f32; 3]> {
+    fn sample_region_point(&self, index: i32, aabb: [[f32; 2]; 3], budget: &mut TraversalBudget) -> Option<[f32; 3]> {
         let ext = [aabb[0][1] - aabb[0][0], aabb[1][1] - aabb[1][0], aabb[2][1] - aabb[2][0]];
         if ext.iter().any(|&e| e < 0.0) { return None; }
         const MAX_SAMPLES: f64 = 120_000.0;
@@ -598,7 +701,8 @@ impl RegionMap {
             while east <= aabb[1][1] {
                 let mut z = aabb[2][0];
                 while z <= aabb[2][1] {
-                    if self.zone_line_at(east, north, z) == Some(index) {
+                    if !budget.spend() { return None; }
+                    if self.zone_line_at_bounded(east, north, z, budget) == Some(index) {
                         sum[0] += east as f64; sum[1] += north as f64; sum[2] += z as f64; hits += 1;
                     }
                     z += step;
@@ -659,14 +763,26 @@ impl RegionMap {
     /// correctness — the same argument as `zone_line_region_points`. Returns
     /// `(east:[min,max], north:[min,max], z:[min,max])` per water leaf. `bounds` =
     /// `(min_e, max_e, min_n, max_n, zmin, zmax)` (server coords), same shape as
-    /// `zone_line_region_points`.
+    /// `zone_line_region_points`. Shares a total 16,000,000-visit budget across both branches,
+    /// including fixture graphs which bypass loader validation. Exhaustion returns no boxes.
     pub fn water_region_aabbs(&self, bounds: (f32, f32, f32, f32, f32, f32)) -> Vec<([f32; 2], [f32; 2], [f32; 2])> {
+        let mut budget = TraversalBudget::new(MAX_REGION_TRAVERSAL_WORK);
+        self.water_region_aabbs_bounded(bounds, &mut budget)
+    }
+
+    fn water_region_aabbs_bounded(&self, bounds: (f32, f32, f32, f32, f32, f32),
+        budget: &mut TraversalBudget) -> Vec<([f32; 2], [f32; 2], [f32; 2])> {
         let (min_e, max_e, min_n, max_n, zmin, zmax) = bounds;
-        if self.nodes.is_empty() || min_e > max_e || min_n > max_n || zmin > zmax { return Vec::new(); }
+        if self.nodes.is_empty() || [min_e, max_e, min_n, max_n, zmin, zmax].iter().any(|v| !v.is_finite())
+            || min_e > max_e || min_n > max_n || zmin > zmax { return Vec::new(); }
         // BSP axes (leaf_at swaps to `(sy, sx, sz)`): axis0 = north, axis1 = east, axis2 = z.
         let root = [[min_n, max_n], [min_e, max_e], [zmin, zmax]];
         let mut out = Vec::new();
-        self.collect_water_leaves(1, root, 0, &mut out);
+        self.collect_water_leaves(1, root, 0, &mut out, budget);
+        if budget.exhausted {
+            tracing::warn!("region_map: water enumeration exceeded its total work budget");
+            out.clear();
+        }
         out
     }
 
@@ -675,8 +791,8 @@ impl RegionMap {
     /// make that safe). Mirror of `collect_zone_line_leaves`, minus the interior-point search (a box
     /// is all the builder needs).
     fn collect_water_leaves(&self, nn: i32, aabb: [[f32; 2]; 3], depth: u32,
-        out: &mut Vec<([f32; 2], [f32; 2], [f32; 2])>) {
-        if nn <= 0 || depth > 256 { return; }
+        out: &mut Vec<([f32; 2], [f32; 2], [f32; 2])>, budget: &mut TraversalBudget) {
+        if !budget.spend() || nn <= 0 || depth as usize >= MAX_REGION_DEPTH { return; }
         let Some(node) = self.nodes.get((nn - 1) as usize) else { return; };
         if node.left == 0 && node.right == 0 {
             if matches!(node.special, 1 | 7) {
@@ -688,7 +804,8 @@ impl RegionMap {
         // left child: dist > 0 (positive side); right child: dist < 0.
         for (child, positive) in [(node.left, true), (node.right, false)] {
             let child_aabb = Self::tighten_aabb(aabb, node.normal, node.split, positive);
-            self.collect_water_leaves(child, child_aabb, depth + 1, out);
+            if budget.exhausted { return; }
+            self.collect_water_leaves(child, child_aabb, depth + 1, out, budget);
         }
     }
 }
@@ -1042,4 +1159,120 @@ mod tests {
         assert!(p[0] + p[1] > 50.0, "point inside north+east>50: {p:?}");
         assert_eq!(rm.zone_line_at(p[0], p[1], p[2]), Some(7), "returned point validates: {p:?}");
     }
+}
+
+#[cfg(test)]
+mod bounded_region_tests {
+    use super::*;
+    #[test]
+    fn region_input_and_node_budgets_reject_before_expansion() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("bounded.wtr");
+        let mut bytes=b"EQEMUWATER".to_vec();bytes.extend_from_slice(&1u32.to_le_bytes());bytes.extend_from_slice(&1u32.to_le_bytes());bytes.extend_from_slice(&[0;36]);
+        std::fs::write(&path,&bytes).unwrap();
+        assert_eq!(RegionMap::try_load_bounded(dir.path(),"bounded",32).err(),Some(RegionLoadError::LimitExceeded));
+        assert!(RegionMap::try_load_bounded(dir.path(),"bounded",54).is_ok());
+        bytes[14..18].copy_from_slice(&1_000_001u32.to_le_bytes());std::fs::write(&path,&bytes).unwrap();
+        assert_eq!(RegionMap::try_load_bounded(dir.path(),"bounded",54).err(),Some(RegionLoadError::LimitExceeded));
+    }
+    fn node(left: i32, right: i32, special: i32) -> BspNode {
+        BspNode { normal: [1.0, 0.0, 0.0], split: 0.0, left, right, special, zone_line_index: 0 }
+    }
+
+    fn native_bytes(nodes: &[BspNode], version: u32) -> Vec<u8> {
+        let mut bytes = b"EQEMUWATER".to_vec();
+        bytes.extend(version.to_le_bytes());
+        bytes.extend((nodes.len() as u32).to_le_bytes());
+        for (i, n) in nodes.iter().enumerate() {
+            bytes.extend((i as i32 + 1).to_le_bytes());
+            for f in n.normal { bytes.extend(f.to_le_bytes()); }
+            bytes.extend(n.split.to_le_bytes());
+            for value in [0, n.special, n.left, n.right] { bytes.extend(value.to_le_bytes()); }
+            if version == 2 { bytes.extend(n.zone_line_index.to_le_bytes()); }
+        }
+        bytes
+    }
+
+    #[test]
+    fn native_loader_rejects_cycles_and_shared_subtree_amplification() {
+        let dir = tempfile::tempdir().unwrap();
+        for version in [1, 2] {
+            for nodes in [
+                vec![node(1, 1, 0)],
+                vec![node(2, 0, 0), node(1, 0, 0)],
+                vec![node(0, 0, 0), node(3, 0, 0), node(2, 0, 0)],
+                vec![node(2, 2, 0), node(0, 0, 1)],
+                vec![node(2, 3, 0), node(4, 0, 0), node(4, 0, 0), node(0, 0, 1)],
+            ] {
+                std::fs::write(dir.path().join("bad.wtr"), native_bytes(&nodes, version)).unwrap();
+                assert_eq!(RegionMap::try_load(dir.path(), "bad").err(), Some(RegionLoadError::NotRegionData));
+            }
+            let valid = [node(2, 3, 0), node(0, 0, 1), node(0, 0, REGION_ZONE_LINE)];
+            std::fs::write(dir.path().join("valid.wtr"), native_bytes(&valid, version)).unwrap();
+            let map = RegionMap::try_load(dir.path(), "valid").unwrap();
+            assert!(map.is_water(1.0, 1.0, 1.0));
+            assert_eq!(map.zone_line_at(1.0, -1.0, 1.0), Some(0));
+        }
+    }
+
+    #[test]
+    fn native_loader_rejects_a_tree_deeper_than_point_queries_can_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nodes: Vec<_> = (0..MAX_REGION_DEPTH).map(|i| node(i as i32 + 2, 0, 0)).collect();
+        nodes.push(node(0, 0, 1));
+        std::fs::write(dir.path().join("deep.wtr"), native_bytes(&nodes, 1)).unwrap();
+        assert_eq!(RegionMap::try_load(dir.path(), "deep").err(), Some(RegionLoadError::LimitExceeded));
+        nodes.pop(); nodes.last_mut().unwrap().left = 0;
+        std::fs::write(dir.path().join("deep.wtr"), native_bytes(&nodes, 1)).unwrap();
+        assert!(RegionMap::try_load(dir.path(), "deep").is_ok());
+    }
+
+    #[test]
+    fn branching_fixture_traversals_share_a_total_budget_and_discard_partial_results() {
+        let bounds = (-2.0, 2.0, -2.0, 2.0, -2.0, 2.0);
+        let aabb = [[-2.0, 2.0]; 3];
+        for special in [1, REGION_ZONE_LINE] {
+            // One real leaf is visited before a corrupt two-branch cycle. The
+            // fixture bypasses the loader, so query protection is independent.
+            let map = RegionMap { nodes: vec![node(2, 3, 0), node(0, 0, special), node(3, 3, 0)] };
+            let mut budget = TraversalBudget::new(31);
+            if special == 1 {
+                let mut partial = Vec::new();
+                map.collect_water_leaves(1, aabb, 0, &mut partial, &mut budget);
+                assert_eq!(partial.len(), 1, "the budget must cover work after an emitted leaf");
+                assert!(budget.exhausted);
+                assert_eq!(budget.remaining, 0);
+                let mut budget = TraversalBudget::new(31);
+                assert!(map.water_region_aabbs_bounded(bounds, &mut budget).is_empty());
+                assert!(budget.exhausted);
+                assert!(map.water_region_aabbs(bounds).is_empty());
+            } else {
+                let mut partial = Vec::new();
+                map.collect_zone_line_leaves(1, aabb, &mut Vec::new(), 0, &mut partial, &mut budget);
+                assert_eq!(partial.len(), 1);
+                assert!(budget.exhausted);
+                assert_eq!(budget.remaining, 0);
+                let mut budget = TraversalBudget::new(31);
+                assert!(map.zone_line_region_points_bounded(bounds, &mut budget).is_empty());
+                assert!(budget.exhausted);
+                assert!(map.zone_line_region_points(bounds).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn sample_and_projection_work_use_the_same_budget_as_tree_visits() {
+        let map = RegionMap::zone_line_below(0.0, 7);
+        let mut budget = TraversalBudget::new(7);
+        // At this magnitude adding the sample pitch cannot advance an f32.
+        // Exhaustion is checked by exact work counts, not elapsed wall time.
+        assert!(map.sample_region_point(99, [[1e20, 1e20]; 3], &mut budget).is_none());
+        assert!(budget.exhausted);
+        assert_eq!(budget.remaining, 0);
+        let mut budget = TraversalBudget::new(3);
+        let constraints = [([1.0, 1.0, 0.0], -50.0, true); 4];
+        assert!(map.find_interior_point(7, [[-100.0, 100.0]; 3], &constraints, &mut budget).is_none());
+        assert!(budget.exhausted);
+        assert_eq!(budget.remaining, 0);
+    }
+
 }

@@ -22,7 +22,6 @@ pub use renderer::DrawnFrame;
 pub use renderer::AcquiredFrame;
 
 pub mod gpu;
-pub mod nav_overlay;
 pub mod pass;
 pub mod pipeline;
 pub mod renderer;
@@ -34,3 +33,6 @@ pub mod billboard;
 pub mod camera;
 pub mod head;
 pub mod frame_capture;
+
+/// Isolated common static visual GPU inspection.
+pub mod static_visual;

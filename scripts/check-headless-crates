@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Run the CPU-only client libraries; this does not qualify a live player session.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/check-headless-crates [--online]
+
+Runs protocol, networking, HTTP and geometry unit/doc tests in pinned Rust.
+Default: offline. --online permits Cargo to download missing locked dependencies.
+Requires Docker and the pinned image below, already present locally.
+EQOXIDE_CHECK_CACHE selects the writable cache, target and private run-log directory.
+This command does not launch a game server or graphical/headless client application.
+EOF
+}
+
+network=none
+cargo_options=(--locked --offline)
+case "${1:-}" in
+  "") ;;
+  --online) network=bridge; cargo_options=(--locked) ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+if (($# > 1)); then usage >&2; exit 2; fi
+
+command -v docker >/dev/null || { echo 'Docker is required.' >&2; exit 2; }
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+image=rust@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  printf 'Pinned build image missing or Docker unavailable. Install it explicitly:\n  docker pull %s\n' "$image" >&2
+  exit 2
+fi
+
+umask 077
+cache_dir=${EQOXIDE_CHECK_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/bump-eqoxide/checks}
+mkdir -p -- "$cache_dir"
+cache_dir=$(cd -- "$cache_dir" && pwd -P)
+if [[ "$cache_dir" == / || "$cache_dir" == "$HOME" || "$cache_dir" == "$repo_dir" ]]; then
+  echo 'Use a dedicated build-cache directory.' >&2
+  exit 2
+fi
+mkdir -p -- "$cache_dir/tmp" "$cache_dir/runs"
+run_dir=$(mktemp -d "$cache_dir/runs/checks-XXXXXXXX")
+container_name="bump-eqoxide-check-$(id -u)-$$"
+
+# The CID is written by Docker in this private run directory, never guessed by name.
+finish() {
+  result=$?
+  trap - EXIT INT TERM
+  if [[ -s "$run_dir/container.cid" ]]; then
+    container_id=$(<"$run_dir/container.cid")
+    if [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] && docker inspect "$container_id" >/dev/null 2>&1; then
+      if ! docker stop --time 10 "$container_id" >/dev/null 2>&1; then
+        echo 'Owned check container could not be stopped.' >&2
+        result=2
+      fi
+    fi
+  fi
+  printf 'CHECK_SCOPE=headless-crate-tests\nCHECK_EXIT=%s\nCHECK_LOG=%s\n' "$result" "$run_dir/output.log"
+  exit "$result"
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+printf 'Source: %s\nRust image: %s\nNetwork: %s\n' \
+  "$(git -C "$repo_dir" rev-parse HEAD)" "$image" "$network"
+timeout --signal=TERM --kill-after=30s 900s \
+  docker run --rm --name "$container_name" --cidfile "$run_dir/container.cid" \
+  --label bump.eqoxide.purpose=headless-crate-checks \
+  --user "$(id -u):$(id -g)" --network "$network" --cpus 2 --memory 6g \
+  --pids-limit 256 --cap-drop ALL --security-opt no-new-privileges --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,exec,size=512m \
+  --mount "type=bind,src=$repo_dir,dst=/source,readonly" \
+  --mount "type=bind,src=$cache_dir,dst=/work" --workdir /source \
+  -e TMPDIR=/work/tmp -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target \
+  -e CARGO_BUILD_JOBS=2 -e CARGO_BUILD_RUSTC_WRAPPER= -e RUSTFLAGS= -e CARGO_ENCODED_RUSTFLAGS= \
+  "$image" cargo test "${cargo_options[@]}" \
+  -p eqoxide-protocol -p eqoxide-net -p eqoxide-http -p eqoxide-zone-geometry -p eqoxide-physics -p eqoxide-headless \
+  -- --test-threads=2 2>&1 | tee "$run_dir/output.log"

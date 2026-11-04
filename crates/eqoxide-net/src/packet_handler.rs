@@ -7,7 +7,7 @@
 use crate::protocol::*;
 use crate::transport::AppPacket;
 use crate::wire::WireReader;
-use eqoxide_core::game_state::{GameState, Entity, Gait, Pose, ZonePoint};
+use eqoxide_core::game_state::{GameState, Entity, Gait, Pose, ServerAck, ZonePoint};
 
 /// Apply one EQ server packet to `gs`.
 pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
@@ -44,7 +44,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_REQUEST_CLIENT_ZONE_CHANGE => {
             // The actual response (OP_ZONE_CHANGE with the server's real zone_id, or a same-zone
             // teleport) is sent by the gameplay.rs handler for this opcode. Here we only surface it
-            // in the message log. (Previously set gs.pending_server_zone, which the nav thread
+            // in the message log. (Previously set gs.pending_server_zone, which the net thread
             // re-answered with a zoneID=0 packet → misroute; removed for #235.)
             if p.len() >= 4 {
                 let zone_id = u16::from_le_bytes([p[0], p[1]]);
@@ -84,7 +84,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_SHOP_END             => {
             // NOT the NPC-merchant refusal/close signal — that's OP_ShopEndConfirm, above. Inbound
             // OP_ShopEnd only arrives from the PLAYER-TRADER (bazaar) path: TraderEndTrader() when a
-            // trader we're shopping at shuts down (zone/trading.cpp:926) and CancelTraderTradeWindow()
+            // trader we're shopping at shuts down (eqemu:zone/trading.cpp@7ab909ee4:926) and CancelTraderTradeWindow()
             // (:3872). eqoxide doesn't drive trader shops today, so this is effectively unreachable —
             // but if it ever does arrive, dropping the stale session is the right move. No message: a
             // trader closing their shop is not a refused purchase, and claiming otherwise would lie.
@@ -94,7 +94,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         }
         OP_TRADE_REQUEST_ACK    => {
             // Server acknowledged our OP_TradeRequest — the trade session now exists. The give
-            // state machine (navigation.rs) waits on this before moving the item into the NPC slot.
+            // state machine (action_loop.rs) waits on this before moving the item into the NPC slot.
             gs.trade_ack_ready = true;
             tracing::info!("EQ: OP_TradeRequestAck — trade session open");
         }
@@ -102,7 +102,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
             // Server finalized the trade SESSION (0-byte packet). This does NOT prove the NPC accepted
             // the item (#486): a rejected / out-of-range turn-in ALSO sends OP_FinishTrade and then
             // RETURNS the item to the cursor via a SEPARATE OP_ItemPacket sent STRICTLY AFTER this
-            // (EQEmu zone/client_packet.cpp:15488). The awaited-give verdict is therefore VERIFIED
+            // (EQEmu eqemu:zone/client_packet.cpp@ca704c7f8:15488). The awaited-give verdict is therefore VERIFIED
             // downstream (action_loop `note_finish_trade` → deferred verify-transfer in `tick_give`),
             // not decided here. We still clear our mirrored trade slots: the server consumed any KEPT
             // items via m_inv.PopItem (zone/trading.cpp) with no per-item packet, and any RETURNED item
@@ -188,9 +188,9 @@ fn apply_animation(gs: &mut GameState, p: &[u8]) {
 //
 // Provenance is PER OPCODE — do not generalise one bullet to another:
 //   * OP_TaskActivity   — re-derived for RoF2 from the send path: `TaskManager::SendTaskActivity*`
-//     (`zone/task_manager.cpp:972-1014`) delegating to `ActivityInformation::SerializeObjective`
-//     (`common/tasks.h:141-189`). See `parse_task_activity` below.
-//   * OP_CompletedTasks — re-derived from `zone/task_manager.cpp:946-966`.
+//     (`eqemu:zone/task_manager.cpp@491b1edd1:972-1014`) delegating to `ActivityInformation::SerializeObjective`
+//     (`eqemu:common/tasks.h@491b1edd1:141-189`). See `parse_task_activity` below.
+//   * OP_CompletedTasks — re-derived from `eqemu:zone/task_manager.cpp@491b1edd1:946-966`.
 //   * OP_TaskDescription — re-derived for RoF2 (#949/#955). It has a RoF2 ENCODE, so the `zone/`
 //     serialiser's output is NOT the wire format and the OP_TaskActivity method above does not
 //     transfer; it was derived against the live ENCODE instead. Field order and sizes match
@@ -202,7 +202,7 @@ fn apply_animation(gs: &mut GameState, p: &[u8]) {
 // titanium.cpp ENCODE(OP_TaskDescription) + the TaskActivity_Struct in eq_packet_structs.h". Both
 // authorities are wrong and both are named in #889's root cause. `titanium.cpp` is the Titanium
 // patch, not RoF2. And the line immediately above `struct TaskActivity_Struct` — at
-// `common/eq_packet_structs.h:4551` — reads, verbatim:
+// `eqemu:common/eq_packet_structs.h@5dc093fe5:4551` — reads, verbatim:
 //     // Old structs not used by Task System implentation but left for reference
 // (the misspelling is EQEmu's), so that struct is marked unused by the emulator itself. Deriving a
 // layout from either source is the mistake this file already made once.
@@ -225,8 +225,8 @@ fn extract_saylink_text(s: &str) -> String {
 /// then `u8 has_reward_selection` (#955).
 ///
 /// **Five, not four.** Two `TaskDescriptionTrailer_Struct` definitions exist — a global 5-byte one
-/// (`common/eq_packet_structs.h:4702-4706`) and a 4-byte one in the RoF2 patch's own nested
-/// namespace (`common/patches/rof2_structs.h:4249-4252`). Both are live code (neither is inside an
+/// (`eqemu:common/eq_packet_structs.h@5dc093fe5:4702-4706`) and a 4-byte one in the RoF2 patch's own nested
+/// namespace (`eqemu:common/patches/rof2_structs.h@7ab909ee4:4249-4252`). Both are live code (neither is inside an
 /// `#if 0`) and both are `#pragma pack(1)`. `ENCODE(OP_TaskDescription)` sizes and `memcpy`s the
 /// trailer with an **unqualified** `sizeof(TaskDescriptionTrailer_Struct)`, and its body is defined
 /// at the patch namespace's own scope rather than inside the nested struct namespace — so ordinary
@@ -383,7 +383,7 @@ fn apply_task_description(gs: &mut GameState, p: &[u8]) {
 
 /// Length of the RoF2 **short** `OP_TaskActivity` form, in bytes.
 ///
-/// EQEmu `TaskManager::SendTaskActivityShort` (`zone/task_manager.cpp:972-987`) allocates the
+/// EQEmu `TaskManager::SendTaskActivityShort` (`eqemu:zone/task_manager.cpp@491b1edd1:972-987`) allocates the
 /// packet as `EQApplicationPacket(OP_TaskActivity, 25)` and writes 6×`u32` + 1×`u8` = exactly 25
 /// bytes:
 /// ```text
@@ -395,9 +395,9 @@ fn apply_task_description(gs: &mut GameState, p: &[u8]) {
 const TASK_ACTIVITY_SHORT_LEN: usize = 25;
 
 /// The literal `WriteUInt32(0xffffffff)` at offset 20 of the short form
-/// (`zone/task_manager.cpp:984`). In the long form that offset holds `activity_type`, and EQEmu
-/// loads `activitytype` as a **`uint8_t`** (`common/repositories/base/base_task_activities_repository.h:43`,
-/// assigned at `:235`) before casting it at `zone/task_manager.cpp:216` — so a long form's value
+/// (`eqemu:zone/task_manager.cpp@491b1edd1:984`). In the long form that offset holds `activity_type`, and EQEmu
+/// loads `activitytype` as a **`uint8_t`** (`eqemu:common/repositories/base/base_task_activities_repository.h@7ab909ee4:43`,
+/// assigned at `:235`) before casting it at `eqemu:zone/task_manager.cpp@491b1edd1:216` — so a long form's value
 /// there is always 0..=255 and this sentinel identifies the short form unambiguously. It is
 /// checked *in addition to* the length, never instead of it; see [`parse_task_activity`].
 const TASK_ACTIVITY_SHORT_SENTINEL: u32 = 0xffff_ffff;
@@ -420,7 +420,7 @@ const UNDECODABLE_TRAILING_MARKER: &str = "trailing byte(s)";
 const TASK_ACTIVITY_LONG_MIN_LEN: usize = 58;
 
 /// Read an EQEmu RoF+ `LengthString` — `SerializeBuffer::WriteLengthString`
-/// (`common/serialize_buffer.h:194-203`): a `u32` byte count followed by exactly that many raw
+/// (`eqemu:common/serialize_buffer.h@491b1edd1:194-203`): a `u32` byte count followed by exactly that many raw
 /// bytes, with **no** NUL terminator. (The pre-RoF branch of `SerializeObjective` wrote these same
 /// fields as plain C strings, which is the second layout error behind #889.)
 ///
@@ -445,10 +445,10 @@ fn try_length_string(r: &mut WireReader) -> Option<String> {
 ///
 /// ## Wire layout (RoF2), derived from the emulator's own serialiser
 ///
-/// `TaskManager::SendTaskActivityLong` (`zone/task_manager.cpp:989-1014`) writes a 5×`u32` header
-/// and then delegates to `ActivityInformation::SerializeObjective` (`common/tasks.h:141-189`),
+/// `TaskManager::SendTaskActivityLong` (`eqemu:zone/task_manager.cpp@491b1edd1:989-1014`) writes a 5×`u32` header
+/// and then delegates to `ActivityInformation::SerializeObjective` (`eqemu:common/tasks.h@491b1edd1:141-189`),
 /// taking its `client_version >= RoF` branch. `WriteString` emits a NUL-terminated cstr
-/// (`common/serialize_buffer.h:174-181`); `WriteLengthString` emits `u32 len` + raw bytes
+/// (`eqemu:common/serialize_buffer.h@491b1edd1:174-181`); `WriteLengthString` emits `u32 len` + raw bytes
 /// (`:194-203`). Byte offsets:
 ///
 /// ```text
@@ -459,7 +459,7 @@ fn try_length_string(r: &mut WireReader) -> Option<String> {
 /// 16 u32  list_group
 /// ── SerializeObjective starts here ──
 /// 20 i32  activity_type
-/// 24 i8   optional               <-- RoF+ writes ONE byte (tasks.h:154-158); pre-RoF wrote i32
+/// 24 i8   optional               <-- RoF+ writes ONE byte (eqemu:common/tasks.h@491b1edd1:154-158); pre-RoF wrote i32
 /// 25 i32  0                      (dead solo/group/raid request type)
 /// 29 cstr target_name            <-- the string eqoxide used to start reading at offset 32
 ///    LenStr item_list
@@ -502,18 +502,18 @@ fn try_length_string(r: &mut WireReader) -> Option<String> {
 /// Two independent derivations of this layout were made for #889 and they proposed *different*
 /// discriminators — length (`== 25`) and the `0xffffffff` at offset 20. Against EQEmu they are
 /// equivalent: `SendTaskActivityShort` is the only writer of that sentinel
-/// (`zone/task_manager.cpp:984`), and a long form's `activity_type` comes from a `uint8_t` DB
+/// (`eqemu:zone/task_manager.cpp@491b1edd1:984`), and a long form's `activity_type` comes from a `uint8_t` DB
 /// column (see [`TASK_ACTIVITY_SHORT_SENTINEL`]) so it can never be `0xffffffff`. Rather than pick
 /// a winner, both are required to agree; a packet on which they disagree is reported
 /// `Undecodable` instead of being decoded under a guess. (`TaskActivityType::Unknown = -1` exists
-/// in the enum at `common/tasks.h:48`, but the `uint8_t` DB path cannot produce it.)
+/// in the enum at `eqemu:common/tasks.h@491b1edd1:48`, but the `uint8_t` DB path cannot produce it.)
 ///
 /// ## Why the trailing fields are required
 ///
 /// A long form is accepted only if all of the fields above are present **and** they consume the
 /// payload exactly. `BasePacket`'s `SerializeBuffer` constructor sets
 /// `size = static_cast<uint32>(std::exchange(buf.m_pos, 0))`
-/// (`common/base_packet.cpp:36-42`, the assignment itself at `:40`) — the payload is exactly the
+/// (`eqemu:common/base_packet.cpp@491b1edd1:36-42`, the assignment itself at `:40`) — the payload is exactly the
 /// bytes written, so the `SerializeBuffer`'s initial capacity never reaches the wire — and
 /// #889's own panic log corroborates that eqoxide delivers it unpadded (`buffer 25 bytes` for the
 /// 25-byte short form). So leftover bytes mean the layout model is wrong somewhere, which is
@@ -586,8 +586,8 @@ fn parse_task_activity(p: &[u8]) -> Option<(u32, eqoxide_core::game_state::TaskA
 /// The `SerializeObjective` body (RoF+ branch), read from a cursor already positioned at offset 20.
 /// `None` if any field runs off the end. See [`parse_task_activity`] for the layout and citations.
 fn parse_long_objective(r: &mut WireReader) -> Option<eqoxide_core::game_state::ActivityProgress> {
-    // SIGNED: `enum class TaskActivityType : int32_t` (common/tasks.h:46), written with
-    // `WriteInt32` (common/tasks.h:152). Reading it unsigned would turn any negative type into a
+    // SIGNED: `enum class TaskActivityType : int32_t` (eqemu:common/tasks.h@491b1edd1:46), written with
+    // `WriteInt32` (eqemu:common/tasks.h@491b1edd1:152). Reading it unsigned would turn any negative type into a
     // ~4-billion "type id" in /v1/quests/log.
     let activity_type = r.try_i32()?;      // 20..24  i32 activity_type
     let optional = r.try_u8()? != 0;       // 24      i8  optional — ONE byte on RoF+
@@ -796,13 +796,14 @@ fn apply_group_invite(gs: &mut GameState, p: &[u8]) {
 
 /// OP_GroupAcknowledge — 4-byte, no fields. Server→client only; purely a "you joined" UI trigger.
 fn apply_group_acknowledge(gs: &mut GameState, _p: &[u8]) {
+    gs.push_ack(ServerAck::GroupJoined);
     gs.push_event("group", "joined", "", true, "You have joined the group");
     gs.log_msg("group", "Joined group");
 }
 
 // ── Inventory (OP_CharInventory / OP_ItemPacket) ────────────────────────────────────────────────
 // RoF2 serializes items as packed binary blobs — NOT the old Titanium pipe-delimited text.
-// OP_CharInventory wire format (rof2.cpp:1043 ENCODE(OP_CharInventory)):
+// OP_CharInventory wire format (eqemu:common/patches/rof2.cpp@5dc093fe5:1043 ENCODE(OP_CharInventory)):
 //   uint32 item_count  — 0 → 4-byte zero packet
 //   [item_count × SerializeItem output back-to-back, no padding]
 // Each item is parsed by crate::item::parse_rof2_item which returns (RoF2Item, consumed).
@@ -814,7 +815,14 @@ fn apply_group_acknowledge(gs: &mut GameState, _p: &[u8]) {
 /// gs.inventory (and `/v1/observe/inventory`) and are movable via the same MoveItem path as any
 /// other slot. RoF2 bags don't nest, so one level is enough. (eqoxide#201)
 fn push_item_and_contents(out: &mut Vec<eqoxide_core::game_state::InvItem>, item: crate::item::RoF2Item) {
-    let parent_slot = item.main_slot as i32;
+    // Individual inventory packets can address an item inside a bag. Its main_slot is the
+    // container, not the acquired item's destination. Never replace that container on a subslot.
+    let parent_slot = if item.sub_slot == u16::MAX {
+        item.main_slot as i32
+    } else {
+        let Some(flat) = eqoxide_core::game_state::bag_wire_slot(item.main_slot as i32, item.sub_slot as u32) else { return };
+        flat
+    };
     let bag_contents = item.bag_contents; // move the Vec out before consuming the rest of `item`
     out.push(eqoxide_core::game_state::InvItem {
         slot:    parent_slot,
@@ -874,11 +882,11 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
 /// OP_ItemPacket — a single item. The 4-byte header is the `ItemPacketType` (Titanium): 0x64 =
 /// Merchant (an item the open merchant offers), 0x66 = Loot, 0x69 = CharInventory, etc. Merchant
 /// items are routed to `gs.merchant_items` (for `GET /trade/list` + the HUD merchant window);
-/// everything else upserts into the player inventory by slot.
+/// corpse loot is catalog data, while inventory packets upsert by their received slot.
 fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
     // RoF2 OP_ItemPacket: ItemPacket_Struct = PacketType (u32) + one binary-serialized item.
     // (Titanium sent pipe-delimited text; RoF2 uses the packed SerializeItem format — see
-    // crate::item.) 0x64 = Merchant, others (0x66 Loot, 0x69 CharInventory…) are items.
+    // crate::item.) 0x64 = Merchant, 0x66 = corpse catalog, 0x69 = CharInventory.
     const ITEM_PACKET_MERCHANT: u32 = 0x64;
     if p.len() < 4 { return; }
     let packet_type = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
@@ -898,19 +906,9 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
     } else {
         const ITEM_PACKET_LOOT: u32 = 0x66;
         if packet_type == ITEM_PACKET_LOOT {
-            // A Loot item's `main_slot` is NOT a safe inventory destination — it collides with
-            // occupied general-inventory wire slots and would evict a real item (eqoxide#56).
-            let it = eqoxide_core::game_state::InvItem {
-                slot:    item.main_slot as i32,
-                item_id: item.id,
-                name:    item.name,
-                icon:    item.icon,
-                charges: (item.stacksize as i32).max(1),
-                idfile:  item.idfile,
-                click_spell_id: item.click_spell_id,
-                filename: item.filename,
-            };
-            apply_looted_item(gs, it);
+            // Corpse catalog only. Actual acquisition arrives as a separate inventory packet.
+            // The gameplay owner requests each listed slot once for an explicitly opened corpse.
+            return;
         } else {
             // OP_CharInventory / equip / cursor etc.: `main_slot` IS the authoritative slot.
             // Expand bag contents too, so a container delivered here shows its items. (eqoxide#201)
@@ -956,35 +954,6 @@ fn apply_delete_item(gs: &mut GameState, p: &[u8]) {
         }
     }
 }
-
-/// General-inventory wire slots (rof2_limits.h): 23..=32. Loot lands here (or a bag, not modelled).
-const GENERAL_BEGIN: i32 = 23;
-const GENERAL_END:   i32 = 32;
-
-/// Place a freshly-looted item into the client inventory model WITHOUT trusting the loot packet's
-/// `main_slot` (eqoxide#56). Merge into an existing stack of the same item in general inventory, else
-/// drop it into the first free general slot. The server holds the authoritative inventory and a
-/// resync (OP_CharInventory on relog / next sync) reconciles anything approximate here.
-fn apply_looted_item(gs: &mut GameState, mut it: eqoxide_core::game_state::InvItem) {
-    // Stack-merge: same item already sitting in a general-inventory slot → add to its quantity.
-    // Restricted to general slots so we never merge into an EQUIPPED item that shares the id.
-    if let Some(stack) = gs.inventory.iter_mut()
-        .find(|x| x.item_id == it.item_id && (GENERAL_BEGIN..=GENERAL_END).contains(&x.slot))
-    {
-        stack.charges = stack.charges.saturating_add(it.charges.max(1));
-        return;
-    }
-    // Otherwise the first free general slot (never an occupied one → no eviction).
-    let occupied: std::collections::HashSet<i32> = gs.inventory.iter().map(|x| x.slot).collect();
-    if let Some(free) = (GENERAL_BEGIN..=GENERAL_END).find(|s| !occupied.contains(s)) {
-        it.slot = free;
-    }
-    // else: general inventory full (item really went to a bag) — leave main_slot as a best effort;
-    // the next server inventory sync corrects it. Don't retain-evict here.
-    gs.inventory.retain(|x| x.slot != it.slot);
-    gs.inventory.push(it);
-}
-
 
 /// OP_ShopPlayerBuy (server→client echo) — confirms a purchase completed. On success the RoF2
 /// server echoes the SAME opcode with the SAME 32-byte Merchant_Sell_Struct sent in the request
@@ -1040,7 +1009,7 @@ fn apply_shop_player_buy(gs: &mut GameState, p: &[u8]) {
 /// OP_ShopEndConfirm (server→client, 0-byte body) — EQEmu's SendMerchantEnd() (zone/client.cpp
 /// 13276-13286). For THIS client it is unambiguously a buy refusal. Every call site is either a
 /// buy-path early return — bad merchant / not-a-merchant / qty<1 / out-of-range
-/// (zone/client_packet.cpp:14151), a stale-or-removed item slot (:14194), or a negative price
+/// (eqemu:zone/client_packet.cpp@ca704c7f8:14151), a stale-or-removed item slot (:14194), or a negative price
 /// (:14254) — or Handle_OP_ShopEnd (:14123), which only ever runs in response to a client-sent
 /// OP_ShopEnd that eqoxide never sends (its merchant close is OP_ShopRequest with cmd=0).
 ///
@@ -1155,7 +1124,7 @@ fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
 /// publish an offer the server never sent.
 fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
     // VARIABLE-LENGTH: `task_count` records, count clamped; a truncated/empty packet must degrade
-    // gracefully (an empty payload legitimately clears the offers — see the navigation.rs mirror),
+    // gracefully (an empty payload legitimately clears the offers — see the action_loop.rs mirror),
     // so this uses the non-panicking `try_*` path throughout.
     //
     // AGENT-HONESTY (#981): "gracefully" means *bail out*, never *substitute a default*. Every
@@ -1247,7 +1216,7 @@ fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
         // If this new spawn is an NPC corpse, queue it for auto-looting. (The dead/Lying flagging that
         // lays the corpse down is now done for ALL spawn paths inside `register_spawn` — #253.)
         let sid = info.spawn_id;
-        if info.npc != 0 && name.to_lowercase().contains("corpse") {
+        if gs.automatic_loot && info.npc != 0 && name.to_lowercase().contains("corpse") {
             tracing::info!("EQ: NPC corpse spawned: id={} name={:?} → queuing for loot", sid, name);
             gs.pending_loot.push_back(sid);
             if gs.loot_queued_at.is_none() {
@@ -1310,10 +1279,9 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.y = upd.y;
         // Wire→foot datum (#522, see coord::WIRE_Z_OFFSET): the wire z is the model-origin datum
         // ~3.1u above the feet, so subtract to store FOOT — the one datum everything internal uses
-        // (self gs.player_z, nav, collision) and every agent-facing position reports. Keeping
+        // (self gs.player_z, collision) and every agent-facing position reports. Keeping
         // entities in wire datum while self is foot would make /observe report two entities on one
-        // plank at heights 3u apart, and feed a 3u-high z into goto-by-name's nav goal (a goal-z/
-        // floor-tier mismatch that wedges nav). Floating entities — boats AND Flying mobs — skip the
+        // plank at heights 3u apart. Floating entities — boats AND Flying mobs — skip the
         // server's Z-offset (Mob::FixZ early-returns for GetIsBoat + flymode==Flying), so their wire
         // z is already at the reported datum; don't shift them (boats would sink; flying NPCs would
         // read 3u low — #548). We derive the skip from the entity's CURRENT is_boat+flymode (kept
@@ -1521,7 +1489,7 @@ fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
     // RoF2: OP_ZoneEntry is sent ONCE PER SPAWN (not just for the player). EQEmu's
     // ENCODE(OP_ZoneEntry) forwards directly to ENCODE(OP_ZoneSpawns), which emits
     // one new EQApplicationPacket(OP_ZoneEntry, ...) containing a single Spawn_Struct
-    // for each entity in the zone (rof2.cpp:4542/4575/4660). Register every one of
+    // for each entity in the zone (eqemu:common/patches/rof2.cpp@5dc093fe5:4542/4575/4660). Register every one of
     // them; `register_spawn` handles player-self detection internally.
     match parse_rof2_spawn(payload) {
         Some((info, _)) => {
@@ -1628,7 +1596,7 @@ pub fn parse_player_profile(payload: &[u8]) -> Option<ProfileInfo> {
     Some(ProfileInfo { level, class_id, stats, coin, mem_spells, cur_hp, cur_mana })
 }
 
-/// RoF2 `BeginCast_Struct` (10 bytes, EQEmu common/patches/rof2_structs.h:719):
+/// RoF2 `BeginCast_Struct` (10 bytes, EQEmu eqemu:common/patches/rof2_structs.h@7ab909ee4:719):
 ///   /*00*/ uint32 spell_id;  /*04*/ uint16 caster_id;  /*06*/ uint32 cast_time; (ms)
 /// The old Titanium-style read (caster u16@0, spell u16@2, cast_ms u32@4) misaligned every field —
 /// cast_ms straddled caster_id + the low half of cast_time, yielding the ~108-hour phantom cast bar
@@ -1641,15 +1609,15 @@ pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u32, u32)> {
     Some((caster_id, spell_id, cast_ms))
 }
 
-/// `ManaChange_Struct` (EQEmu common/eq_packet_structs.h:462 — no RoF2 ENCODE, sent raw):
+/// `ManaChange_Struct` (EQEmu eqemu:common/eq_packet_structs.h@5dc093fe5:462 — no RoF2 ENCODE, sent raw):
 ///   /*00*/ uint32 new_mana;  /*04*/ uint32 stamina;  /*08*/ uint32 spell_id;
 ///   /*12*/ uint8  keepcasting;  /*13*/ uint8 padding[3];  /*16*/ int32 slot;
 /// Returns `(new_mana, stamina, spell_id, keepcasting)`. `stamina` is the player's CURRENT
 /// endurance — this packet fires on every mana-OR-endurance change, for every class
 /// (`Client::CheckManaEndUpdate`), so it doubles as a cheap endurance trickle (#1127; see
 /// `GameState::set_endurance_current`). `keepcasting == 0` means "the cast STOPPED" — the
-/// server sends it from `Mob::StopCasting` (zone/spells.cpp:1369) and `Mob::SendSpellBarEnable`
-/// (zone/spells.cpp:5752) on *every* cast end (completed, interrupted, or fizzled), naming the
+/// server sends it from `Mob::StopCasting` (eqemu:zone/spells.cpp@7ab909ee4:1369) and `Mob::SendSpellBarEnable`
+/// (eqemu:zone/spells.cpp@7ab909ee4:5752) on *every* cast end (completed, interrupted, or fizzled), naming the
 /// spell that ended. The 4-byte prefix is still accepted (mana only, no stamina) so a short
 /// packet can't silently drop the mana update. (eqoxide#348)
 /// `(new_mana, stamina, spell_id, keepcasting)` — named so the signature below stays under
@@ -1667,10 +1635,10 @@ pub fn parse_mana_change(p: &[u8]) -> Option<ManaChangeFields> {
     Some((new_mana, Some(stamina), Some(spell_id), Some(p[12])))
 }
 
-/// `EnduranceUpdate_Struct` (EQEmu common/eq_packet_structs.h:1469 — no RoF2 ENCODE, sent raw):
+/// `EnduranceUpdate_Struct` (EQEmu eqemu:common/eq_packet_structs.h@5dc093fe5:1469 — no RoF2 ENCODE, sent raw):
 ///   /*00*/ uint32 cur_end;  /*04*/ uint32 max_end;  /*08*/ uint16 spawn_id;
-/// Sent by `Client::SendEnduranceUpdate` (zone/client.cpp:2506), called from
-/// `CheckManaEndUpdate` (zone/client.cpp:2416-2450) alongside OP_ManaChange whenever mana or
+/// Sent by `Client::SendEnduranceUpdate` (eqemu:zone/client.cpp@5dc093fe5:2506), called from
+/// `CheckManaEndUpdate` (eqemu:zone/client.cpp@5dc093fe5:2416-2450) alongside OP_ManaChange whenever mana or
 /// endurance changes, for every class. Unlike OP_ManaChange's `stamina` field, this carries a
 /// REAL max directly — the authoritative source for both fields (#1127). Returns
 /// `(cur_end, max_end, spawn_id)`.
@@ -1699,10 +1667,10 @@ pub fn parse_memorize_spell(p: &[u8]) -> Option<(u32, u32, u32)> {
     Some((r(0), r(4), r(8)))
 }
 
-/// `InterruptCast_Struct` (EQEmu common/eq_packet_structs.h:446 — no RoF2 ENCODE, sent raw):
+/// `InterruptCast_Struct` (EQEmu eqemu:common/eq_packet_structs.h@5dc093fe5:446 — no RoF2 ENCODE, sent raw):
 ///   /*00*/ uint32 spawnid;  /*04*/ uint32 messageid;  /*08*/ char message[0];
 /// `messageid` is an eqstr id that says WHY the cast ended: SPELL_FIZZLE (173) / MISS_NOTE (180) =
-/// a fizzle, INTERRUPT_SPELL (439) = a true interrupt (zone/spells.cpp:1299-1314). Returns
+/// a fizzle, INTERRUPT_SPELL (439) = a true interrupt (eqemu:zone/spells.cpp@7ab909ee4:1299-1314). Returns
 /// `(spawnid, messageid)`; the old parse read only `spawnid` and threw the reason away, which is
 /// why the client could never tell a fizzle from an interrupt. (eqoxide#348)
 pub fn parse_interrupt_cast(p: &[u8]) -> Option<(u32, u32)> {
@@ -1776,7 +1744,7 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
             // to drift from this one.
             gs.mark_hp_estimated();
             // A profile with HP means we're alive (respawn/zone-in) → clear death bookkeeping.
-            gs.player_dead = false;         // nav walker / dead pose (eqoxide#61)
+            gs.player_dead = false;         // dead pose (eqoxide#61)
             gs.player_dead_since = None;    // respawn safety-net timer (eqoxide#50)
             tracing::info!("EQ: PlayerProfile: seeded hp={}/{} ({:.0}%)", gs.cur_hp, gs.max_hp, gs.hp_pct);
         }
@@ -1851,7 +1819,7 @@ pub fn apply_begin_cast(gs: &mut GameState, p: &[u8]) {
     }
 }
 
-/// The sentinel spell id `Mob::SendSpellBarDisable` puts in OP_MemorizeSpell (zone/client.h:99
+/// The sentinel spell id `Mob::SendSpellBarDisable` puts in OP_MemorizeSpell (eqemu:zone/client.h@5dc093fe5:99
 /// `SPELLBAR_UNLOCK 0x2bc`). It is a spell-bar command, not a spell: never report it as a completed
 /// cast. (Nothing in EQEmu currently calls SendSpellBarDisable, but the sentinel is cheap to honor.)
 const SPELLBAR_UNLOCK: u32 = 0x2bc;
@@ -1869,17 +1837,17 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
     }
 
     // `keepcasting == 1` is the routine mana/endurance update (Client::CheckManaEndUpdate,
-    // zone/client.cpp:2427-2432) — regen, not a cast ending. Only 0 means "the cast stopped".
+    // eqemu:zone/client.cpp@5dc093fe5:2427-2432) — regen, not a cast ending. Only 0 means "the cast stopped".
     if keepcasting != Some(0) { return; }
 
     // OP_ManaChange(keepcasting=0) is the server's UNIVERSAL cast-end signal: StopCasting
-    // (zone/spells.cpp:1369) and SendSpellBarEnable (zone/spells.cpp:5752) both send it, on EVERY
+    // (eqemu:zone/spells.cpp@7ab909ee4:1369) and SendSpellBarEnable (eqemu:zone/spells.cpp@7ab909ee4:5752) both send it, on EVERY
     // way a cast can end — completed, interrupted, fizzled, refused, or dropped because
     // SpellFinished returned false. So it is the terminal, deferred by one packet so a following
     // memorize/interrupt/message can still refine WHY it ended.
     //
     // The server also sends it as the TAIL of an interrupt/refusal it has already explained
-    // (InterruptSpell → SendSpellBarEnable, zone/spells.cpp:1314). We reported that outcome on the
+    // (InterruptSpell → SendSpellBarEnable, eqemu:zone/spells.cpp@7ab909ee4:1314). We reported that outcome on the
     // earlier packet, so the trailing one must not re-arm anything — otherwise the next unnamed
     // failure inherits the spell we just finished reporting. (eqoxide#348)
     if gs.suppress_cast_end {
@@ -1888,7 +1856,7 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
     }
 
     // The spell that ended. This is the only packet that names a FIZZLED spell — the fizzle is
-    // decided in DoCastSpell (zone/spells.cpp:320) before OP_BeginCast is ever sent (:450), so
+    // decided in DoCastSpell (eqemu:zone/spells.cpp@7ab909ee4:320) before OP_BeginCast is ever sent (:450), so
     // gs.casting is None by the time "Your spell fizzles!" arrives.
     // (No SPELLBAR_UNLOCK check: OP_ManaChange always carries a REAL spell id — StopCasting sends
     // `casting_spell_id`, SendSpellBarEnable sends the spell it was called with. The sentinel only
@@ -1899,7 +1867,7 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
         }
     }
     // Arms the terminal only for a cast we believe is IN FLIGHT. `ResetAllCastbarCooldowns`
-    // (zone/spells.cpp:7246, reachable from Lua quest scripts) fires SendSpellBarEnable for EVERY
+    // (eqemu:zone/spells.cpp@7ab909ee4:7246, reachable from Lua quest scripts) fires SendSpellBarEnable for EVERY
     // memorized gem while the player is not casting at all — arming on those would invent a burst
     // of phantom cast outcomes. `end_cast_unexplained` no-ops when nothing is casting.
     gs.end_cast_unexplained();
@@ -1907,11 +1875,21 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
 
 pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
     if let Some((slot, spell_id, scribing)) = parse_memorize_spell(p) {
-        match scribing {
-            1 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = spell_id; } }
-            2 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = eqoxide_core::game_state::EMPTY_GEM; } }
-            // memSpellSpellbar (zone/client.h:105) — the server re-enables the spell bar only from
-            // the tail of Mob::SpellFinished (zone/spells.cpp:1803/1824), i.e. the cast COMPLETED.
+        match MemorizeAction::from_wire(scribing) {
+            Some(MemorizeAction::Memorize) => {
+                if (slot as usize) < 9 {
+                    gs.mem_spells[slot as usize] = spell_id;
+                    gs.push_ack(ServerAck::SpellMemorized { slot });
+                }
+            }
+            Some(MemorizeAction::Forget) => {
+                if (slot as usize) < 9 {
+                    gs.mem_spells[slot as usize] = eqoxide_core::game_state::EMPTY_GEM;
+                    gs.push_ack(ServerAck::SpellUnmemorized { slot });
+                }
+            }
+            // memSpellSpellbar (eqemu:zone/client.h@5dc093fe5:105) — the server re-enables the spell bar only from
+            // the tail of Mob::SpellFinished (eqemu:zone/spells.cpp@7ab909ee4:1803/1824), i.e. the cast COMPLETED.
             // An interrupt/fizzle never sends it (InterruptSpell → OP_InterruptCast + OP_ManaChange
             // only). So this is the authoritative "your spell landed" signal. (eqoxide#348)
             //
@@ -1926,7 +1904,7 @@ pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
             // and swallows it, so the cast resolves as `cast_ended_unexplained` instead of
             // `cast_completed`. That degrades to an explicit "we don't know why it ended", which is
             // imprecision, not a lie. It affects exactly one spell id and only on a late packet.
-            3 => {
+            Some(MemorizeAction::Spellbar) => {
                 let is_sentinel = spell_id == SPELLBAR_UNLOCK
                     && gs.casting.as_ref().is_none_or(|c| c.spell_id != spell_id);
                 if is_sentinel {
@@ -1936,7 +1914,7 @@ pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
                     gs.finish_cast(spell_id, "cast_completed", &text);
                 }
             }
-            _ => {}
+            Some(MemorizeAction::Scribe) | None => {}
         }
     }
 }
@@ -1944,13 +1922,13 @@ pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
 pub fn apply_interrupt_cast(gs: &mut GameState, p: &[u8]) {
     let Some((spawnid, messageid)) = parse_interrupt_cast(p) else { return };
     // The server ALSO broadcasts an OP_InterruptCast to everyone nearby when someone ELSE's cast
-    // breaks (zone/spells.cpp:1339-1345, with the caster's name appended). Acting on it would clear
+    // breaks (eqemu:zone/spells.cpp@7ab909ee4:1339-1345, with the caster's name appended). Acting on it would clear
     // OUR cast bar because a passing NPC got interrupted — the same class of bug as eqoxide#222.
     if spawnid != gs.player_id { return; }
     // Only a cast we believe is RUNNING can be interrupted. This gate is what keeps a cast-start
     // refusal from being double-reported: the server says "Insufficient Mana to cast this spell!"
     // (OP_SimpleMessage 199) and THEN calls InterruptSpell() → OP_InterruptCast 439
-    // (zone/spells.cpp:484-496). apply_simple_message already published the real reason and cleared
+    // (eqemu:zone/spells.cpp@7ab909ee4:484-496). apply_simple_message already published the real reason and cleared
     // `casting`, so the trailing generic "interrupted" here would overwrite a precise outcome with a
     // vague one. (eqoxide#348)
     if gs.casting.is_none() { return; }
@@ -1960,7 +1938,7 @@ pub fn apply_interrupt_cast(gs: &mut GameState, p: &[u8]) {
         _ => ("cast_interrupted", "Your spell is interrupted.".to_string()),
     };
     gs.finish_cast(0, kind, &text); // 0 = take the spell from gs.casting / the ended-cast hint
-    // InterruptSpell sends OP_InterruptCast and THEN SendSpellBarEnable (zone/spells.cpp:1299-1314).
+    // InterruptSpell sends OP_InterruptCast and THEN SendSpellBarEnable (eqemu:zone/spells.cpp@7ab909ee4:1299-1314).
     // We have just reported the outcome, so ignore that trailing OP_ManaChange.
     gs.suppress_cast_end = true;
 }
@@ -1972,10 +1950,10 @@ fn cast_outcome_for_string_id(string_id: u32) -> Option<&'static str> {
     match string_id {
         // A player fizzle reaches us ONLY as this bare message: Client::CheckFizzle fails inside
         // DoCastSpell, which calls StopCasting() + MessageString(Chat::SpellFailure, SPELL_FIZZLE)
-        // and returns *before* OP_BeginCast / any OP_InterruptCast (zone/spells.cpp:318-345).
+        // and returns *before* OP_BeginCast / any OP_InterruptCast (eqemu:zone/spells.cpp@7ab909ee4:318-345).
         SPELL_FIZZLE | MISS_NOTE => Some("cast_fizzled"),
         // Cast-start refusals (no mana / recast timer / no target / …). The server sends the eqstr
-        // and nothing else — previously the cast just vanished. (zone/spells.cpp:169-241, :484-496)
+        // and nothing else — previously the cast just vanished. (eqemu:zone/spells.cpp@7ab909ee4:169-241, :484-496)
         id if CAST_FAILED_STRING_IDS.contains(&id) => Some("cast_failed"),
         _ => None,
     }
@@ -2014,7 +1992,7 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
             .unwrap_or_else(|| "something".to_string());
         gs.died_at   = Some(std::time::Instant::now());
         gs.hp_pct    = 0.0;
-        gs.player_dead = true; // nav walker checks this and clears any stale /goto (eqoxide#61)
+        gs.player_dead = true; // dead pose (eqoxide#61)
         // Zero cur_hp too: the self-render path derives the dead pose from
         // `cur_hp <= 0 && max_hp > 0` (app.rs), and the death packet — not an
         // OP_HPUpdate — is the authoritative "you died" signal. Without this the
@@ -2045,7 +2023,7 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
             // Auto-loot our OWN kills: the NPC corpse reuses the mob's spawn_id, and the server
             // doesn't send OP_BecomeCorpse for these deaths — so queue the corpse here. The
             // gameplay loop sends OP_LootRequest after a short delay (loot-empty corpses are a no-op).
-            if killer_id == gs.player_id {
+            if gs.automatic_loot && killer_id == gs.player_id {
                 gs.pending_loot.push_back(d_id);
                 if gs.loot_queued_at.is_none() {
                     gs.loot_queued_at = Some(std::time::Instant::now());
@@ -2269,7 +2247,7 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     // even land in the tell/ooc/... match below — without this filter it silently falls into the
     // generic "chat" bucket as a *second*, differently formatted line.
     //
-    // The outgoing-chat code in navigation.rs (the hail/say/dialogue-click/chat_send sites)
+    // The outgoing-chat code in action_loop.rs (the hail/say/dialogue-click/chat_send sites)
     // already writes the "You say/tell/..." line into the log the moment we send, so this
     // inbound bounce-back must never be logged or evented — logging it doubles every outgoing
     // line, and eventing it means an agent polling /v1/events/chat receives its own outbound
@@ -2287,15 +2265,17 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         && !sender.is_empty()
         && sender.eq_ignore_ascii_case(&gs.player_name);
     if is_self_echo {
+        gs.record_self_echo(chan_num,&sender,&msg);
         tracing::debug!("chat: dropped self-echo from server (chan {chan_num}): {msg}");
         return;
     }
 
     // EQEmu ChatChannel: 0 guild, 2 group, 3 shout, 4 auction, 5 OOC, 6 broadcast, 7 tell,
-    // 8 say, 11 gmsay. The inter-agent channels are ALSO recorded as structured chat events for
-    // the GET /events feed; `say` (8) is NPC dialogue / local say and stays in the message log only.
+    // 8 say, 11 gmsay. Received local say also enters the bounded event feed so a
+    // headless caller can read NPC dialogue without mistaking its own local echo for delivery.
     let event_channel = match chan_num {
         7  => Some("tell"),
+        8  => Some("say"),
         5  => Some("ooc"),
         3  => Some("shout"),
         2  => Some("group"),
@@ -2315,7 +2295,7 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     if !sender.is_empty() {
         // Log under the channel kind (tell/ooc/shout/group) so the chat window
         // can color and tab-filter by channel; plain say stays "chat" (#162).
-        gs.log_msg_with_item_links(event_channel.unwrap_or("chat"), &format!("<{}> {}", sender, msg), item_links);
+        gs.log_msg_with_item_links(if chan_num == 8 { "chat" } else { event_channel.unwrap_or("chat") }, &format!("<{}> {}", sender, msg), item_links);
     } else {
         // Zone-wide broadcasts without a sender (server messages like "An earthquake strikes!").
         gs.log_msg_with_item_links("zone", &msg, item_links);
@@ -2551,10 +2531,10 @@ fn apply_emote(gs: &mut GameState, payload: &[u8]) {
 }
 
 /// OP_SimpleMessage — eqstr-table text, no arguments. Layout: string_id(u32) + color(u32)
-/// + unknown(u32) (`SimpleMessage_Struct`, EQEmu common/eq_packet_structs.h:3832).
+/// + unknown(u32) (`SimpleMessage_Struct`, EQEmu eqemu:common/eq_packet_structs.h@5dc093fe5:3832).
 ///
 /// `Client::MessageString(type, string_id)` sends this straight to the caster only
-/// (zone/client.cpp:3811-3821 — `QueuePacket`, not a broadcast), so a spell-failure id here is
+/// (eqemu:zone/client.cpp@5dc093fe5:3811-3821 — `QueuePacket`, not a broadcast), so a spell-failure id here is
 /// unambiguously OURS. That matters: a fizzle and every cast-start refusal arrive as nothing BUT
 /// this message, so if we only log the text the outcome is invisible to an agent. Turn the known
 /// spell-failure ids into a real cast outcome. (eqoxide#348)
@@ -2567,11 +2547,11 @@ fn apply_simple_message(gs: &mut GameState, payload: &[u8]) {
         gs.finish_cast(0, kind, &text); // finish_cast logs the line too
         // A cast-start/mid-cast REFUSAL ("Insufficient Mana", "Spell recast time not yet met", …)
         // is followed by StopCastSpell/InterruptSpell → SendSpellBarEnable → OP_ManaChange
-        // (zone/spells.cpp:169-241, :484-496). Ignore that trailing terminal; we just explained it.
+        // (eqemu:zone/spells.cpp@7ab909ee4:169-241, :484-496). Ignore that trailing terminal; we just explained it.
         // A FIZZLE is the opposite shape — its OP_ManaChange arrives BEFORE this message
-        // (StopCasting then MessageString, zone/spells.cpp:326-330) — so it must not suppress.
+        // (StopCasting then MessageString, eqemu:zone/spells.cpp@7ab909ee4:326-330) — so it must not suppress.
         // NOTE: the server does NOT always send that trailing ManaChange — an instant item clicky
-        // or an AA skips SendSpellBarEnable entirely (zone/spells.cpp:158-161), and
+        // or an AA skips SendSpellBarEnable entirely (eqemu:zone/spells.cpp@7ab909ee4:158-161), and
         // SPELL_TOO_POWERFUL reaches that path. `suppress_cast_end` is a bool that begin_cast /
         // begin_zone_in clear, so an unbalanced arm here cannot leak into a later cast.
         if kind == "cast_failed" {
@@ -2682,8 +2662,8 @@ pub fn attitude_name(faction: u32) -> &'static str {
 ///
 /// The reply's spawn is NOT necessarily the current target, so the two halves are handled
 /// separately:
-///  - The chat line is ALWAYS logged. There are two OP_CONSIDER send sites (navigation.rs): the
-///    target path (preceded by `set_target`), and the *standalone* consider at navigation.rs:1932,
+///  - The chat line is ALWAYS logged. There are two OP_CONSIDER send sites (action_loop.rs): the
+///    target path (preceded by `set_target`), and the *standalone* consider at action_loop.rs,
 ///    fed by `POST /v1/combat/consider {"id":N}` — whose whole purpose is conning an arbitrary
 ///    spawn that is deliberately NOT your target. Gating the log line on "is this the current
 ///    target" would make that endpoint a silent no-op (200 OK, then nothing).
@@ -2737,11 +2717,11 @@ pub fn apply_consider(gs: &mut GameState, payload: &[u8]) {
 /// OP_TargetCommand (server→client) — the server FORCING our target (eqoxide#506).
 ///
 /// Payload is `ClientTarget_Struct`: a single `u32 new_target` spawn id, 4 bytes LE, no RoF2
-/// encode/decode (rof2_structs.h:1316; sent by `Client::SendTargetCommand`, zone/client.cpp:7004).
+/// encode/decode (eqemu:common/patches/rof2_structs.h@7ab909ee4:1316; sent by `Client::SendTargetCommand`, eqemu:zone/client.cpp@5dc093fe5:7004).
 /// The same opcode is ALSO sent client→server (our own `OP_TargetMouse`/target request path lives
 /// in action_loop.rs) and echoed back as an accept-ack, but eqoxide never emits OP_TargetCommand
 /// outbound, so every inbound one is a genuine server force-target: corpse-locate, the Sense
-/// Undead/Summoned/Animal spell effects (spell_effects.cpp:896), merc-hire clear, or a Perl/Lua
+/// Undead/Summoned/Animal spell effects (eqemu:zone/spell_effects.cpp@758774b0b:896), merc-hire clear, or a Perl/Lua
 /// `$client->SendTargetCommand`.
 ///
 /// Honesty (#506): before this handler existed, a server force-target never reached GameState, so
@@ -2749,7 +2729,7 @@ pub fn apply_consider(gs: &mut GameState, payload: &[u8]) {
 /// pointed elsewhere — `/observe/debug` reported a confident-but-wrong target. We mirror the
 /// client-initiated target path (action_loop.rs `gs.set_target(id)`) so a forced target updates the
 /// same fields the same way. `new_target == 0` is EQEmu's "clear target" sentinel (merc-hire clear,
-/// client_packet.cpp:10670 `SendTargetCommand(0)`) — route it through `clear_target` so no stale
+/// eqemu:zone/client_packet.cpp@ca704c7f8:10670 `SendTargetCommand(0)`) — route it through `clear_target` so no stale
 /// target survives.
 pub(crate) fn apply_target_command(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 4 {
@@ -3060,13 +3040,13 @@ fn is_sentinel_zone_point(x: f32, y: f32, z: f32) -> bool {
 /// (`SIZE_ZONE_POINT_ENTRY` = 32 octets for RoF2).
 ///
 /// **The trailing entry is a terminator, not a zone point (#1094).** EQEmu sizes the packet for
-/// `count + 1` entries and fills only `count`: `zone/client.cpp:6956` allocates
+/// `count + 1` entries and fills only `count`: `eqemu:zone/client.cpp@5dc093fe5:6956` allocates
 /// `(count + 1) * sizeof(ZonePoint_Entry)` and `:6959` writes `zp->count = count`, and the RoF2
-/// ENCODE does the same — `common/patches/rof2.cpp:3630` allocates `(emu->count + 1)`, `:3632`
+/// ENCODE does the same — `eqemu:common/patches/rof2.cpp@5dc093fe5:3630` allocates `(emu->count + 1)`, `:3632`
 /// copies the count onto the wire, `:3633` loops `i < emu->count`. The struct comment says it
 /// outright: "Always add one extra to the end after all zonepoints"
-/// (`common/eq_packet_structs.h:2460`). `ALLOC_VAR_ENCODE` memsets its fresh buffer
-/// (`common/patches/ss_define.h:57`), so the extra entry arrives as deterministic **zeros**, not as
+/// (`eqemu:common/eq_packet_structs.h@5dc093fe5:2460`). `ALLOC_VAR_ENCODE` memsets its fresh buffer
+/// (`eqemu:common/patches/ss_define.h@7ab909ee4:57`), so the extra entry arrives as deterministic **zeros**, not as
 /// garbage. Bounding the loop by `payload.len()` therefore parsed it as a record and published a
 /// phantom entrance at the origin with `zone_id = 0` in every zone. **The loop is bounded by
 /// `count`.**
@@ -3190,6 +3170,7 @@ fn apply_move_door(gs: &mut GameState, p: &[u8]) {
     let action_open = p[1] == 0x02;
     let invert = gs.world.doors.get(&door_id).map(|d| d.invert_state).unwrap_or(false);
     gs.set_door_open(door_id, action_open ^ invert);
+    gs.push_ack(ServerAck::DoorMoved { door_id });
 }
 
 fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
@@ -3291,6 +3272,9 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
         gs.loot_confirmed = false;
         gs.loot_last_activity = None;
         gs.loot_end_requested_at = None;
+        if let Some(corpse_id) = corpse_id {
+            gs.push_ack(ServerAck::LootRefused { corpse_id, reason });
+        }
         let msg = format!("Loot refused: {reason}");
         gs.log_msg("loot", &msg);
         gs.push_event("loot", "refused", "system", true, &msg);
@@ -3302,16 +3286,19 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
         return;
     }
     // Normal(1) / Normal2(3) / LootAll(6) — the server accepted the request.
+    if let Some(corpse_id) = gs.loot_current_corpse {
+        gs.push_ack(ServerAck::LootOpened { corpse_id });
+    }
     gs.loot_confirmed = true;
     gs.loot_last_activity = Some(std::time::Instant::now());
 
     // ONLY Normal(1)/Normal2(3) carry the corpse's coin: they are the reply to OP_LootRequest built
-    // by `Corpse::MakeLootRequestPackets` (zone/corpse.cpp:1139), which is the one place that fills
+    // by `Corpse::MakeLootRequestPackets` (eqemu:zone/corpse.cpp@7ab909ee4:1139), which is the one place that fills
     // the platinum/gold/silver/copper fields. LootAll(6) is the SoD+ "all items were sent" marker
     // that trails the item packets — it is NOT a fresh accept and must never credit coin.
     //
     // Crediting it happens to be harmless TODAY only because `BasePacket` memsets the buffer
-    // (common/base_packet.cpp:31) so a LootAll packet carries zeros. That makes coin correctness
+    // (eqemu:common/base_packet.cpp@491b1edd1:31) so a LootAll packet carries zeros. That makes coin correctness
     // load-bearing on a server-side memset — in the exact field whose polarity was already inverted
     // once (see above: every looted coin used to be silently discarded). A two-value match is free;
     // don't bet the purse on someone else's memset (#346 review).
@@ -3346,12 +3333,12 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
 /// OP_LootComplete — a 0-byte packet the server sends for TWO very different outcomes, and it is
 /// byte-identical in both, so the packet alone cannot tell them apart (#346 review):
 ///
-///   1. The genuine close: `Corpse::EndLoot` (zone/corpse.cpp:1787), sent in reply to OUR
+///   1. The genuine close: `Corpse::EndLoot` (eqemu:zone/corpse.cpp@7ab909ee4:1787), sent in reply to OUR
 ///      OP_EndLootRequest. This — and only this — means "the loot session finished".
-///   2. A server-side ABORT of an item take: `Corpse::LootCorpseItem` (zone/corpse.cpp:1419)
-///      answers our OP_LootItem echo with `SendEndLootErrorPacket` (corpse.cpp:50 → a 0-byte
-///      OP_LootComplete) on EVERY error path — LORE conflict (corpse.cpp:1535, :1548),
-///      cursor-not-empty (corpse.cpp:1459 — a live condition for this client, see #275), loot
+///   2. A server-side ABORT of an item take: `Corpse::LootCorpseItem` (eqemu:zone/corpse.cpp@7ab909ee4:1419)
+///      answers our OP_LootItem echo with `SendEndLootErrorPacket` (eqemu:zone/corpse.cpp@7ab909ee4:50 → a 0-byte
+///      OP_LootComplete) on EVERY error path — LORE conflict (eqemu:zone/corpse.cpp@7ab909ee4:1535, :1548),
+///      cursor-not-empty (eqemu:zone/corpse.cpp@7ab909ee4:1459 — a live condition for this client, see #275), loot
 ///      cooldown, not-the-looter, zoning, and others. The items STAY ON THE CORPSE.
 ///
 /// Reporting (2) as "Looting complete" would be exactly the #346 lie relocated from the timer to
@@ -3491,6 +3478,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // model-origin datum ~3.1u above the floor. Converting here seeds the controller at
         // (approximately) the collision floor, so zone-in no longer starts with a phantom 3u fall.
         gs.player_z       = info.z - eqoxide_core::coord::WIRE_Z_OFFSET;
+        gs.player_pos_known = true; // received self spawn establishes this zone's position
         gs.player_heading = info.heading;
         gs.player_level   = info.level as u32;
         gs.player_race    = eq_race_to_code(info.race).to_string();
@@ -3529,7 +3517,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // perfectly ordinary race (e.g. 240 "TeleportMan"), not a fixed "invisible" race id, and a
     // coords-only heuristic risks hiding real content that happens to path near (0,0,0). Filter
     // at registration (never enters `gs.world.entities`) so it also matches native for by-name lookups
-    // (/goto, /interact) that key off the same entity map.
+    // (/interact) that key off the same entity map.
     if info.body_type == 11 || info.body_type == 60 {
         tracing::debug!(
             "EQ: dropping untargetable utility spawn id={} name='{}' bodytype={}",
@@ -3545,7 +3533,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     }
 
     // Wire→foot datum (#522, see coord::WIRE_Z_OFFSET): the spawn z is the model-origin datum
-    // ~3.1u above the feet — subtract to store FOOT, the single datum used internally (self/nav/
+    // ~3.1u above the feet — subtract to store FOOT, the single datum used internally (self/
     // collision) and reported by every agent-facing position, so entities and self share one frame
     // (see the else-branch in apply_position_update for the full rationale). Boats AND Flying mobs
     // skip the server Z-offset (Mob::FixZ early-returns for both — GetIsBoat + flymode==Flying), so
@@ -3591,6 +3579,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // deployed content never sets it nonzero anyway. This is the "place in the client where
         // the spawn struct's appearance fields are read" the issue asks be a considered decision.
         npc_tint_index: info.npc_tint_index,
+        class_id: Some(info.class_),
     });
 }
 
@@ -3740,7 +3729,7 @@ mod tests {
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
             face: 0, hairstyle: 0, haircolor: 0, pose: Pose::Standing, gait: None, is_boat: false, flymode: 0,
-            npc_tint_index: 0,
+            npc_tint_index: 0, class_id: None,
         }
     }
 
@@ -3918,7 +3907,7 @@ mod tests {
     fn apply_shop_player_buy_confirmed_echo_spends_coin_and_logs_bought() {
         // #345: a confirmed OP_ShopPlayerBuy echo (32-byte Merchant_Sell_Struct, price@24
         // recomputed server-side) must be the ONLY thing that deducts coin or logs "Bought item" —
-        // never the send-time code in navigation.rs. Start with 10pp (10000c) and confirm a 37c buy.
+        // never the send-time code in action_loop.rs. Start with 10pp (10000c) and confirm a 37c buy.
         let mut gs = GameState::new();
         gs.coin = [10, 0, 0, 0]; // 10 platinum = 10000 copper
         let mut echo = [0u8; 32];
@@ -3938,7 +3927,7 @@ mod tests {
     fn apply_shop_end_confirm_reports_refusal_with_no_merchant_session_open() {
         // THE case that matters (#345 review): a fresh client buys from a merchant it is out of
         // range of. Handle_OP_ShopRequest returns SILENTLY for an out-of-range/non-merchant target
-        // (zone/client_packet.cpp:14605-14612), so `merchant_open` is NEVER set; the buy then trips
+        // (eqemu:zone/client_packet.cpp@ca704c7f8:14605-14612), so `merchant_open` is NEVER set; the buy then trips
         // the same range check (:14151) and SendMerchantEnd() fires. OP_ShopEndConfirm is thus the
         // ONLY signal the server ever sends — so it must be reported even with no session open.
         // Gating this on `merchant_open` swallowed the refusal entirely and left the agent unable to
@@ -3996,7 +3985,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.coin = [10, 0, 0, 0];
         gs.coin_confirmed = true; // a real reading had landed at some earlier point
-        gs.begin_shop_buy();      // this buy is in flight (as the nav tick does at send time)
+        gs.begin_shop_buy();      // this buy is in flight (as the action loop does at send time)
         let mut echo = [0u8; 32];
         echo[8..12].copy_from_slice(&7u32.to_le_bytes());
         echo[16..20].copy_from_slice(&1u32.to_le_bytes());
@@ -4191,7 +4180,7 @@ mod tests {
     #[test]
     fn apply_consider_standalone_non_target_spawn_still_logs_the_con_line() {
         // POST /v1/combat/consider {"id":N} sends OP_CONSIDER for an ARBITRARY spawn with no
-        // set_target (the "Standalone consider" send site, navigation.rs:1932) — conning a spawn
+        // set_target (the "Standalone consider" send site, action_loop.rs) — conning a spawn
         // that is deliberately NOT your target is the endpoint's whole purpose. The reply must
         // still produce its chat line, or the endpoint is a silent no-op (200 OK, then nothing).
         // The con FIELDS are target-scoped, so they must stay untouched here (#330).
@@ -4583,38 +4572,6 @@ mod tests {
         let m = last(&gs);
         assert!(m.contains("for 40 damage"), "genuine spell damage still shows the amount: {m}");
         assert!(!m.contains("misses"), "genuine spell must not read as a melee miss: {m}");
-    }
-
-    #[test]
-    fn looted_item_places_in_free_slot_and_stacks_never_overwrites() {
-        // eqoxide#56: loot must not evict an occupied slot, and stackable loot should merge.
-        use super::apply_looted_item;
-        use eqoxide_core::game_state::InvItem;
-        let inv = |slot: i32, id: u32, ch: i32| InvItem {
-            slot, item_id: id, name: String::new(), icon: 0, charges: ch, idfile: String::new(),
-            click_spell_id: 0, filename: String::new(),
-        };
-        let mut gs = GameState::new();
-        // Skin of Milk x20 @23, Bread Cakes x20 @24, Rat Whiskers x1 @25.
-        gs.inventory = vec![inv(23, 9990, 20), inv(24, 9991, 20), inv(25, 13071, 1)];
-
-        // Loot another Rat Whiskers; the packet's main_slot bogusly names an occupied slot (23).
-        apply_looted_item(&mut gs, inv(23, 13071, 1));
-        assert_eq!(gs.inventory.iter().find(|x| x.slot == 23).map(|x| x.item_id), Some(9990),
-            "Skin of Milk must not be overwritten");
-        assert_eq!(gs.inventory.iter().find(|x| x.slot == 24).map(|x| x.item_id), Some(9991),
-            "Bread Cakes must not be overwritten");
-        let rw: Vec<_> = gs.inventory.iter().filter(|x| x.item_id == 13071).collect();
-        assert_eq!(rw.len(), 1, "Rat Whiskers should stack into one slot, not split");
-        assert_eq!(rw[0].charges, 2, "stack quantity should merge to 2");
-
-        // Loot a brand-new item with a bogus main_slot (24) → first FREE general slot (26).
-        apply_looted_item(&mut gs, inv(24, 9131, 1));
-        assert_eq!(gs.inventory.iter().find(|x| x.slot == 24).map(|x| x.item_id), Some(9991),
-            "Bread Cakes still untouched");
-        assert_eq!(gs.inventory.iter().find(|x| x.item_id == 9131).unwrap().slot, 26,
-            "new loot goes to the first free general slot");
-        assert_eq!(gs.inventory.len(), 4);
     }
 
     #[test]
@@ -5019,11 +4976,11 @@ mod tests {
     }
 
     /// #346 REVIEW. Only Normal(1)/Normal2(3) — the reply to OP_LootRequest built by
-    /// `Corpse::MakeLootRequestPackets` (zone/corpse.cpp:1139) — carry the corpse's coin. LootAll(6)
+    /// `Corpse::MakeLootRequestPackets` (eqemu:zone/corpse.cpp@7ab909ee4:1139) — carry the corpse's coin. LootAll(6)
     /// is the trailing "all items were sent" marker and must credit NOTHING.
     ///
     /// This is deliberately fed a coin-BEARING LootAll payload, which cannot occur on the wire today
-    /// (`BasePacket` memsets the buffer, common/base_packet.cpp:31 — so a real LootAll carries
+    /// (`BasePacket` memsets the buffer, eqemu:common/base_packet.cpp@491b1edd1:31 — so a real LootAll carries
     /// zeros). That memset is exactly the point: without this guard, coin correctness would be
     /// load-bearing on a server-side memset in the very field whose polarity was already inverted
     /// once. If EQEmu ever populates it, this test is what stops us crediting phantom coin.
@@ -5193,8 +5150,8 @@ mod tests {
         assert_eq!(gs.target_name, None, "a cleared target must not leave a stale name");
     }
 
-    /// #346 REVIEW REGRESSION. EQEmu's `Corpse::LootCorpseItem` (zone/corpse.cpp:1419) answers our
-    /// OP_LootItem echo with `SendEndLootErrorPacket` (corpse.cpp:50) on EVERY error path — LORE
+    /// #346 REVIEW REGRESSION. EQEmu's `Corpse::LootCorpseItem` (eqemu:zone/corpse.cpp@7ab909ee4:1419) answers our
+    /// OP_LootItem echo with `SendEndLootErrorPacket` (eqemu:zone/corpse.cpp@7ab909ee4:50) on EVERY error path — LORE
     /// conflict (:1535, :1548), cursor-not-empty (:1459, a live condition for this client — #275),
     /// loot cooldown, not-the-looter, zoning… That packet is a 0-byte OP_LootComplete, BYTE-IDENTICAL
     /// to the genuine close from `Corpse::EndLoot` (:1787). The items STAY ON THE CORPSE.
@@ -5562,8 +5519,10 @@ mod tests {
         super::apply_channel_message(&mut gs, &payload);
         assert!(gs.messages.iter().any(|m| m.kind == "chat"
             && m.text == "<Guard_Janior> Halt, adventurer!"));
-        // Say (NPC dialogue) is NOT an inter-agent chat event.
-        assert!(gs.chat_events.is_empty(), "say must not produce a chat event");
+        // Only received dialogue is published; outgoing self echoes remain filtered.
+        let event = gs.chat_events.back().expect("received say event");
+        assert_eq!((&*event.category, &*event.kind, &*event.from, &*event.text),
+            ("chat", "say", "Guard_Janior", "Halt, adventurer!"));
     }
 
     fn make_tell(sender: &str, target: &str, msg: &str) -> Vec<u8> {
@@ -5625,7 +5584,7 @@ mod tests {
     //
     // EQEmu broadcasts channel messages back to the SENDING client, not just other listeners
     // (zone/entity.cpp ChannelMessageSend loops include the sender with no skip; confirmed
-    // live against the running server). The outgoing-chat code in navigation.rs already writes
+    // live against the running server). The outgoing-chat code in action_loop.rs already writes
     // the "You say/tell/..." line into the log when we send, so this inbound bounce must be
     // dropped entirely — it must not double the message log AND it must never surface as a
     // /v1/events/chat event (an agent would otherwise "hear" its own outbound message as if
@@ -6290,11 +6249,11 @@ mod tests {
 
     // ── #348: cast OUTCOMES must reach the agent (events + last_cast), not just `tracing` ────────
     // Wire ground truth (EQEmu):
-    //   OP_BeginCast      zone/spells.cpp:497   → cast started
-    //   OP_InterruptCast  zone/spells.cpp:1299  → InterruptCast_Struct{spawnid, messageid}
-    //   OP_MemorizeSpell  zone/spells.cpp:1824  → scribing=3 (memSpellSpellbar) = cast COMPLETED
-    //   OP_SimpleMessage  zone/client.cpp:3811  → the ONLY signal for a player FIZZLE (string 173)
-    //   OP_ManaChange     zone/spells.cpp:1369  → keepcasting=0 names the spell that just ended
+    //   OP_BeginCast      eqemu:zone/spells.cpp@7ab909ee4:497   → cast started
+    //   OP_InterruptCast  eqemu:zone/spells.cpp@7ab909ee4:1299  → InterruptCast_Struct{spawnid, messageid}
+    //   OP_MemorizeSpell  eqemu:zone/spells.cpp@7ab909ee4:1824  → scribing=3 (memSpellSpellbar) = cast COMPLETED
+    //   OP_SimpleMessage  eqemu:zone/client.cpp@5dc093fe5:3811  → the ONLY signal for a player FIZZLE (string 173)
+    //   OP_ManaChange     eqemu:zone/spells.cpp@7ab909ee4:1369  → keepcasting=0 names the spell that just ended
 
     /// Build the 10-byte RoF2 BeginCast_Struct.
     fn begin_cast_pkt(caster: u16, spell: u32, ms: u32) -> Vec<u8> {
@@ -6355,7 +6314,7 @@ mod tests {
     #[test]
     fn completed_cast_publishes_cast_completed_with_the_spell_id() {
         // The server re-enables the spell bar via OP_MemorizeSpell scribing=3 ONLY from the tail of
-        // SpellFinished (zone/spells.cpp:1824) — i.e. the cast landed.
+        // SpellFinished (eqemu:zone/spells.cpp@7ab909ee4:1824) — i.e. the cast landed.
         let mut gs = GameState::new();
         gs.player_id = 42;
         super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
@@ -6372,7 +6331,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_id = 42;
         super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
-        // Another caster's interrupt is broadcast to everyone nearby (zone/spells.cpp:1339): it must
+        // Another caster's interrupt is broadcast to everyone nearby (eqemu:zone/spells.cpp@7ab909ee4:1339): it must
         // neither clear OUR cast bar nor emit an outcome for us.
         super::apply_interrupt_cast(&mut gs, &interrupt_pkt(999, eqoxide_core::game_state::INTERRUPT_SPELL));
         assert!(gs.casting.is_some(), "a passing NPC's interrupt must not clear our cast bar");
@@ -6389,7 +6348,7 @@ mod tests {
     #[test]
     fn fizzle_is_distinguishable_from_an_interrupt_and_names_the_spell() {
         // A PLAYER fizzle never sends OP_BeginCast or OP_InterruptCast: CheckFizzle fails inside
-        // DoCastSpell (zone/spells.cpp:318) *before* SendBeginCast (:499). All the client gets is
+        // DoCastSpell (eqemu:zone/spells.cpp@7ab909ee4:318) *before* SendBeginCast (:499). All the client gets is
         // OP_ManaChange (keepcasting=0, naming the spell) + OP_SimpleMessage{SPELL_FIZZLE=173}.
         let mut gs = GameState::new();
         gs.player_id = 42;
@@ -6406,7 +6365,7 @@ mod tests {
     #[test]
     fn cast_start_refusal_is_reported_once_not_double_reported() {
         // Insufficient mana: the server sends OP_SimpleMessage{199} and THEN InterruptSpell() →
-        // OP_InterruptCast{439} (zone/spells.cpp:484-496). The precise reason must win; the trailing
+        // OP_InterruptCast{439} (eqemu:zone/spells.cpp@7ab909ee4:484-496). The precise reason must win; the trailing
         // generic "interrupted" must not overwrite it with a second, vaguer event.
         let mut gs = GameState::new();
         gs.player_id = 42;
@@ -6436,7 +6395,7 @@ mod tests {
     #[test]
     fn the_manachange_trailing_an_interrupt_does_not_re_arm_the_spell_hint() {
         // REGRESSION (PR #364 review). InterruptSpell sends OP_InterruptCast and THEN
-        // SendSpellBarEnable → OP_ManaChange (zone/spells.cpp:1299-1314). That trailing ManaChange
+        // SendSpellBarEnable → OP_ManaChange (eqemu:zone/spells.cpp@7ab909ee4:1299-1314). That trailing ManaChange
         // used to RE-ARM `ended_cast_spell` *after* finish_cast had consumed it — so the next
         // unnamed failure (a refusal, which sends no OP_BeginCast) was reported against the
         // previous, unrelated spell. The earlier stale-hint test missed this because it never fed
@@ -6461,7 +6420,7 @@ mod tests {
     #[test]
     fn a_cast_the_server_ends_without_explaining_does_not_stick_forever() {
         // REGRESSION (PR #364 review) — BLOCKING. When Mob::SpellFinished returns false (the common
-        // case: a beneficial buff that won't stack, zone/spells.cpp:2590 → :1744-1751),
+        // case: a beneficial buff that won't stack, eqemu:zone/spells.cpp@7ab909ee4:2590 → :1744-1751),
         // CastedSpellFinished calls StopCasting(), which sends OP_ManaChange{keepcasting=0} and
         // NOTHING else — no memorize, no interrupt, no message. `casting` therefore hung forever
         // and NO outcome event was ever emitted. Publishing `casting` (this PR) would have turned
@@ -6492,7 +6451,7 @@ mod tests {
         // "every cast_failed eqstr is followed by exactly one OP_ManaChange{keepcasting=0}".
         //
         // Mob::CastSpell sets send_spellbar_enable = false for an instant item clicky or an AA
-        // ((item_slot != -1 && cast_time == 0) || aa_id — zone/spells.cpp:158-161), so
+        // ((item_slot != -1 && cast_time == 0) || aa_id — eqemu:zone/spells.cpp@7ab909ee4:158-161), so
         // StopCastSpell skips SendSpellBarEnable entirely and NO terminal ManaChange is ever sent.
         // SPELL_TOO_POWERFUL (197) reaches exactly that path, and we expose an item-clicky cast.
         //
@@ -6602,7 +6561,7 @@ mod tests {
     #[test]
     fn an_explaining_packet_inside_the_grace_window_wins_over_the_unexplained_end() {
         // The deferral must not fire for a NORMAL completion: SpellFinished sends
-        // SendSpellBarEnable (ManaChange) at zone/spells.cpp:1817 and MemorizeSpell(3) at :1824 —
+        // SendSpellBarEnable (ManaChange) at eqemu:zone/spells.cpp@7ab909ee4:1817 and MemorizeSpell(3) at :1824 —
         // ManaChange arrives FIRST. The memorize that follows must refine the pending end into
         // "completed", not race it into a bogus "did not take hold".
         let mut gs = GameState::new();
@@ -6617,7 +6576,7 @@ mod tests {
 
     #[test]
     fn a_castbar_cooldown_reset_burst_does_not_invent_cast_outcomes() {
-        // Client::ResetAllCastbarCooldowns (zone/spells.cpp:7246, callable from Lua quest scripts)
+        // Client::ResetAllCastbarCooldowns (eqemu:zone/spells.cpp@7ab909ee4:7246, callable from Lua quest scripts)
         // fires SendSpellBarEnable — i.e. OP_ManaChange{keepcasting=0} — for EVERY memorized gem
         // while the player is not casting at all. Arming the terminal on those would emit a burst
         // of phantom cast_failed events.
@@ -6802,7 +6761,7 @@ mod tests {
     ///
     /// `count` is passed SEPARATELY from the entry list on purpose — that disagreement is the whole
     /// defect. EQEmu sizes the packet for `count + 1` entries and fills `count`
-    /// (`zone/client.cpp:6956`/`:6959`; RoF2 `common/patches/rof2.cpp:3630`/`:3632`/`:3633`), so the
+    /// (`eqemu:zone/client.cpp@5dc093fe5:6956`/`:6959`; RoF2 `eqemu:common/patches/rof2.cpp@5dc093fe5:3630`/`:3632`/`:3633`), so the
     /// honest fixture is one where the list is longer than the count.
     fn zp_packet(count: u32, entries: &[Vec<u8>]) -> Vec<u8> {
         let mut p = count.to_le_bytes().to_vec();
@@ -6811,7 +6770,7 @@ mod tests {
     }
 
     /// An all-zero terminator entry — what `ALLOC_VAR_ENCODE`'s memset
-    /// (`common/patches/ss_define.h:57`) leaves in the `count + 1`-th slot.
+    /// (`eqemu:common/patches/ss_define.h@7ab909ee4:57`) leaves in the `count + 1`-th slot.
     fn zp_terminator() -> Vec<u8> {
         vec![0u8; crate::protocol::SIZE_ZONE_POINT_ENTRY]
     }
@@ -6991,6 +6950,39 @@ mod tests {
         assert_eq!(gs.world.doors.len(), 2, "exactly two doors, no phantom drifted records");
     }
 
+    /// #347: each echo that identifies a queued action records the ack that settles it.
+    #[test]
+    fn server_echoes_record_the_ack_that_settles_the_request_347() {
+        use super::{apply_group_acknowledge, apply_move_door, apply_memorize_spell, apply_money_on_corpse};
+        use eqoxide_core::game_state::ServerAck;
+        let mut gs = GameState::new();
+        apply_group_acknowledge(&mut gs, &[0; 4]);
+        apply_move_door(&mut gs, &[7, 0x02]);
+        apply_memorize_spell(&mut gs, &memorize_pkt(2, 202, 1));
+        apply_memorize_spell(&mut gs, &memorize_pkt(3, 0, 2));
+        apply_memorize_spell(&mut gs, &memorize_pkt(99, 202, 1)); // out-of-range gem: no effect, no ack
+        gs.loot_session_active = true;
+        gs.loot_current_corpse = Some(42);
+        apply_money_on_corpse(&mut gs, &money_on_corpse_payload(1, 0, 0, 0, 0));
+        assert_eq!(gs.server_acks, vec![
+            ServerAck::GroupJoined,
+            ServerAck::DoorMoved { door_id: 7 },
+            ServerAck::SpellMemorized { slot: 2 },
+            ServerAck::SpellUnmemorized { slot: 3 },
+            ServerAck::LootOpened { corpse_id: 42 },
+        ]);
+
+        let mut gs = GameState::new();
+        gs.loot_session_active = true;
+        gs.loot_current_corpse = Some(42);
+        apply_money_on_corpse(&mut gs, &money_on_corpse_payload(5, 0, 0, 0, 0));
+        assert_eq!(gs.server_acks, vec![ServerAck::LootRefused { corpse_id: 42, reason: "too far away" }]);
+
+        let mut gs = GameState::new();
+        apply_money_on_corpse(&mut gs, &money_on_corpse_payload(1, 0, 0, 0, 0)); // no session: stale
+        assert!(gs.server_acks.is_empty(), "a stale ack must not settle anything");
+    }
+
     #[test]
     fn move_door_open_close_with_invert() {
         use super::apply_move_door;
@@ -7162,7 +7154,7 @@ mod tests {
 
     /// Same as [`build_playable_npc_record`] but with a settable `NpcTintIndex` (eqoxide#857) — used
     /// to prove the field decodes off the wire regardless of the PLAYABLE (216-byte) equipment branch
-    /// that follows it, i.e. that the race gate at rof2.cpp:4849 does not also gate this field.
+    /// that follows it, i.e. that the race gate at eqemu:common/patches/rof2.cpp@5dc093fe5:4849 does not also gate this field.
     fn build_playable_npc_record_with_tint(name: &str, id: u32, race: u32, mat0: u32, mat8: u32,
                                             npc_tint: u32) -> Vec<u8> {
         assert!(race <= 12 || matches!(race, 128 | 130 | 330 | 522), "must be a playable race");
@@ -7245,8 +7237,8 @@ mod tests {
         }
     }
 
-    /// eqoxide#857 crux: `NpcTintIndex` (rof2.cpp:4843) is written BEFORE the `is_playable` branch
-    /// point (rof2.cpp:4849) that gates the 7-slot equipment/tint block — so it must decode to the
+    /// eqoxide#857 crux: `NpcTintIndex` (eqemu:common/patches/rof2.cpp@5dc093fe5:4843) is written BEFORE the `is_playable` branch
+    /// point (eqemu:common/patches/rof2.cpp@5dc093fe5:4849) that gates the 7-slot equipment/tint block — so it must decode to the
     /// same value whether the spawn takes the 60-byte non-playable branch or the 216-byte playable
     /// branch. If the race gate were (wrongly) applied to this field too, one of these two would
     /// come back 0 instead of the seeded value.
@@ -7280,7 +7272,7 @@ mod tests {
         assert_eq!(consumed2, playable.len(), "must consume the whole playable record");
         assert_eq!(info2.npc_tint_index, 42,
             "NpcTintIndex must decode identically for a playable-race (216-byte equipment) NPC — \
-             the race gate at rof2.cpp:4849 does not cover this field");
+             the race gate at eqemu:common/patches/rof2.cpp@5dc093fe5:4849 does not cover this field");
         // The 216-byte playable equipment block comes right after the tint block; a one-byte
         // stride error here would corrupt these Material reads.
         assert_eq!(info2.equipment[0], 111, "slot 0 Material must not have shifted after the tint read");
@@ -8071,20 +8063,20 @@ mod tests {
     // as *encoders* (rather than a hex blob) is what makes the decoder's layout falsifiable: a
     // wrong offset here would have to be wrong in the same direction in both files to pass.
 
-    /// `SerializeBuffer::WriteLengthString` (`common/serialize_buffer.h:194-203`) — u32 count then
+    /// `SerializeBuffer::WriteLengthString` (`eqemu:common/serialize_buffer.h@491b1edd1:194-203`) — u32 count then
     /// raw bytes, NO NUL.
     fn ser_length_string(p: &mut Vec<u8>, s: &str) {
         p.extend_from_slice(&(s.len() as u32).to_le_bytes());
         p.extend_from_slice(s.as_bytes());
     }
-    /// `SerializeBuffer::WriteString` (`common/serialize_buffer.h:174-181`) — NUL-terminated.
+    /// `SerializeBuffer::WriteString` (`eqemu:common/serialize_buffer.h@491b1edd1:174-181`) — NUL-terminated.
     fn ser_cstr(p: &mut Vec<u8>, s: &str) {
         p.extend_from_slice(s.as_bytes());
         p.push(0);
     }
 
-    /// `TaskManager::SendTaskActivityLong` (`zone/task_manager.cpp:989-1014`) followed by
-    /// `ActivityInformation::SerializeObjective` (`common/tasks.h:141-189`), RoF+ branch.
+    /// `TaskManager::SendTaskActivityLong` (`eqemu:zone/task_manager.cpp@491b1edd1:989-1014`) followed by
+    /// `ActivityInformation::SerializeObjective` (`eqemu:common/tasks.h@491b1edd1:141-189`), RoF+ branch.
     #[allow(clippy::too_many_arguments)]
     fn build_task_activity_long(
         task_id: u32, activity_id: u32, activity_type: i32, optional: bool,
@@ -8116,7 +8108,7 @@ mod tests {
         p
     }
 
-    /// `TaskManager::SendTaskActivityShort` (`zone/task_manager.cpp:972-987`) — 6×u32 + 1×u8.
+    /// `TaskManager::SendTaskActivityShort` (`eqemu:zone/task_manager.cpp@491b1edd1:972-987`) — 6×u32 + 1×u8.
     fn build_task_activity_short(task_id: u32, activity_id: u32, optional: bool) -> Vec<u8> {
         let mut p = Vec::new();
         p.extend_from_slice(&7u32.to_le_bytes());        //  0 client_task_index
@@ -8136,7 +8128,7 @@ mod tests {
     }
 
     /// The fixture builder agrees with the emulator on the SHORT form's length — 25 bytes is
-    /// `EQApplicationPacket(OP_TaskActivity, 25)` at `zone/task_manager.cpp:978`, and it is the
+    /// `EQApplicationPacket(OP_TaskActivity, 25)` at `eqemu:zone/task_manager.cpp@491b1edd1:978`, and it is the
     /// `buffer 25 bytes` in #889's panic log.
     #[test]
     fn short_form_is_exactly_25_bytes() {
@@ -8310,7 +8302,7 @@ mod tests {
         }
     }
 
-    /// `activity_type` is `enum class TaskActivityType : int32_t` (`common/tasks.h:46`) written
+    /// `activity_type` is `enum class TaskActivityType : int32_t` (`eqemu:common/tasks.h@491b1edd1:46`) written
     /// with `WriteInt32` (`:152`). Reading it unsigned would report any negative type as a
     /// ~4-billion id in `/v1/quests/log` — the same class of confident-nonsense number #889 is
     /// about. (EQEmu's own `uint8_t` DB column means the live range is 0..=255, so this pins the
@@ -8888,7 +8880,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9],
             helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0,
+            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0, class_id: None,
         });
         // Build a 32-byte Death_Struct payload: spawn_id=42, killer_id=1 (player)
         let mut pkt = [0u8; 32];
@@ -8905,7 +8897,7 @@ mod tests {
 
     #[test]
     fn player_death_sets_dead_flag_and_revive_clears_it() {
-        // eqoxide#61: the nav walker keys on gs.player_dead to abandon a stale /goto.
+        // eqoxide#61: gs.player_dead drives the dead pose.
         use super::apply_death;
         let mut gs = GameState::new();
         gs.player_id = 7;
@@ -9130,7 +9122,7 @@ mod tests {
 
     #[test]
     fn apply_task_select_window_empty_payload_clears_offers() {
-        // navigation.rs mirrors an accept/decline by sending an EMPTY OP_TaskSelectWindow, which
+        // action_loop.rs mirrors an accept/decline by sending an EMPTY OP_TaskSelectWindow, which
         // must clear the render-side offers so the Task selector window closes (bug #5).
         let mut gs = GameState::new();
         gs.task_offers.push(eqoxide_core::game_state::TaskOffer {
@@ -9239,5 +9231,116 @@ mod tests {
             assert_eq!(gs.target_hp_pct, Some(37.0),
                 "spawn_id {sid}: and the targeted mob's published hp_pct with it");
         }
+    }
+}
+
+#[cfg(test)]
+mod explicit_loot_policy_tests {
+    use super::*;
+    #[test]
+    fn explicit_policy_does_not_queue_own_kill() {
+        let mut gs=GameState::new();gs.automatic_loot=false;gs.player_id=1;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42,"a_rat",0.0,0.0,0.0,true));
+        let mut death=vec![0;32];death[0..4].copy_from_slice(&42u32.to_le_bytes());death[4..8].copy_from_slice(&1u32.to_le_bytes());
+        apply_death(&mut gs,&death);
+        assert!(gs.world.entities[&42].dead);assert!(gs.pending_loot.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod received_self_echo_tests {
+    use super::*;
+    #[test]
+    fn actual_inbound_echo_is_retained_separately_from_chat_delivery() {
+        let mut gs=GameState::new();gs.player_name="Tester".into();
+        let mut payload=b"Tester\0Tester\0".to_vec();
+        payload.extend_from_slice(&[0;8]);payload.extend_from_slice(&7u32.to_le_bytes());payload.extend_from_slice(&[0;9]);
+        payload.extend_from_slice(b"exact-server-nonce\0");
+        apply_channel_message(&mut gs,&payload);
+        assert!(gs.chat_events.is_empty());assert!(gs.messages.is_empty());
+        let echo=gs.received_self_echoes.back().unwrap();assert_eq!(echo.channel,7);
+        assert_eq!(echo.sender,"Tester");assert_eq!(echo.text,"exact-server-nonce");
+    }
+}
+
+#[cfg(test)]
+mod corpse_catalog_inventory_tests {
+    use super::*;
+    #[test]
+    fn corpse_catalog_packets_never_acquire_or_stack_player_inventory() {
+        let mut gs = GameState::new();
+        let mut catalog = 0x66u32.to_le_bytes().to_vec();
+        catalog.extend(crate::item::tests::fixture());
+        let packet = crate::transport::AppPacket {
+            opcode: OP_ITEM_PACKET,
+            payload: catalog,
+        };
+        apply_packet(&mut gs, &packet);
+        apply_packet(&mut gs, &packet);
+        assert!(
+            gs.inventory.is_empty(),
+            "a corpse listing is not an acquired inventory item"
+        );
+        let mut acquired = 0x68u32.to_le_bytes().to_vec();
+        acquired.extend(crate::item::tests::fixture());
+        apply_packet(
+            &mut gs,
+            &crate::transport::AppPacket {
+                opcode: OP_ITEM_PACKET,
+                payload: acquired,
+            },
+        );
+        assert_eq!(
+            gs.inventory.len(),
+            1,
+            "an actual server inventory item still applies"
+        );
+        assert_eq!(gs.inventory[0].slot, 23);
+    }
+}
+
+#[cfg(test)]
+mod received_bag_item_tests {
+    use super::*;
+    fn deliver(gs: &mut GameState, blob: Vec<u8>) {
+        let mut payload = 0x68u32.to_le_bytes().to_vec();
+        payload.extend(blob);
+        apply_packet(
+            gs,
+            &crate::transport::AppPacket {
+                opcode: OP_ITEM_PACKET,
+                payload,
+            },
+        );
+    }
+    #[test]
+    fn received_bag_destination_preserves_the_container() {
+        let mut gs = GameState::new();
+        deliver(&mut gs, crate::item::tests::fixture());
+        let mut inside = crate::item::tests::fixture2();
+        inside[26..28].copy_from_slice(&23u16.to_le_bytes());
+        inside[28..30].copy_from_slice(&0u16.to_le_bytes());
+        deliver(&mut gs, inside.clone());
+        deliver(&mut gs, inside);
+        assert_eq!(
+            gs.inventory.iter().find(|i| i.slot == 23).unwrap().item_id,
+            1001
+        );
+        assert_eq!(
+            gs.inventory.iter().find(|i| i.slot == 251).unwrap().item_id,
+            2002
+        );
+        assert_eq!(gs.inventory.len(), 2);
+    }
+    #[test]
+    fn unsupported_subslot_never_overwrites_the_parent() {
+        let mut gs = GameState::new();
+        deliver(&mut gs, crate::item::tests::fixture());
+        let mut invalid = crate::item::tests::fixture2();
+        invalid[26..28].copy_from_slice(&23u16.to_le_bytes());
+        invalid[28..30].copy_from_slice(&10u16.to_le_bytes());
+        deliver(&mut gs, invalid);
+        assert_eq!(gs.inventory.len(), 1);
+        assert_eq!(gs.inventory[0].item_id, 1001);
     }
 }

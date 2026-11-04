@@ -54,6 +54,12 @@ fn des_decrypt(data: &[u8]) -> Vec<u8> {
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
+/// Exact advertised world identity required by the selected login flow.
+pub struct ExpectedWorld {
+    pub name: String,
+    pub host: String,
+}
+
 /// World-server credentials needed to reconnect after a zone change.
 pub struct WorldCredentials {
     pub lsid:       i32,
@@ -72,25 +78,54 @@ pub async fn run_login_flow(
     slots:       ActionLoopSlots,
     lifecycle:   GameplayLifecycle,
 ) -> Result<(), String> {
+    run_login_flow_with_world(config, max_retries, slots, lifecycle, None).await
+}
+
+/// Log in only when the complete server list contains exactly one expected world.
+/// Selection failures stop immediately without sending a play request or reconnecting.
+pub async fn run_login_flow_selected(
+    config: LoginConfig,
+    max_retries: u32,
+    slots: ActionLoopSlots,
+    lifecycle: GameplayLifecycle,
+    expected: ExpectedWorld,
+) -> Result<(), String> {
+    run_login_flow_with_world(config, max_retries, slots, lifecycle, Some(expected)).await
+}
+
+async fn run_login_flow_with_world(
+    config: LoginConfig,
+    max_retries: u32,
+    slots: ActionLoopSlots,
+    lifecycle: GameplayLifecycle,
+    expected: Option<ExpectedWorld>,
+) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
             tracing::warn!("EQ: retry {}/{}", attempt, max_retries);
             sleep(Duration::from_secs(3)).await;
         }
-        match run_login_phase(&config, &lifecycle.net_health, &slots.controller, &slots.interact.doors_shared).await {
-            // A server-rejected create can't succeed on retry — surface it and stop now so the
-            // user sees the real reason instead of an endless "Login timed out" loop. (#6)
+        match run_login_phase(&config, &lifecycle.net_health, &slots.controller, &slots.interact.doors_shared, expected.as_ref()).await {
+            // Creation rejections and world selection failures must surface immediately.
             Err(LoginError::Fatal(e)) => return Err(e),
             Err(LoginError::Retryable(e)) => tracing::warn!("EQ: login failed (attempt {}): {}", attempt, e),
-            Ok((stream, net_rx, gs, world_creds)) => {
+            Ok((stream, net_rx, mut gs, world_creds)) => {
+                if expected.is_some() {
+                    // Selected-world CPU sessions are driven explicitly. A corpse received during
+                    // the login burst must not start unsolicited gameplay when the loop begins.
+                    gs.automatic_loot = false;
+                    gs.automatic_zone_crossing = false;
+                    gs.pending_loot.clear();
+                    gs.loot_queued_at = None;
+                }
                 // Seed /entities map with everything discovered during login.
                 {
-                    // #643: this is the SECOND roster publisher (the nav tick's `sync_entities` is
+                    // #643: this is the SECOND roster publisher (the action loop's `sync_entities` is
                     // the first). It goes through the same `WorldSlots::publish_entities` so it
                     // cannot seed positions without poses — which is precisely what it did do when
                     // `entity_poses` was added and only the other publisher was updated, leaving
                     // every `poses` key missing for the whole window between login and the first
-                    // nav tick. See that method's doc comment.
+                    // action loop tick. See that method's doc comment.
                     let n = slots.world.publish_entities(&gs.world.entities);
                     tracing::info!("NAV: entity map seeded with {} entities", n);
                 }
@@ -162,8 +197,9 @@ async fn run_login_phase(
     net_health: &eqoxide_ipc::NetHealthShared,
     controller: &eqoxide_ipc::ControllerSlots,
     doors: &eqoxide_ipc::DoorsShared,
+    expected: Option<&ExpectedWorld>,
 ) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), LoginError> {
-    let outcome = run_login_handshake(config, net_health, controller, doors).await;
+    let outcome = run_login_handshake(config, net_health, controller, doors, expected).await;
     if outcome.is_err() {
         doors.lock().unwrap().clear();
     }
@@ -176,6 +212,7 @@ async fn run_login_handshake(
     net_health: &eqoxide_ipc::NetHealthShared,
     controller: &eqoxide_ipc::ControllerSlots,
     doors: &eqoxide_ipc::DoorsShared,
+    expected: Option<&ExpectedWorld>,
 ) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), LoginError> {
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<AppPacket>();
 
@@ -187,7 +224,10 @@ async fn run_login_handshake(
     tracing::info!("EQ: login session established — waiting for handshake");
     stream.send_app_packet(OP_SESSION_READY, &2u32.to_le_bytes());
 
-    let mut proto = LoginProtocol::new(config);
+    let mut proto = match expected {
+        Some(expected) => LoginProtocol::new_selected(config, expected),
+        None => LoginProtocol::new(config),
+    };
     let mut gs    = GameState::new();
     gs.player_name = config.character_name.clone();
 
@@ -305,7 +345,7 @@ enum PhaseResult {
 }
 
 /// Outcome of one login attempt. `Retryable` errors (timeouts, transient connection drops) are
-/// retried; `Fatal` errors (a server-rejected create) break the retry loop immediately so the user
+/// retried; `Fatal` errors (a server-rejected create or failed world selection) break the retry loop so the user
 /// sees the real reason instead of an endless "Login timed out". `?` on a `String` maps to
 /// `Retryable` via the `From` impl, so existing connection error sites are unchanged.
 enum LoginError {
@@ -327,6 +367,7 @@ impl std::fmt::Display for LoginError {
 /// Game state (entities, positions) is maintained separately in GameState.
 struct LoginProtocol<'a> {
     config:       &'a LoginConfig,
+    expected:     Option<&'a ExpectedWorld>,
     // Credentials returned by the login server
     lsid:         i32,
     ls_key:       String,
@@ -360,6 +401,7 @@ impl<'a> LoginProtocol<'a> {
     fn new(config: &'a LoginConfig) -> Self {
         LoginProtocol {
             config,
+            expected: None,
             lsid: 0, ls_key: String::new(),
             world_host: String::new(), world_server_id: 0,
             done_session_ready:    false,
@@ -379,6 +421,10 @@ impl<'a> LoginProtocol<'a> {
         }
     }
 
+    fn new_selected(config: &'a LoginConfig, expected: &'a ExpectedWorld) -> Self {
+        Self { expected: Some(expected), ..Self::new(config) }
+    }
+
     fn is_timed_out(&self) -> bool {
         self.start_time.elapsed() > Duration::from_secs(120)
     }
@@ -389,7 +435,7 @@ impl<'a> LoginProtocol<'a> {
         let lsid_bytes = lsid_str.as_bytes();
         login_info[..lsid_bytes.len().min(64)].copy_from_slice(&lsid_bytes[..lsid_bytes.len().min(64)]);
         stream.send_app_packet(OP_SEND_LOGIN_INFO, &login_info);
-        tracing::info!("EQ: sent login info to world (lsid={} key={})", self.lsid, self.ls_key);
+        tracing::info!("EQ: sent login info to world");
     }
 
     fn on_zone_connected(&self, stream: &mut EqStream) {
@@ -418,19 +464,16 @@ impl<'a> LoginProtocol<'a> {
                 PhaseResult::Continue
             }
             OP_SERVER_LIST_RESPONSE if !self.done_server_list => {
+                if let Err(error) = self.parse_server_list(&packet.payload) {
+                    return PhaseResult::Fatal(error);
+                }
                 self.done_server_list = true;
-                self.parse_server_list(&packet.payload);
                 self.send_play_everquest(stream);
                 PhaseResult::Continue
             }
             OP_PLAY_EVERQUEST_RESP if !self.done_play_everquest => {
                 self.done_play_everquest = true;
-                let host = if self.world_host.is_empty() {
-                    self.config.login_host.clone()
-                } else {
-                    self.world_host.clone()
-                };
-                PhaseResult::ReconnectWorld { host, port: self.config.world_port }
+                self.world_reconnect()
             }
             OP_SEND_CHAR_INFO if !self.done_char_info => {
                 let name = &self.config.character_name;
@@ -596,7 +639,7 @@ impl<'a> LoginProtocol<'a> {
     // ── Packet builders ───────────────────────────────────────────────────────
 
     fn send_credentials(&self, stream: &mut EqStream) {
-        tracing::info!("EQ: sending credentials for '{}'", self.config.username);
+        tracing::info!("EQ: sending login credentials");
         stream.send_app_packet(OP_LOGIN, &build_login_request(&self.config.username, &self.config.password));
     }
 
@@ -627,7 +670,7 @@ impl<'a> LoginProtocol<'a> {
             Some((lsid, key)) => {
                 self.lsid   = lsid;
                 self.ls_key = key;
-                tracing::info!("EQ: login accepted: lsid={} key={}", self.lsid, self.ls_key);
+                tracing::info!("EQ: login accepted");
                 true
             }
             None => {
@@ -637,11 +680,29 @@ impl<'a> LoginProtocol<'a> {
         }
     }
 
-    fn parse_server_list(&mut self, payload: &[u8]) {
-        let (server_id, host, name) = parse_server_list_payload(payload, &self.config.login_host);
+    fn parse_server_list(&mut self, payload: &[u8]) -> Result<(), String> {
+        let (server_id, host, name) = match self.expected {
+            Some(expected) => select_expected_world(payload, expected)?,
+            None => parse_server_list_payload(payload, &self.config.login_host),
+        };
         tracing::info!("EQ: world server: id={} name={} host={}", server_id, name, host);
         self.world_server_id = server_id;
         self.world_host = host;
+        Ok(())
+    }
+
+    fn world_reconnect(&self) -> PhaseResult {
+        let host = match self.expected {
+            Some(expected) => {
+                if !self.done_server_list || self.world_host != expected.host {
+                    return PhaseResult::Fatal("Expected world was not selected; refusing world reconnect".into());
+                }
+                expected.host.clone()
+            }
+            None if self.world_host.is_empty() => self.config.login_host.clone(),
+            None => self.world_host.clone(),
+        };
+        PhaseResult::ReconnectWorld { host, port: self.config.world_port }
     }
 }
 
@@ -743,6 +804,68 @@ fn parse_server_list_payload(payload: &[u8], fallback_host: &str) -> (u32, Strin
     if server_id == 0 { server_id = 1; }
     if host.is_empty() { host = fb(); }
     (server_id, host, name)
+}
+
+/// Validate every advertised entry before accepting a unique exact name/host match.
+/// Unlike the graphical compatibility parser, this never substitutes a host or server id.
+fn select_expected_world(payload: &[u8], expected: &ExpectedWorld) -> Result<(u32, String, String), String> {
+    const MALFORMED: &str = "Malformed or truncated world server list";
+
+    fn take<'a>(remaining: &mut &'a [u8], len: usize) -> Result<&'a [u8], String> {
+        let bytes = remaining.get(..len).ok_or(MALFORMED)?;
+        *remaining = &remaining[len..];
+        Ok(bytes)
+    }
+
+    fn read_u32(remaining: &mut &[u8]) -> Result<u32, String> {
+        let bytes = take(remaining, 4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_string<'a>(remaining: &mut &'a [u8]) -> Result<&'a str, String> {
+        let len = remaining.iter().position(|&byte| byte == 0).ok_or(MALFORMED)?;
+        let bytes = take(remaining, len + 1)?;
+        std::str::from_utf8(&bytes[..len]).map_err(|_| MALFORMED.to_string())
+    }
+
+    if expected.name.is_empty() || expected.host.is_empty() || expected.host == "0.0.0.0" {
+        return Err("Expected world must have a name and an explicit host".into());
+    }
+    if payload.len() < 20 || payload[10] != 1 || payload[15] != 0 {
+        return Err(MALFORMED.into());
+    }
+    let mut remaining = &payload[16..];
+    let count = read_u32(&mut remaining)?;
+    // Four string terminators and four u32 fields are the minimum entry size.
+    // Bound the loop by actual bytes, including when the signed wire count is negative.
+    if count > i32::MAX as u32 || count as usize > remaining.len() / 20 {
+        return Err(MALFORMED.into());
+    }
+    let mut selected = None;
+    let mut matches = 0;
+    for _ in 0..count {
+        let host = read_string(&mut remaining)?;
+        let _server_type = read_u32(&mut remaining)?;
+        let server_id = read_u32(&mut remaining)?;
+        let name = read_string(&mut remaining)?;
+        let _country = read_string(&mut remaining)?;
+        let _language = read_string(&mut remaining)?;
+        let _status = read_u32(&mut remaining)?;
+        let _players_online = read_u32(&mut remaining)?;
+        if name == expected.name && host == expected.host {
+            matches += 1;
+            selected = Some((server_id, host.to_string(), name.to_string()));
+        }
+    }
+    if !remaining.is_empty() {
+        return Err(MALFORMED.into());
+    }
+    match (matches, selected) {
+        (1, Some((0, _, _))) => Err("Expected world advertised an invalid server id".into()),
+        (1, Some(world)) => Ok(world),
+        (0, _) => Err("Expected world name and host did not match any server list entry".into()),
+        _ => Err("Expected world name and host matched multiple server list entries".into()),
+    }
 }
 
 // ── Character-creation helpers ─────────────────────────────────────────────────
@@ -1037,6 +1160,196 @@ mod sod_login_tests {
         assert_eq!(id, 9);
         assert_eq!(host, "myfallback");
     }
+
+    fn expected_world() -> ExpectedWorld {
+        ExpectedWorld { name: "Bump Staging".into(), host: "192.168.1.220".into() }
+    }
+
+    fn login_config() -> LoginConfig {
+        LoginConfig {
+            login_host: "127.0.0.1".into(), login_port: 5999, world_port: 9000,
+            username: "tester".into(), password: "test-only".into(),
+            character_name: "Tester".into(), create: None,
+        }
+    }
+
+    fn world_list(entries: &[(&[u8], u32, &[u8])]) -> Vec<u8> {
+        let mut payload = make_server_list(b"", 1, 1, b"", entries.len() as i32);
+        payload.truncate(20);
+        for &(host, id, name) in entries {
+            let entry = make_server_list(host, 1, id, name, 1);
+            payload.extend_from_slice(&entry[20..]);
+        }
+        payload
+    }
+
+    #[tokio::test]
+    async fn selected_world_matches_both_fields_across_all_entries_and_reconnects_to_expected_host() {
+        let config = login_config();
+        let expected = expected_world();
+        let mut proto = LoginProtocol::new_selected(&config, &expected);
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let gs = GameState::new();
+        let payload = world_list(&[
+            (b"192.168.1.220", 7, b"Other World"),
+            (b"192.168.1.220", 42, b"Bump Staging"),
+            (b"192.168.1.221", 9, b"Bump Staging"),
+        ]);
+        assert!(matches!(proto.handle(
+            &AppPacket { opcode: OP_SERVER_LIST_RESPONSE, payload }, &mut stream, &gs,
+        ), PhaseResult::Continue));
+        assert_eq!(proto.world_server_id, 42);
+        assert_eq!(proto.world_host, expected.host);
+        assert_eq!(stream.sent_app_packets(), vec![(OP_PLAY_EVERQUEST_REQ, build_play_everquest(42))]);
+        match proto.handle(
+            &AppPacket { opcode: OP_PLAY_EVERQUEST_RESP, payload: Vec::new() }, &mut stream, &gs,
+        ) {
+            PhaseResult::ReconnectWorld { host, port } => {
+                assert_eq!(host, expected.host);
+                assert_eq!(port, config.world_port);
+            }
+            _ => panic!("expected selected world reconnect"),
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_world_handler_fails_before_sending_play_for_invalid_lists() {
+        let config = login_config();
+        let expected = expected_world();
+        let gs = GameState::new();
+        let duplicate = world_list(&[
+            (b"192.168.1.220", 42, b"Bump Staging"),
+            (b"192.168.1.220", 43, b"Bump Staging"),
+        ]);
+        let mut truncated = world_list(&[(b"192.168.1.220", 42, b"Bump Staging")]);
+        truncated.pop();
+        for payload in [Vec::new(), world_list(&[]), duplicate, truncated] {
+            let mut proto = LoginProtocol::new_selected(&config, &expected);
+            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+            assert!(matches!(proto.handle(
+                &AppPacket { opcode: OP_SERVER_LIST_RESPONSE, payload }, &mut stream, &gs,
+            ), PhaseResult::Fatal(_)));
+            assert!(!proto.done_server_list);
+            assert!(proto.world_host.is_empty());
+            assert!(stream.sent_app_packets().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_world_preserves_normal_character_creation_handshake() {
+        let mut config = login_config();
+        config.create = Some(CharacterCreate { race: 6, class: 5, ..Default::default() });
+        let expected = expected_world();
+        let mut proto = LoginProtocol::new_selected(&config, &expected);
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let gs = GameState::new();
+        for (opcode, payload) in [
+            (OP_SEND_CHAR_INFO, Vec::new()),
+            (OP_APPROVE_NAME, vec![1]),
+            (OP_SEND_CHAR_INFO, b"Tester\0".to_vec()),
+        ] {
+            assert!(matches!(proto.handle(&AppPacket { opcode, payload }, &mut stream, &gs), PhaseResult::Continue));
+        }
+        let packets = stream.sent_app_packets();
+        assert_eq!(packets.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>(),
+            [OP_APPROVE_NAME, OP_CHARACTER_CREATE, OP_ENTER_WORLD, OP_POST_ENTER_WORLD]);
+        assert_eq!(packets[1].1, build_char_create(config.create.as_ref().unwrap()));
+        assert!(proto.done_char_info);
+        assert!(!proto.awaiting_create_result);
+    }
+
+    #[test]
+    fn selected_world_rejects_mismatches_without_host_fallback() {
+        let expected = expected_world();
+        for (host, name) in [
+            (b"192.168.1.221".as_slice(), b"Bump Staging".as_slice()),
+            (b"192.168.1.220", b"bump staging"),
+            (b"192.168.1.220", b"Bump Staging Extra"),
+            (b"", b"Bump Staging"),
+            (b"0.0.0.0", b"Bump Staging"),
+        ] {
+            let payload = world_list(&[(host, 42, name)]);
+            assert!(select_expected_world(&payload, &expected).unwrap_err().contains("did not match"));
+        }
+        assert!(select_expected_world(&world_list(&[]), &expected).unwrap_err().contains("did not match"));
+    }
+
+    #[test]
+    fn selected_world_rejects_ambiguous_entries_even_with_identical_ids() {
+        for second_id in [42, 43] {
+            let payload = world_list(&[
+                (b"192.168.1.220", 42, b"Bump Staging"),
+                (b"192.168.1.220", second_id, b"Bump Staging"),
+            ]);
+            assert!(select_expected_world(&payload, &expected_world()).unwrap_err().contains("multiple"));
+        }
+    }
+
+    #[test]
+    fn selected_world_rejects_every_truncation_including_entries_after_a_match() {
+        let expected = expected_world();
+        let payload = world_list(&[
+            (b"192.168.1.220", 42, b"Bump Staging"),
+            (b"192.168.1.221", 7, b"Other World"),
+        ]);
+        assert!(select_expected_world(&payload, &expected).is_ok());
+        for len in 0..payload.len() {
+            assert!(select_expected_world(&payload[..len], &expected).is_err(), "accepted length {len}");
+        }
+    }
+
+    #[test]
+    fn selected_world_rejects_malformed_counts_strings_headers_and_trailing_bytes() {
+        let expected = expected_world();
+        let valid = world_list(&[(b"192.168.1.220", 42, b"Bump Staging")]);
+        for count in [0i32, -1, 2, i32::MAX] {
+            let mut payload = valid.clone();
+            payload[16..20].copy_from_slice(&count.to_le_bytes());
+            assert!(select_expected_world(&payload, &expected).is_err());
+        }
+        for index in [10, 15, 20, 42, valid.len() - 14] {
+            let mut payload = valid.clone();
+            payload[index] = 0xff;
+            assert!(select_expected_world(&payload, &expected).is_err());
+        }
+        let mut payload = valid;
+        payload.push(0);
+        assert!(select_expected_world(&payload, &expected).is_err());
+        assert!(select_expected_world(
+            &world_list(&[(b"192.168.1.220", 0, b"Bump Staging")]), &expected,
+        ).is_err());
+    }
+
+    #[test]
+    fn selected_world_reconnect_requires_successful_selection_and_preserves_expected_host() {
+        let config = login_config();
+        let expected = expected_world();
+        let mut proto = LoginProtocol::new_selected(&config, &expected);
+        assert!(matches!(proto.world_reconnect(), PhaseResult::Fatal(_)));
+        proto.world_host = expected.host.clone();
+        assert!(matches!(proto.world_reconnect(), PhaseResult::Fatal(_)));
+        proto.done_server_list = true;
+        proto.world_host = config.login_host.clone();
+        assert!(matches!(proto.world_reconnect(), PhaseResult::Fatal(_)));
+    }
+
+    #[test]
+    fn graphical_login_keeps_first_entry_and_fallback_compatibility() {
+        let config = login_config();
+        let mut proto = LoginProtocol::new(&config);
+        let payload = world_list(&[
+            (b"0.0.0.0", 7, b"Other World"),
+            (b"192.168.1.220", 42, b"Bump Staging"),
+        ]);
+        proto.parse_server_list(&payload).unwrap();
+        assert_eq!(proto.world_server_id, 7);
+        assert_eq!(proto.world_host, config.login_host);
+        proto.parse_server_list(&[]).unwrap();
+        assert_eq!(proto.world_server_id, 1);
+        assert_eq!(proto.world_host, config.login_host);
+        assert!(matches!(proto.world_reconnect(), PhaseResult::ReconnectWorld { host, .. }
+            if host == config.login_host));
+    }
 }
 
 // ── #1022: the login path's door publisher ────────────────────────────────────
@@ -1127,6 +1440,7 @@ mod login_door_publish_tests {
                 &eqoxide_ipc::NetHealthShared::default(),
                 &eqoxide_ipc::ControllerSlots::default(),
                 &doors_bg,
+                None,
             ).await;
         });
 
@@ -1214,6 +1528,7 @@ mod login_door_publish_tests {
                 &eqoxide_ipc::NetHealthShared::default(),
                 &eqoxide_ipc::ControllerSlots::default(),
                 &doors_bg,
+                None,
             ).await.err().map(|e| e.to_string())
         });
 

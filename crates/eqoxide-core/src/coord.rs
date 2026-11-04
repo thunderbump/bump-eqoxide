@@ -1,5 +1,5 @@
-//! Low-level EQ coordinate-space math shared by render, movement, and nav. Deliberately dependency-
-//! free (no `assets`/`eq_net`/`nav` types) so it can be called from any of them without creating a
+//! Low-level EQ coordinate-space math shared by render and movement. Deliberately dependency-
+//! free (no `assets`/`eq_net` types) so it can be called from any of them without creating a
 //! layering cycle.
 
 /// The EQ **wire Z datum offset**: how far a character's wire/server `z` coordinate sits ABOVE
@@ -25,7 +25,7 @@
 /// per-model refinement (e.g. gnome vs ogre) can layer on later without changing the datum rule.
 ///
 /// **The datum discipline: FOOT everywhere except the wire.** Everything eqoxide holds and reports —
-/// `gs.player_z`, the controller, nav, collision, every stored ENTITY z (converted wire→foot on
+/// `gs.player_z`, the controller, collision, every stored ENTITY z (converted wire→foot on
 /// ingest in `packet_handler`), and the agent-facing position readings (`player.pos` on
 /// `GET /v1/observe/debug`, the positions in `GET /v1/observe/entities`) — is FOOT. Those two are
 /// named because they are the position readings this datum rule was written for, not as a claim
@@ -33,14 +33,12 @@
 /// `pos_up` response key — `pos_up` is the internal `PlayerState` field the served `pos` array's
 /// third element is built from, #822.) The `± WIRE_Z_OFFSET` conversion happens ONLY at the packet
 /// edge.
-/// One datum end to end means a position the agent READS can be fed straight back into `goto`/coords
-/// with no 3u skew, self reads at the same height as another player on the same plank, and a
-/// goto-by-name goal lands on the floor instead of 3u above it (a goal-z/floor-tier mismatch wedges
-/// nav). Boats/floating entities skip the server's Z-offset (`Mob::FixZ` early-returns for them), so
+/// One datum end to end means a position the agent READS can be fed straight back into coords
+/// with no 3u skew, and self reads at the same height as another player on the same plank. Boats/floating entities skip the server's Z-offset (`Mob::FixZ` early-returns for them), so
 /// their wire z is already surface-level and is NOT shifted on ingest.
 pub const WIRE_Z_OFFSET: f32 = 3.125;
 
-/// EQ `flymode` (GravityBehavior) wire codes (EQEmu `common/emu_constants.h:297`):
+/// EQ `flymode` (GravityBehavior) wire codes (EQEmu `eqemu:common/emu_constants.h@7ab909ee4:297`):
 /// Ground=0, Flying=1, Levitating=2, Water=3, Floating=4, LevitateWhileRunning=5.
 ///
 /// A grounded mob's wire z carries the server's `GetZOffset` (+3.125, the model-origin datum) — it
@@ -58,7 +56,7 @@ pub const WIRE_Z_OFFSET: f32 = 3.125;
 pub const FLYMODE_FLYING: u8 = 1;
 /// See [`FLYMODE_FLYING`]. Levitating airborne mobs are excepted from the Z-offset the same way.
 pub const FLYMODE_LEVITATING: u8 = 2;
-/// `LevitateWhileRunning=5` (EQEmu `common/emu_constants.h:297`) — a second levitating variant.
+/// `LevitateWhileRunning=5` (EQEmu `eqemu:common/emu_constants.h@7ab909ee4:297`) — a second levitating variant.
 pub const FLYMODE_LEVITATE_WHILE_RUNNING: u8 = 5;
 
 /// True when a `flymode`/GravityBehavior wire code means "levitating" for gravity purposes: either
@@ -92,8 +90,8 @@ pub fn skips_wire_z_offset(is_boat: bool, flymode: u8) -> bool {
 /// **Levitating(2)**:
 ///
 /// `Mob::FixZ`/`GetFixedZ` early-return **only** for `GetIsBoat` and `flymode==Flying(1)` (EQEmu
-/// `zone/waypoints.cpp:788-790,836-842`) — Levitating is NOT excepted. So a Levitating NPC that is
-/// actively **patrolling** is routed through `UpdatePathGround` (`zone/mob_movement_manager.cpp:1090-1099`,
+/// `eqemu:zone/waypoints.cpp@7ab909ee4:788-790,836-842`) — Levitating is NOT excepted. So a Levitating NPC that is
+/// actively **patrolling** is routed through `UpdatePathGround` (`eqemu:zone/mob_movement_manager.cpp@7ab909ee4:1090-1099`,
 /// `opts.offset = GetZOffset()`), which bakes `+3.125` into every position it broadcasts, exactly
 /// like a Ground NPC. A *stationary-hover* Levitating NPC never moves, so it sends no position
 /// updates at all — meaning the mere existence of a position update for a Levitating entity is the
@@ -104,7 +102,7 @@ pub fn skips_wire_z_offset(is_boat: bool, flymode: u8) -> bool {
 ///
 /// Boats and Flying(1) skip on BOTH paths: `Mob::FixZ` early-returns for both, and a Flying NPC
 /// pursuing a target is `PushFlyTo`'d to a raw destination with no offset
-/// (`mob_movement_manager.cpp:1070-1077`). (Accepted residual, per EQEmu source review: a Flying NPC
+/// (`eqemu:zone/mob_movement_manager.cpp@7ab909ee4:1070-1077`). (Accepted residual, per EQEmu source review: a Flying NPC
 /// that patrols with no line-of-sight target instead falls through `UpdatePathGround` and would
 /// carry the offset — rare, and indistinguishable on the wire; we keep Flying an unconditional skip
 /// to match `FixZ`'s literal `== Flying` check.)

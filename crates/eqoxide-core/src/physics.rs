@@ -1,5 +1,5 @@
 //! Pure movement/physics constants and calculations shared by the controller (`movement`), the
-//! action loop (`eq_net::action_loop`), and the navigation planner/walker (`nav`).
+//! action loop (`eq_net::action_loop`).
 //!
 //! These are dependency-free scalars and `f32 -> …` functions — no wgpu/winit/tokio/net/app types —
 //! so they live in the leaf `eqoxide-core` crate (#544 Step 2d). The behavior that *operates* on
@@ -24,9 +24,7 @@ pub const PLAYER_RADIUS: f32 = 1.0;
 /// Step-up height, matched to the reference RoF2 client. This is a HARD cap: the
 /// native client can auto-step a ledge at most 2.0u tall; anything taller is a wall (jump or go
 /// around) — there is no larger climb and no separate slope check. It is the single source of truth
-/// for how high nav may climb, so `find_path` derives its edge-climb cap (`STEP_H`) from it. Both
-/// free WASD and the nav walker are clamped to this — navigation must never climb what a WASD player
-/// can't (#239).
+/// for how high the character may climb (#239).
 pub const STEP_UP: f32 = 2.0;
 
 /// Downward acceleration for the fall integration, in EQ units/s². This is the ACCELERATION only —
@@ -47,18 +45,17 @@ pub const GRAVITY: f32 = 120.0;
 /// (Exact RoF2 parity of the impulse is worth a live check; 4u restores a usable jump.)
 pub const JUMP_VELOCITY: f32 = 31.0;
 
-/// Native Titanium base run speed (u/s). The action loop tags outbound move intents with it and the
-/// nav walker/steering integrate at it, so it is the single source of truth for both drivers.
+/// Native Titanium base run speed (u/s). The action loop tags outbound move intents with it.
 pub const RUN_SPEED: f32 = 44.0;
 
 /// Locomotion clip threshold (u/s), matching the native rule verified for #623: the client
 /// chooses the run clip purely by comparing the actor's current forward speed against ITS OWN
 /// `walkspeed` (strict `>`; equal walks). eqoxide does not (yet) carry each spawn's individual
-/// walkspeed/runspeed floats (`EQEmu/common/patches/rof2_structs.h:444-445` — a longer-term
+/// walkspeed/runspeed floats (`eqemu:common/patches/rof2_structs.h@7ab909ee4:444-445` — a longer-term
 /// option noted in #623 but not implemented here), so this is a single constant derived from the
 /// one speed eqoxide does track precisely: `RUN_SPEED` (44 u/s) is this client's controller cap,
 /// which corresponds to the player-special-cased native runspeed float 0.7
-/// (`EQEmu/zone/mob.cpp:190-196`). The equivalent native walk speed is
+/// (`eqemu:zone/mob.cpp@7ab909ee4:190-196`). The equivalent native walk speed is
 /// `RUN_SPEED * (0.3/0.7) ≈ 18.857 u/s` (0.3 = native walkspeed float), so 20.0 sits just above
 /// walk and well below run, giving margin against float noise in the measured speed.
 pub const WALK_RUN_THRESHOLD: f32 = 20.0;
@@ -66,7 +63,7 @@ pub const WALK_RUN_THRESHOLD: f32 = 20.0;
 /// Local movement speed (u/s) selected when the run/walk toggle (#625) is set to walk. Derived the
 /// same way #623 derived `WALK_RUN_THRESHOLD`'s reference point: `RUN_SPEED * (0.3/0.7)`, scaling
 /// the player-special-cased native walkspeed float (0.3) against the native runspeed float (0.7)
-/// that `RUN_SPEED` (44 u/s) itself corresponds to (`EQEmu/zone/mob.cpp:190-196`).
+/// that `RUN_SPEED` (44 u/s) itself corresponds to (`eqemu:zone/mob.cpp@7ab909ee4:190-196`).
 ///
 /// This is purely this client's OWN local-controller speed selection. `OP_SetRunMode` (0x009f),
 /// the wire message the toggle also sends, does not itself gate the server's anti-cheat speed
@@ -105,19 +102,12 @@ mod walk_speed_tests {
 pub const NAV_SPEED_SAMPLE_WINDOW: f32 = 0.15;
 
 /// Samples a 2D speed (u/s) over a real elapsed-time window, returning `None` until the window has
-/// actually elapsed. Exists to fix a live-validation finding for #623: `src/app.rs`'s self-player
-/// speed estimate used to re-anchor its distance/time baseline on **every call** (i.e. every render
-/// frame), against a denominator `clamp`ed up to a 50ms floor. That is only correct if the position
-/// source itself only changes on discrete ~150ms nav ticks, matching the old code's comment — but it
-/// does not: `game_state_view.player_x/y/z` is mirrored on essentially every render tick (~10ms),
-/// the same defect already found and fixed for the OUTBOUND wire-encoding path in #624 (see
-/// `eqoxide-net/src/action_loop.rs`'s `last_streamed` vs `last_sent_pos` split). Re-anchoring every
-/// frame meant the numerator only ever covered ~16ms of travel (at 60fps) while the denominator was
-/// floored to 50ms, understating a true 44 u/s run as roughly 44×(0.016/0.05) ≈ 14 u/s — exactly the
-/// ~5-17 u/s ceiling observed live, never reaching `WALK_RUN_THRESHOLD` (20 u/s). Sampling only once
-/// a real `min_window_s` has elapsed since the anchor keeps the numerator and denominator covering
-/// the same window regardless of how often the position source itself is mirrored. Callers must only
-/// advance their anchor (position + timestamp) when this returns `Some`.
+/// actually elapsed.
+///
+/// `game_state_view.player_x/y/z` is mirrored on essentially every render tick (~10ms), so the
+/// distance and the elapsed time must cover the same window of at least `min_window_s`. Re-anchoring
+/// every frame would understate a 44 u/s run and never reach `WALK_RUN_THRESHOLD` (20 u/s). Callers
+/// must only advance their anchor (position + timestamp) when this returns `Some`.
 pub fn windowed_speed_sample(
     current_pos: [f32; 2],
     anchor_pos: [f32; 2],
@@ -374,7 +364,7 @@ pub fn walk_or_run(speed_u_per_s: f32) -> &'static str {
 /// [`WALK_RUN_THRESHOLD`] (world u/s) that gates the self-player (#651). This is the exact inverse of
 /// this client's own outbound encoder `eqoxide_net::action_loop::speed_to_wire_animation`, which maps
 /// `anim = speed_u_per_s * (0.7 * 40 / RUN_SPEED)` — EQEmu computes `base_runspeed = runspeed_float *
-/// 40` with the player special-case run `0.7 → 28` and walk `0.3 → 12` (`EQEmu/zone/mob.cpp:190-196`,
+/// 40` with the player special-case run `0.7 → 28` and walk `0.3 → 12` (`eqemu:zone/mob.cpp@7ab909ee4:190-196`,
 /// sent as `spu->animation`). So the recovery is `speed = gait * RUN_SPEED / (0.7 * 40)`.
 ///
 /// Two properties this preserves, both load-bearing:
@@ -389,7 +379,7 @@ pub fn walk_or_run(speed_u_per_s: f32) -> &'static str {
 ///   backwards can never select the run clip. Feeding the raw *unsigned* 10-bit value would read a
 ///   backward gait of −12 as 1012 → a spurious run.
 pub fn gait_to_speed(gait: i32) -> f32 {
-    const EQ_RUNSPEED_FLOAT_AT_RUN: f32 = 0.7; // EQEmu player special-case runspeed (mob.cpp:190-196)
+    const EQ_RUNSPEED_FLOAT_AT_RUN: f32 = 0.7; // EQEmu player special-case runspeed (eqemu:zone/mob.cpp@7ab909ee4:190-196)
     const ANIM_SCALE: f32 = 40.0; // EQEmu: base_runspeed = runspeed_float * 40
     gait as f32 * RUN_SPEED / (EQ_RUNSPEED_FLOAT_AT_RUN * ANIM_SCALE)
 }
@@ -398,7 +388,7 @@ pub fn gait_to_speed(gait: i32) -> f32 {
 mod gait_to_speed_tests {
     use super::*;
 
-    /// The two native reference gaits (`EQEmu/zone/mob.cpp:190-196`: walk 0.3→12, run 0.7→28) must
+    /// The two native reference gaits (`eqemu:zone/mob.cpp@7ab909ee4:190-196`: walk 0.3→12, run 0.7→28) must
     /// recover the world speeds the self-player path already uses, and classify accordingly. This
     /// pins `gait_to_speed` to the SAME anchor values `speed_to_wire_animation` encodes to.
     #[test]
@@ -538,10 +528,6 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
 /// client across drop heights, and nobody has run that. Until someone does, treat the ceiling as a
 /// property of THIS code, not of a fall.
 ///
-/// The bound is not confined to this function: `eqoxide-nav`'s pre-emptive lethal-fall guard
-/// compares `max_damage` against current HP, so it cannot fire at all above the ceiling. See
-/// `walker::classify_ledge_fall`, which reports that case rather than passing it off as safe.
-///
 /// UNCITED, as a statement about the tree as it stands: no document in this repository, and none in
 /// the private EQ knowledge-base tree, derives this curve or its constants. That is the operative
 /// fact — treat every number here as unverified until someone re-derives it. #1005 tracks the
@@ -641,9 +627,8 @@ mod fall_damage_ceiling_tests {
         (0..SWEEP_SAMPLES).map(|i| i as f32 * SWEEP_STEP).collect()
     }
 
-    /// Every pathological `f32` a caller can hand this function. `drop_to_target` in the nav walker
-    /// is a subtraction of two published floats, so a NaN or an infinity is a real reachable input,
-    /// not a theoretical one.
+    /// Every pathological `f32` a caller can hand this function. a drop distance computed as
+    /// a subtraction of two published floats can be a NaN or an infinity, so these are reachable inputs.
     fn pathological_heights() -> Vec<f32> {
         vec![
             0.0, -0.0, -1.0, -1e9, f32::MIN, f32::NEG_INFINITY,

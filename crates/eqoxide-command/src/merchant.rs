@@ -77,7 +77,10 @@ impl CommandState {
     pub fn take_buy_await(
         &self,
     ) -> Option<(u32, u32, oneshot::Sender<CommandResult<BuyOk>>)> {
-        self.dequeue(&self.merchant.buy_await)
+        match self.dequeue_checked(&self.merchant.buy_await) {
+            Ok(value)=>value,
+            Err((_,_,tx))=>{let _=tx.send(CommandResult::Refused("stale_zone_epoch_before_dispatch".into()));None}
+        }
     }
 
     /// Drain a pending sell request as `(merchant_id, slot, quantity)`.
@@ -94,7 +97,10 @@ impl CommandState {
     /// `ActionLoop::drain_merchant` takes this, sends the open, and parks the `Sender` in
     /// `pending_open` until the resolving packet lands. Sibling of `take_merchant_trade`.
     pub fn take_open_await(&self) -> Option<(u32, oneshot::Sender<CommandResult<OpenOk>>)> {
-        self.dequeue(&self.merchant.open_await)
+        match self.dequeue_checked(&self.merchant.open_await) {
+            Ok(value)=>value,
+            Err((_,tx))=>{let _=tx.send(CommandResult::Refused("stale_zone_epoch_before_dispatch".into()));None}
+        }
     }
 }
 

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Build only the CPU executable; no player connection or graphical assets.
+set -euo pipefail
+options=(--locked --offline)
+case "${1:-}" in
+  '') ;;
+  --online) options=(--locked) ;;
+  *) echo 'Usage: scripts/build-headless [--online]' >&2; exit 2 ;;
+esac
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+cache_dir=${EQOXIDE_CHECK_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/bump-eqoxide/checks}
+mkdir -p -- "$cache_dir"
+cache_dir=$(cd -- "$cache_dir" && pwd -P)
+image=rust@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa
+docker run --rm --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=$repo_dir,dst=/source,readonly" \
+  --mount "type=bind,src=$cache_dir,dst=/work" --workdir /source \
+  -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target -e CARGO_BUILD_JOBS=4 \
+  -e CARGO_BUILD_RUSTC_WRAPPER= -e RUSTFLAGS= -e CARGO_ENCODED_RUSTFLAGS= \
+  "$image" cargo build -p eqoxide-headless "${options[@]}"
+printf 'HEADLESS_BINARY=%s/target/debug/eqoxide-headless\n' "$cache_dir"

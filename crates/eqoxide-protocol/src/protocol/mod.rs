@@ -4,7 +4,7 @@
 //! Transport-layer opcodes (u8) are protocol-layer constants identical across all patches.
 //!
 //! Packet BUILDERS (payload construction for outbound opcodes) are organized into domain
-//! submodules below — split out of this god-module (and out of `navigation.rs`, where a
+//! submodules below — split out of this god-module (and out of `action_loop.rs`, where a
 //! large batch of unrelated `args -> Vec<u8>` builders had accreted; cleanup step 1). Each
 //! submodule's public items are re-exported here so existing `protocol::build_*` call sites
 //! keep working unchanged.
@@ -241,9 +241,9 @@ pub const OP_SHOP_PLAYER_SELL: u16 = 0x791b;  // RoF2: OP_ShopPlayerSell; Mercha
 // (bazaar) path: zone/trading.cpp TraderEndTrader() :926 / CancelTraderTradeWindow() :3872. It is
 // NOT the NPC-merchant refusal signal — that's OP_SHOP_END_CONFIRM, below.
 pub const OP_SHOP_END: u16 = 0x30a8;
-// Server→client, 0-byte body. EQEmu SendMerchantEnd() (zone/client.cpp:13276-13286). For this
+// Server→client, 0-byte body. EQEmu SendMerchantEnd() (eqemu:zone/client.cpp@5dc093fe5:13276-13286). For this
 // client it is unambiguously a BUY REFUSAL: every call site is a buy-path early return — bad
-// merchant / not-a-merchant / qty<1 / out-of-range (zone/client_packet.cpp:14151), a stale or
+// merchant / not-a-merchant / qty<1 / out-of-range (eqemu:zone/client_packet.cpp@ca704c7f8:14151), a stale or
 // removed item slot (:14194), or a negative price (:14254) — or Handle_OP_ShopEnd (:14123), which
 // only fires in response to a client-sent OP_ShopEnd that eqoxide never sends. It carries no reason
 // text. A buy the server drops for insufficient funds sends NEITHER this NOR an OP_ShopPlayerBuy
@@ -262,7 +262,7 @@ pub const OP_DELETE_CHARGE: u16 = 0x01b8;     // RoF2: OP_DeleteCharge (same wir
 
 // Trade window: hand an item to an NPC for a quest turn-in. Sequence is
 //   C: OP_TradeRequest → S: OP_TradeRequestAck → C: OP_MoveItem(cursor→trade slot) +
-//   OP_TradeAcceptClick → S: OP_FinishTrade. See navigation.rs for the state machine.
+//   OP_TradeAcceptClick → S: OP_FinishTrade. See action_loop.rs for the state machine.
 pub const OP_TRADE_REQUEST: u16      = 0x77b5; // RoF2: OP_TradeRequest; C->S, TradeRequest_Struct {to_mob_id, from_mob_id} (8b)
 pub const OP_TRADE_REQUEST_ACK: u16  = 0x14bf; // RoF2: OP_TradeRequestAck; S->C, server auto-sends; same 8-byte struct
 pub const OP_TRADE_ACCEPT_CLICK: u16 = 0x69e2; // RoF2: OP_TradeAcceptClick; C->S, TradeAccept_Struct {from_mob_id, unknown4} (8b)
@@ -1692,7 +1692,7 @@ pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
 }
 
 /// Encode a minimal position update (deltas/animation zero) in the RoF2
-/// PlayerPositionUpdateServer_Struct wire format (24 bytes), for the nav thread's
+/// PlayerPositionUpdateServer_Struct wire format (24 bytes), for the net thread's
 /// synthetic render-follow packet.  `heading` is EQ-CCW degrees (the same convention
 /// as `gs.player_heading`); it is packed so `decode_position_update` recovers it,
 /// letting the render loop face the player along the nav step direction.

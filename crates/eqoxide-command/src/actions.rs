@@ -1,4 +1,4 @@
-use std::{collections::HashMap, future::Future, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
+use std::{collections::{HashMap, HashSet, VecDeque}, future::Future, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
 
 use tokio::time::Instant;
 
@@ -67,13 +67,17 @@ pub struct ActionTracker(Arc<Mutex<State>>);
 #[derive(Default)]
 struct State {
     next: u64,
+    zone_epoch: u64,
+    fences: HashMap<usize, (u64, u64)>,
+    fifo_fences: HashMap<usize, VecDeque<Option<(u64,u64)>>>,
     pending: HashMap<u64, Pending>,
     queued: HashMap<usize, Vec<u64>>,
     names: HashMap<usize, Action>,
     drained: HashMap<usize, Vec<u64>>,
+    held: HashMap<(Action, u64), Vec<u64>>,
     events: Vec<ActionRecord>,
 }
-struct Pending { kind: String, accepted: bool, deadline: Instant }
+struct Pending { kind: String, accepted: bool, deadline: Instant, zone_epoch: Option<u64> }
 #[derive(Clone, Debug)]
 pub struct ActionRecord { pub id: u64, pub kind: String, pub result: String, pub reason: String }
 #[derive(Clone)]
@@ -89,14 +93,23 @@ impl ActionTracker {
         let mut state = self.0.lock().unwrap();
         state.next = state.next.checked_add(1).expect("action ID exhausted");
         let id = state.next;
-        state.pending.insert(id, Pending { kind: kind.into(), accepted: false, deadline: Instant::now() + Duration::from_secs(30) });
+        state.pending.insert(id, Pending { kind: kind.into(), accepted: false, deadline: Instant::now() + Duration::from_secs(30), zone_epoch: None });
         ActionContext { tracker: self.clone(), id, accepted: Arc::new(AtomicBool::new(false)) }
     }
+    /// Attach caller knowledge to the network mailbox, without changing legacy UI callers.
+    pub fn begin_for_zone(&self, kind: &str, zone_epoch: u64) -> ActionContext {
+        let context = self.begin(kind);
+        self.0.lock().unwrap().pending.get_mut(&context.id).unwrap().zone_epoch = Some(zone_epoch);
+        context
+    }
+    /// Called by the sole network owner before draining any gameplay commands.
+    pub fn set_zone_epoch(&self, zone_epoch: u64) { self.0.lock().unwrap().zone_epoch = zone_epoch; }
     pub fn is_accepted(&self, id: u64) -> bool { self.0.lock().unwrap().pending.get(&id).is_some_and(|p| p.accepted) }
     pub fn discard(&self, id: u64) { self.0.lock().unwrap().pending.remove(&id); }
     pub fn finish(&self, id: u64, result: &str, reason: &str) {
         let mut state = self.0.lock().unwrap();
         if let Some(pending) = state.pending.remove(&id) {
+            state.held.retain(|_, ids| { ids.retain(|&held| held != id); !ids.is_empty() });
             if pending.accepted { state.events.push(ActionRecord { id, kind: pending.kind, result: result.into(), reason: reason.into() }); }
         }
     }
@@ -106,23 +119,78 @@ impl ActionTracker {
         for id in ids { self.finish(id, "unconfirmed", "outcome_timeout"); }
     }
     pub(crate) fn accept(&self, key: usize, awaited: bool, name: Action) {
-        let _ = CONTEXT.try_with(|context| {
-            if !Arc::ptr_eq(&self.0, &context.tracker.0) { return; }
-            let mut state = self.0.lock().unwrap();
-            state.names.insert(key, name);
-            if let Some(p) = state.pending.get_mut(&context.id) {
-                p.accepted = true;
-                p.deadline = Instant::now() + Duration::from_secs(30);
-                context.accepted.store(true, Ordering::Release);
-                if !awaited { state.queued.entry(key).or_default().push(context.id); }
-            }
-        });
+        self.accept_mode(key,awaited,name,false);
     }
-    pub(crate) fn drain(&self, key: usize) {
+    pub(crate) fn accept_fifo(&self, key: usize, name: Action) {
+        self.accept_mode(key,false,name,true);
+    }
+    fn accept_mode(&self,key:usize,awaited:bool,name:Action,fifo:bool) {
+        let context = CONTEXT.try_with(Clone::clone).ok().filter(|c|Arc::ptr_eq(&self.0,&c.tracker.0));
+        let mut state=self.0.lock().unwrap();
+        let mut fence=None;
+        if let Some(context)=context {
+            state.names.insert(key,name);
+            if let Some(p)=state.pending.get_mut(&context.id) {
+                p.accepted=true;p.deadline=Instant::now()+Duration::from_secs(30);
+                context.accepted.store(true,Ordering::Release);
+                fence=p.zone_epoch.map(|epoch|(epoch,context.id));
+                if !awaited {state.queued.entry(key).or_default().push(context.id);}
+            }
+        }
+        if fifo {state.fifo_fences.entry(key).or_default().push_back(fence);}
+        else if let Some(fence)=fence {state.fences.insert(key,fence);}
+    }
+    /// FIFO metadata has one entry per payload, including unscoped graphical messages.
+    pub(crate) fn drain_fifo(&self,key:usize,len:usize)->Vec<bool> {
+        let mut state=self.0.lock().unwrap();
+        let mut fences=state.fifo_fences.remove(&key).unwrap_or_default();
+        let mut stale=HashSet::new();
+        let keep=(0..len).map(|_| {
+            match fences.pop_front().flatten() {
+                Some((epoch,id)) if epoch!=state.zone_epoch=>{stale.insert(id);false},
+                _=>true,
+            }
+        }).collect();
+        if let Some(ids)=state.queued.remove(&key) {
+            state.drained.entry(key).or_default().extend(ids.into_iter().filter(|id|!stale.contains(id)));
+        }
+        drop(state);
+        for id in stale {self.finish(id,"refused","stale_zone_epoch_before_dispatch");}
+        keep
+    }
+    pub(crate) fn drain(&self, key: usize) -> bool {
         let mut state = self.0.lock().unwrap();
+        if let Some((expected, id)) = state.fences.remove(&key) {
+            if expected != state.zone_epoch {
+                state.queued.remove(&key);
+                drop(state);
+                self.finish(id, "refused", "stale_zone_epoch_before_dispatch");
+                return false;
+            }
+        }
         if let Some(ids) = state.queued.remove(&key) { state.drained.entry(key).or_default().extend(ids); }
+        true
     }
     pub fn drain_scope(&self) -> DrainScope { DrainScope(self.clone()) }
+
+    /// Ids drained from `command`'s slot this tick, removed so the drain scope cannot report them.
+    fn take_drained(&self, command: Action) -> Vec<u64> {
+        let mut state = self.0.lock().unwrap();
+        let keys: Vec<_> = state.names.iter().filter(|&(_, &name)| name == command).map(|(&key, _)| key).collect();
+        keys.into_iter().flat_map(|key| state.drained.remove(&key).unwrap_or_default()).collect()
+    }
+    /// Keep `command`'s drained requests open under `key` until the server answers (or the
+    /// watchdog reports `outcome_timeout`). Without this the drain scope reports them `unconfirmed`
+    /// the moment the packet is sent.
+    pub fn hold_drained(&self, command: Action, key: u64) {
+        let ids = self.take_drained(command);
+        if !ids.is_empty() { self.0.lock().unwrap().held.entry((command, key)).or_default().extend(ids); }
+    }
+    /// Report the server's answer for requests held under `(command, key)`. No-op when none are held.
+    pub fn settle_held(&self, command: Action, key: u64, result: &str, reason: &str) {
+        let ids = self.0.lock().unwrap().held.remove(&(command, key)).unwrap_or_default();
+        for id in ids { self.finish(id, result, reason); }
+    }
 
 }
 pub struct DrainScope(ActionTracker);
@@ -137,12 +205,7 @@ impl crate::CommandState {
     /// Report a local rejection for a command already drained this tick.
     /// `command` names the slot as an [`Action`], so it cannot drift from the `enqueue` that filled it.
     pub fn refuse_drained(&self, command: Action, reason: &str) {
-        let ids = {
-            let mut state = self.actions.0.lock().unwrap();
-            let keys: Vec<_> = state.names.iter().filter(|&(_, &name)| name == command).map(|(&key, _)| key).collect();
-            keys.into_iter().flat_map(|key| state.drained.remove(&key).unwrap_or_default()).collect::<Vec<_>>()
-        };
-        for id in ids { self.actions.finish(id, "refused", reason); }
+        for id in self.actions.take_drained(command) { self.actions.finish(id, "refused", reason); }
     }
     pub(crate) fn enqueue<T>(&self, slot: &Mutex<Option<T>>, msg: T, awaited: bool, name: Action) -> bool {
         let mut value = slot.lock().unwrap();
@@ -152,10 +215,16 @@ impl crate::CommandState {
         true
     }
     pub(crate) fn dequeue<T>(&self, slot: &Mutex<Option<T>>) -> Option<T> {
-        let mut value = slot.lock().unwrap();
-        let result = value.take();
-        if result.is_some() { self.actions.drain(slot as *const _ as usize); }
-        result
+        self.dequeue_checked(slot).ok().flatten()
+    }
+    /// Return a rejected payload to awaited domains so they can answer the caller explicitly.
+    pub(crate) fn dequeue_checked<T>(&self, slot: &Mutex<Option<T>>) -> Result<Option<T>,T> {
+        let mut value=slot.lock().unwrap();
+        let result=value.take();
+        if result.is_some() && !self.actions.drain(slot as *const _ as usize) {
+            return Err(result.unwrap());
+        }
+        Ok(result)
     }
 }
 
@@ -287,4 +356,101 @@ mod tests {
         assert_eq!(tracker.take_events()[0].id, context.id());
     }
 
+    #[tokio::test]
+    async fn held_request_is_settled_by_the_server_answer_not_the_drain() {
+        let command = CommandState::default();
+        let tracker = command.actions();
+        let context = tracker.begin("door");
+        context.scope(async { command.request_door_click(7); }).await;
+        {
+            let _scope = tracker.drain_scope();
+            command.take_door_click();
+            tracker.hold_drained(Action::InteractDoorClick, 7);
+        }
+        assert!(tracker.take_events().is_empty(), "leaving the drain scope must not report a held request");
+        tracker.settle_held(Action::InteractDoorClick, 8, "confirmed", "wrong_key");
+        assert!(tracker.take_events().is_empty(), "an answer for another key settles nothing");
+        tracker.settle_held(Action::InteractDoorClick, 7, "confirmed", "door_moved");
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].result.as_str(), events[0].reason.as_str()), ("confirmed", "door_moved"));
+        tracker.settle_held(Action::InteractDoorClick, 7, "confirmed", "door_moved");
+        assert!(tracker.take_events().is_empty(), "a request is settled once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn held_request_with_no_answer_expires_as_unconfirmed() {
+        let command = CommandState::default();
+        let tracker = command.actions();
+        let context = tracker.begin("door");
+        context.scope(async { command.request_door_click(7); }).await;
+        {
+            let _scope = tracker.drain_scope();
+            command.take_door_click();
+            tracker.hold_drained(Action::InteractDoorClick, 7);
+        }
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tracker.expire();
+        let events = tracker.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].result.as_str(), events[0].reason.as_str()), ("unconfirmed", "outcome_timeout"));
+        tracker.settle_held(Action::InteractDoorClick, 7, "confirmed", "door_moved");
+        assert!(tracker.take_events().is_empty(), "a late answer cannot report a request already expired");
+    }
+
+    #[tokio::test]
+    async fn holding_an_untracked_drain_holds_nothing() {
+        let command = CommandState::default();
+        let tracker = command.actions();
+        command.request_door_click(7); // the human UI click: no HTTP request behind it
+        {
+            let _scope = tracker.drain_scope();
+            command.take_door_click();
+            tracker.hold_drained(Action::InteractDoorClick, 7);
+        }
+        tracker.settle_held(Action::InteractDoorClick, 7, "confirmed", "door_moved");
+        assert!(tracker.take_events().is_empty());
+    }
+
+}
+
+#[cfg(test)]
+mod zone_fence_tests {
+    #[tokio::test]
+    async fn stale_target_inventory_chat_and_awaited_buy_do_not_leave_their_mailboxes() {
+        let command=crate::CommandState::default();let tracker=command.actions();
+        tracker.set_zone_epoch(1);
+        let target=tracker.begin_for_zone("target",1);
+        assert!(target.scope(async {command.request_target(7)}).await);
+        let inventory=tracker.begin_for_zone("inventory",1);
+        assert!(inventory.scope(async {command.request_inventory_move(23,24)}).await);
+        let chat=tracker.begin_for_zone("tell",1);
+        chat.scope(async {command.request_chat_send(eqoxide_ipc::ChatSend{chan:7,to:"Other".into(),text:"hello".into()})}).await;
+        let buy=tracker.begin_for_zone("buy",1);let(tx,mut rx)=tokio::sync::oneshot::channel();
+        assert!(buy.scope(async {command.request_buy_await(7,1,tx)}).await);
+        tracker.set_zone_epoch(2);
+        assert!(command.take_target().is_none());assert!(command.take_inventory_move().is_none());
+        assert!(command.take_chat_send().is_empty());assert!(command.take_buy_await().is_none());
+        assert!(matches!(rx.try_recv(),Ok(eqoxide_ipc::CommandResult::Refused(reason)) if reason=="stale_zone_epoch_before_dispatch"));
+        let events=tracker.take_events();assert_eq!(events.len(),4);
+        assert!(events.iter().all(|e| e.result=="refused" && e.reason=="stale_zone_epoch_before_dispatch"));
+        let current=tracker.begin_for_zone("target",2);
+        assert!(current.scope(async {command.request_target(7)}).await);
+        assert_eq!(command.take_target(),Some(7));
+    }
+}
+
+#[cfg(test)]
+mod mixed_fifo_epoch_tests {
+    #[tokio::test]
+    async fn a_new_chat_cannot_authorize_a_departed_zones_message() {
+        let command=crate::CommandState::default();let tracker=command.actions();
+        for (epoch,text) in [(1,"stale"),(2,"current")] {
+            let context=tracker.begin_for_zone("tell",epoch);
+            context.scope(async {command.request_chat_send(eqoxide_ipc::ChatSend{chan:7,to:"Other".into(),text:text.into()})}).await;
+        }
+        tracker.set_zone_epoch(2);
+        let messages=command.take_chat_send();assert_eq!(messages.len(),1);assert_eq!(messages[0].text,"current");
+        let events=tracker.take_events();assert_eq!(events.len(),1);assert_eq!(events[0].result,"refused");
+    }
 }

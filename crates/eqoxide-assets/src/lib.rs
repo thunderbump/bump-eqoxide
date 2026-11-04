@@ -1,5 +1,5 @@
 //! `eqoxide-assets` — zone + texture asset loading, extracted as a workspace crate above
-//! `eqoxide-core` (`core ← assets`, #544 Step 2e) so `eqoxide-nav` can depend on it next. The app
+//! `eqoxide-core` (`core ← assets`, #544 Step 2e). The app
 //! crate re-exports this crate as its `assets` module (`pub use eqoxide_assets as assets;`), so
 //! every existing `crate::assets::…` / `eqoxide::assets::…` path across the tree keeps resolving
 //! unchanged.
@@ -8,11 +8,15 @@
 //! placed objects (buildings, etc.) from the zone's ActorInstance fragments, and indexes equipment
 //! textures. See `docs/zone-rendering.md`.
 //!
-//! The collision grid built from this data (`Collision::build`) and its A* pathfinding model — the
-//! `floor_z`/`nearest_floor` (grounding), `nearest_hit_t`/`segment_blocked` (camera + nameplate
-//! occlusion), `path_clear` (movement gating), and `find_path` (A* routing) queries — live in
-//! `nav::collision` (cleanup step 4) in the app crate, ONE LAYER UP — this crate has no reference
-//! back into it. See `docs/collision-system.md`.
+//! The collision grid built from this data (`Collision::build`) and its queries live in
+//! `eqoxide-zone-geometry`, one layer up. This crate has no reference back into it. See
+//! `docs/collision-system.md`.
+
+mod static_decode;
+pub mod static_collision;
+pub use static_collision::{decode_static_collision, CollisionDecodeLimits, StaticCollision};
+pub mod static_visual;
+pub use static_visual::{decode_static_visual, DecodeLimits, StaticVisual};
 
 use anyhow::Context;
 
@@ -183,7 +187,7 @@ pub struct ObjectModel {
     /// object constructor classifies actors by name prefix (`__strnicmp(name, "LADDER", 6)` →
     /// category 6, `GRASS_` → 7, default 5) before binding them. Consumers here therefore match
     /// prefixes rather than invent their own object taxonomy — see
-    /// `eqoxide_nav::climb::is_climbable_name`. Empty when the glTF mesh is unnamed.
+    /// `eqoxide_zone_geometry::climb::is_climbable_name`. Empty when the glTF mesh is unnamed.
     pub name: String,
     pub meshes: Vec<MeshData>,
     /// Column-major 4×4 transforms, one per placement (`Mat4::from_cols_array_2d` form).

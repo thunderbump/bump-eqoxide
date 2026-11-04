@@ -55,7 +55,7 @@ pub struct SpellDb {
     by_id: HashMap<u32, SpellInfo>,
 }
 
-/// Process-global spell table, set once at startup (mirrors the eqstr table). Lets the nav thread
+/// Process-global spell table, set once at startup (mirrors the eqstr table). Lets the net thread
 /// resolve a spell's target type for self-cast decisions without threading the Arc through the
 /// login → ActionLoop arg chain. (eqoxide#95)
 static GLOBAL: OnceLock<Arc<SpellDb>> = OnceLock::new();
@@ -141,6 +141,14 @@ impl SpellDb {
     }
 
     pub fn get(&self, id: u32) -> Option<&SpellInfo> { self.by_id.get(&id) }
+
+    /// Test-only direct insertion — production code only ever populates `by_id` from the parsed
+    /// `spells_us.txt` (`SpellDb::load`). Gated the same way `eqoxide-ipc`'s `Roster::insert_for_test`
+    /// is: invisible outside `#[cfg(test)]`/`test-fixtures` builds.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn insert_for_test(&mut self, id: u32, info: SpellInfo) {
+        self.by_id.insert(id, info);
+    }
 
     /// Does spell `id` carry SPA `spa` in any of its 12 effect slots?
     ///
