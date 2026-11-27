@@ -3763,6 +3763,7 @@ mod tests {
         // central-6ly1.8: the killer's ID and a session death count, without changing the
         // graphical `killed_by` wording for a self-inflicted death.
         assert_eq!((gs.killer_id, gs.death_count), (Some(42), 1));
+        assert!(!gs.killer_is_self, "a rat is not self");
         let mut gs3 = GameState::new();
         gs3.player_id = 7; gs3.player_name = "Me".into();
         let mut p = vec![0u8; SIZE_DEATH];
@@ -3770,6 +3771,7 @@ mod tests {
         p[4..8].copy_from_slice(&7u32.to_le_bytes()); // our own spawn killed us
         super::apply_death(&mut gs3, &p);
         assert_eq!((gs3.killer_id, gs3.killed_by.as_str()), (Some(7), "something"));
+        assert!(gs3.killer_is_self, "decided at death time");
     }
 
     #[test]
