@@ -924,4 +924,31 @@ async fn assert_inbound_wire_fields(opcode: u16, name: &str, hex: &str, expected
     assert!(rows[0]["acked_at_ms"].is_u64());
     assert_eq!(rows[0]["payload_hex"], hex);
     assert_eq!(rows[0]["fields"], expected);
+
+/// central-6ly1.1 acceptance: an hour at five commands a second (18 000 commands) keeps admitting
+/// work and loses no receipt event, for a reader that drains every 1000 commands (200 s). Run at
+/// production capacities, compressed in time.
+#[test]
+fn one_hour_at_five_commands_per_second_keeps_admitting_and_loses_no_receipt() {
+    let control = Control::new("session-1".into(), "private-test-token".into(), 65_536, 32_768).unwrap();
+    control.publish_state(4, json!({"phase":"ready"})).unwrap();
+    control.set_ready(true);
+    let mut cursor = 0u64;
+    let mut receipts_seen = 0usize;
+    for n in 0..18_000 {
+        let id = format!("cmd-{n}");
+        let (code, _) = control.admit(id.clone(), movement()).unwrap();
+        assert_eq!(code, StatusCode::ACCEPTED, "command {n} was not admitted");
+        assert_eq!(control.drain_actions().len(), 1);
+        control
+            .publish_outcome(&id, CommandStatus::AppliedLocal, None, Some(json!({"kind":"controller_intent"})))
+            .unwrap();
+        if n % 1000 == 999 {
+            let batch = control.event_batch(cursor).unwrap();
+            assert!(!batch.gap, "the reader lost events at command {n}");
+            receipts_seen += batch.events.iter().filter(|e| e.event["kind"] == "command").count();
+            cursor = batch.cursor.rsplit_once(':').unwrap().1.parse().unwrap();
+        }
+    }
+    assert_eq!(receipts_seen, 36_000, "an admission and an outcome event for every command");
 }
