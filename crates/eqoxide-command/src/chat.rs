@@ -8,6 +8,7 @@
 //! read-path feeds the model publishes and the view/HTTP reads (`GET /v1/events/*` and
 //! `/v1/observe/messages`), not writes the view makes — see `mod.rs`.
 
+use super::actions::TracedRequest;
 use super::{Action, CommandState};
 use eqoxide_ipc::ChatSend;
 
@@ -26,10 +27,19 @@ impl CommandState {
 
     /// Drain the whole outgoing-chat queue at once (FIFO order preserved).
     pub fn take_chat_send(&self) -> Vec<ChatSend> {
+        self.take_chat_send_with_commands().into_iter().map(|(message, _)| message).collect()
+    }
+
+    pub fn take_chat_send_with_commands(&self) -> Vec<TracedRequest<ChatSend>> {
         let mut queue = self.chat.chat_send.lock().unwrap();
         let result = std::mem::take(&mut *queue);
-        let keep=self.actions.drain_fifo(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize,result.len());
-        result.into_iter().zip(keep).filter_map(|(message,keep)|keep.then_some(message)).collect()
+        let commands = self.actions.drain_fifo(
+            std::sync::Arc::as_ptr(&self.chat.chat_send) as usize,
+            result.len(),
+        );
+        result.into_iter().zip(commands)
+            .filter_map(|(message, command)| command.ok().map(|id| (message, id)))
+            .collect()
     }
 }
 

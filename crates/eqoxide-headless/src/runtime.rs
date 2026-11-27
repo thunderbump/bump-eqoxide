@@ -29,7 +29,6 @@ use std::{
 
 struct Wiring {
     command: CommandState,
-    combat: ipc::CombatSlots,
     controller: ipc::ControllerSlots,
     snapshot: ipc::GameStateSnapshot,
     health: ipc::NetHealthShared,
@@ -40,7 +39,6 @@ struct Wiring {
 }
 impl Wiring {
     fn new(maps_dir: std::path::PathBuf) -> Self {
-        let combat = ipc::CombatSlots::default();
         let merchant = ipc::MerchantSlots::default();
         let inventory = ipc::InventorySlots::default();
         let interact = ipc::InteractSlots::default();
@@ -53,7 +51,7 @@ impl Wiring {
         let life = ipc::LifecycleSlots::default();
         let controller = ipc::ControllerSlots::default();
         let command = CommandState::new(
-            combat.clone(),
+            ipc::CombatSlots::default(),
             merchant.clone(),
             inventory.clone(),
             interact.clone(),
@@ -94,7 +92,6 @@ impl Wiring {
         };
         Self {
             command,
-            combat,
             controller,
             snapshot,
             health,
@@ -115,7 +112,6 @@ struct Motion {
 struct Host {
     control: Control,
     command: CommandState,
-    combat: ipc::CombatSlots,
     controller_slots: ipc::ControllerSlots,
     body: Option<CharacterController>,
     zone_in: ZoneIn,
@@ -151,7 +147,7 @@ impl Host {
         }
         self.attack_until = None;
         // LAST-WINS: safety off must replace an attack still waiting in the net mailbox.
-        *self.combat.attack.lock().unwrap() = Some(false);
+        self.command.overwrite_attack_off(None);
     }
     fn step(
         &mut self,
@@ -172,7 +168,7 @@ impl Host {
         }
         if self.attack_until.is_some_and(|until| now >= until) {
             self.attack_until = None;
-            *self.combat.attack.lock().unwrap() = Some(false); // LAST-WINS: lease expiry
+            self.command.overwrite_attack_off(None); // LAST-WINS: lease expiry
             self.control
                 .publish_event(json!({"kind":"attack_lease_expired"}));
         }
@@ -402,7 +398,7 @@ impl Host {
             }
             Operation::AttackOff => {
                 self.attack_until = None;
-                *self.combat.attack.lock().unwrap() = Some(false); // LAST-WINS: safety request
+                self.command.overwrite_attack_off(Some(&id)); // LAST-WINS: safety request
                 self.outcome(
                     &id,
                     Status::AppliedLocal,
@@ -424,7 +420,8 @@ impl Host {
                 let context = self
                     .command
                     .actions()
-                    .begin_for_zone("merchant_open", self.epoch);
+                    .begin_for_zone("merchant_open", self.epoch)
+                    .with_packet_command(&id);
                 if !context
                     .scope(async { self.command.request_open_await(entity_id as u32, tx) })
                     .await
@@ -456,7 +453,11 @@ impl Host {
                     return;
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let context = self.command.actions().begin_for_zone("buy", self.epoch);
+                let context = self
+                    .command
+                    .actions()
+                    .begin_for_zone("buy", self.epoch)
+                    .with_packet_command(&id);
                 if !context
                     .scope(async { self.command.request_buy_await(merchant, slot, tx) })
                     .await
@@ -477,7 +478,9 @@ impl Host {
                     Operation::Sell { .. } | Operation::InventoryMove { .. }
                 );
                 let tracker = self.command.actions();
-                let context = tracker.begin_for_zone("headless_command", self.epoch);
+                let context = tracker
+                    .begin_for_zone("headless_command", self.epoch)
+                    .with_packet_command(&id);
                 let accepted = context
                     .scope(async {
                         match operation {
@@ -511,7 +514,7 @@ impl Host {
                             Operation::Sit => {
                                 self.motion = None;
                                 self.attack_until = None;
-                                *self.combat.attack.lock().unwrap() = Some(false);
+                                self.command.overwrite_attack_off(Some(&id));
                                 self.command.request_sit(true)
                             }
                             Operation::Stand => self.command.request_sit(false),
@@ -555,8 +558,9 @@ impl Host {
                             }
                             Operation::Camp => {
                                 self.halt("camp");
-                                self.command
-                                    .request_camp(ipc::CampCmd::StartInZone(self.epoch));
+                                self.command.request_camp_with_command(
+                                    ipc::CampCmd::StartInZone(self.epoch), Some(&id),
+                                );
                                 true
                             }
                             _ => false,
@@ -765,15 +769,16 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             .as_nanos()
     );
     let started = Instant::now();
-    let control = Control::new(session, profile.control_token.clone(), 4096, 2048)?;
+    let wiring = Wiring::new(profile.maps_dir.clone());
+    let trace = eqoxide_net::packet_telemetry::SessionTrace::new(started);
+    let control = Control::new(session, profile.control_token.clone(), 4096, 2048)?
+        .with_packet_trace(trace.clone(), wiring.health.clone());
     let router = control.router();
     let api = tokio::spawn(async move { axum::serve(listener, router).await });
     println!("API_PORT={}", profile.api_port);
-    let wiring = Wiring::new(profile.maps_dir.clone());
     let mut host = Host {
         control: control.clone(),
         command: wiring.command,
-        combat: wiring.combat,
         controller_slots: wiring.controller,
         body: None,
         zone_in: Default::default(),
@@ -804,12 +809,15 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                     .enable_all()
                     .build()
                     .map_err(|_| "network runtime initialization failed".to_string())?
-                    .block_on(eqoxide_net::login::run_login_flow_selected(
-                        config,
-                        1,
-                        wiring.slots,
-                        wiring.lifecycle,
-                        expected,
+                    .block_on(eqoxide_net::transport::with_packet_trace(
+                        trace,
+                        eqoxide_net::login::run_login_flow_selected(
+                            config,
+                            1,
+                            wiring.slots,
+                            wiring.lifecycle,
+                            expected,
+                        ),
                     ))
             }))
             .unwrap_or_else(|_| Err("network task panicked".into()));
@@ -985,7 +993,6 @@ mod tests {
         Host {
             control: Control::new("test-session".into(), "test-credential".into(), 16, 32).unwrap(),
             command: wiring.command,
-            combat: wiring.combat,
             controller_slots: wiring.controller,
             body: Some(CharacterController::new([0.0, 0.0, 0.0])),
             zone_in: Default::default(),
@@ -1059,7 +1066,7 @@ mod tests {
         assert_eq!(host.body.as_ref().unwrap().pos, moving);
         assert!(host.motion.is_none());
         assert!(host.attack_until.is_none());
-        assert_eq!(*host.combat.attack.lock().unwrap(), Some(false));
+        assert_eq!(host.command.take_attack(), Some(false));
     }
     #[test]
     fn network_loss_clears_wish_and_does_not_initialize_a_body() {
@@ -1344,7 +1351,6 @@ mod transaction_admission_tests {
         let mut host = Host {
             control: Control::new("s".into(), "credential".into(), 8, 16).unwrap(),
             command: wiring.command,
-            combat: wiring.combat,
             controller_slots: wiring.controller,
             body: None,
             zone_in: Default::default(),
@@ -1476,7 +1482,7 @@ mod execution_claim_tests {
             7, "rat", 0.0, 0.0, 0.0, true,
         ));
         host.dispatch(attack, &gs, true, Instant::now()).await;
-        assert!(host.combat.attack.lock().unwrap().is_none());
+        assert!(host.command.take_attack().is_none());
         assert_eq!(
             host.control.command("attack").unwrap().status,
             Status::Refused

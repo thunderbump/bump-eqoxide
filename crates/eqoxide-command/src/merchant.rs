@@ -10,6 +10,7 @@
 //! `self.merchant.merchant` (the live `MerchantSnapshot` for GET /v1/merchant/list) is a
 //! read-path/published field, not a command — deliberately NOT exposed here (see `mod.rs`).
 
+use super::actions::TracedRequest;
 use super::{Action, CommandState};
 use eqoxide_ipc::{BuyOk, CommandResult, OpenOk, TradeCmd};
 use tokio::sync::oneshot;
@@ -77,7 +78,13 @@ impl CommandState {
     pub fn take_buy_await(
         &self,
     ) -> Option<(u32, u32, oneshot::Sender<CommandResult<BuyOk>>)> {
-        match self.dequeue_checked(&self.merchant.buy_await) {
+        self.take_buy_await_with_command().map(|(value, _)| value)
+    }
+
+    pub fn take_buy_await_with_command(
+        &self,
+    ) -> Option<TracedRequest<(u32, u32, oneshot::Sender<CommandResult<BuyOk>>)>> {
+        match self.dequeue_checked_with_command(&self.merchant.buy_await) {
             Ok(value)=>value,
             Err((_,_,tx))=>{let _=tx.send(CommandResult::Refused("stale_zone_epoch_before_dispatch".into()));None}
         }
@@ -88,16 +95,30 @@ impl CommandState {
         self.dequeue(&self.merchant.sell)
     }
 
+    pub fn take_merchant_sell_with_command(&self) -> Option<TracedRequest<(u32, u32, u32)>> {
+        self.dequeue_with_command(&self.merchant.sell)
+    }
+
     /// Drain a pending open/close request.
     pub fn take_merchant_trade(&self) -> Option<TradeCmd> {
         self.dequeue(&self.merchant.trade)
+    }
+
+    pub fn take_merchant_trade_with_command(&self) -> Option<TracedRequest<TradeCmd>> {
+        self.dequeue_with_command(&self.merchant.trade)
     }
 
     /// Drain a pending awaited-open request as `(merchant_id, Sender)` (eqoxide#479).
     /// `ActionLoop::drain_merchant` takes this, sends the open, and parks the `Sender` in
     /// `pending_open` until the resolving packet lands. Sibling of `take_merchant_trade`.
     pub fn take_open_await(&self) -> Option<(u32, oneshot::Sender<CommandResult<OpenOk>>)> {
-        match self.dequeue_checked(&self.merchant.open_await) {
+        self.take_open_await_with_command().map(|(value, _)| value)
+    }
+
+    pub fn take_open_await_with_command(
+        &self,
+    ) -> Option<TracedRequest<(u32, oneshot::Sender<CommandResult<OpenOk>>)>> {
+        match self.dequeue_checked_with_command(&self.merchant.open_await) {
             Ok(value)=>value,
             Err((_,tx))=>{let _=tx.send(CommandResult::Refused("stale_zone_epoch_before_dispatch".into()));None}
         }

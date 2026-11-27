@@ -78,6 +78,7 @@ async fn all_endpoints_require_exact_bearer_authentication() {
     for path in [
         "/v2/player/state",
         "/v2/player/events",
+        "/v2/player/packets",
         "/v2/player/commands/id",
     ] {
         for token in [None, Some("Bearer wrong"), Some("private-test-token")] {
@@ -623,4 +624,115 @@ async fn safety_supersession_does_not_promise_a_dispatched_attack_was_refused() 
         control.command("attack").unwrap().status,
         CommandStatus::Unknown
     );
+}
+
+#[tokio::test]
+async fn packet_trace_orders_and_filters_decoded_packets() {
+    use eqoxide_net::{
+        action_loop::encode_client_position_update,
+        packet_telemetry::Dir,
+        protocol::{OP_CLIENT_UPDATE, OP_DAMAGE, OP_TARGET_COMMAND, OP_TARGET_MOUSE},
+    };
+
+    let now = Instant::now();
+    let trace = SessionTrace::new(now - Duration::from_millis(42));
+    let health = eqoxide_ipc::NetHealthShared::default();
+    health.lock().unwrap().send_failures_unretried = 3;
+    let control = control(10, 10).with_packet_trace(trace.clone(), health);
+
+    let position = encode_client_position_update(2, 12, [15.0, -20.0, 0.0], [1.0, 2.0, 3.0], 400, 17);
+    trace.capture(Dir::Out, OP_CLIENT_UPDATE, &position, None, None);
+    trace.capture(Dir::Out, OP_TARGET_MOUSE, &41u32.to_le_bytes(), Some(7), Some("target-a".into()));
+    trace.capture(Dir::Out, OP_TARGET_MOUSE, &42u32.to_le_bytes(), Some(8), Some("target-b".into()));
+    trace.capture(Dir::Out, OP_TARGET_COMMAND, &43u32.to_le_bytes(), Some(9), Some("target-b".into()));
+    let mut damage = [0; 13];
+    damage[0..2].copy_from_slice(&12u16.to_le_bytes());
+    damage[2..4].copy_from_slice(&42u16.to_le_bytes());
+    damage[5..9].copy_from_slice(&21u32.to_le_bytes());
+    damage[9..13].copy_from_slice(&(-5i32).to_le_bytes());
+    trace.capture(Dir::In, OP_DAMAGE, &damage, Some(4), None);
+    trace.record_send(false);
+    trace.record_send(true);
+    trace.record_receive();
+    trace.record_sequence_gap();
+
+    let (status, first) = authorized(&control, "GET", "/v2/player/packets?limit=2", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["next"], 2);
+    assert_eq!(first["gap"], false);
+    let pos = &first["packets"][0];
+    assert_eq!(pos["n"], 1);
+    assert!(pos["at_ms"].as_u64().unwrap() >= 42);
+    assert_eq!(pos["opcode"], OP_CLIENT_UPDATE);
+    assert_eq!(pos["dir"], "out");
+    assert_eq!(pos["len"], 48);
+    assert_eq!(pos["reliable"], false);
+    assert_eq!(pos["wire_seq"], Value::Null);
+    assert_eq!(pos["command_id"], Value::Null);
+    assert_eq!(pos["fields"], json!({
+        "position": [15.0, -20.0, eqoxide_core::coord::WIRE_Z_OFFSET],
+        "delta": [1.0, 2.0, 3.0], "animation": 17, "heading": 400,
+    }));
+    assert_eq!(first["packets"][1]["n"], 2);
+
+    let (_, rest) = authorized(&control, "GET", "/v2/player/packets?after=2", None).await;
+    let packets = rest["packets"].as_array().unwrap();
+    assert_eq!(packets.iter().map(|p| p["n"].as_u64().unwrap()).collect::<Vec<_>>(), [3, 4, 5]);
+    assert_eq!(rest["next"], 5);
+    assert_eq!(packets[2]["dir"], "in");
+    assert_eq!(packets[2]["command_id"], Value::Null);
+    assert_eq!(packets[2]["fields"], json!({"source":42, "target":12, "damage":-5, "spell":21}));
+    assert_eq!(rest["counters"], json!({
+        "sent":2, "resent":1, "received":1, "dropped_unretried":3, "sequence_gaps":1,
+    }));
+
+    let (_, selected) = authorized(
+        &control, "GET", "/v2/player/packets?opcode=OP_TARGET_MOUSE&command=target-b", None,
+    ).await;
+    assert_eq!(selected["next"], 5);
+    let packets = selected["packets"].as_array().unwrap();
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0], json!({
+        "n":3, "at_ms":rest["packets"][0]["at_ms"], "dir":"out",
+        "opcode":OP_TARGET_MOUSE, "opcode_name":"OP_TARGET_MOUSE", "len":6, "reliable":true,
+        "wire_seq":8, "command_id":"target-b", "fields":{"target_id":42},
+    }));
+}
+
+#[tokio::test]
+async fn packet_trace_gaps_follow_eviction_even_with_filters() {
+    use eqoxide_net::packet_telemetry::Dir;
+
+    let control = control(1, 1);
+    for _ in 0..20_002 {
+        control.packet_trace.capture(Dir::In, 0xfffe, &[], None, None);
+    }
+    let (_, page) = authorized(&control, "GET", "/v2/player/packets?after=1&limit=2", None).await;
+    assert_eq!(page["gap"], true);
+    assert_eq!(page["packets"][0]["n"], 3);
+    assert_eq!(page["packets"][0]["fields"], json!({}));
+    assert_eq!(page["packets"][1]["n"], 4);
+    assert_eq!(page["next"], 4);
+
+    let (_, page) = authorized(&control, "GET", "/v2/player/packets?after=2&limit=1", None).await;
+    assert_eq!(page["gap"], false);
+    assert_eq!(page["next"], 3);
+
+    let (_, page) = authorized(&control, "GET", "/v2/player/packets?command=missing", None).await;
+    assert_eq!(page["gap"], true);
+    assert_eq!(page["next"], 20_002);
+    assert_eq!(page["packets"], json!([]));
+}
+
+#[tokio::test]
+async fn packet_trace_rejects_unknown_queries_and_out_of_range_limits() {
+    let control = control(1, 1);
+    for query in ["since=2", "limit=0", "limit=2001"] {
+        let request = Request::get(format!("/v2/player/packets?{query}"))
+            .header("authorization", "Bearer private-test-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = control.router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
 }

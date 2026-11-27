@@ -46,6 +46,9 @@
 //! This is a behavior-preserving pure move: the capture hook, ring, and decoded records are
 //! byte-identical.
 
+mod session;
+pub use session::{PacketPage, SessionTrace};
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};

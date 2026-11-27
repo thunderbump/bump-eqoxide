@@ -186,6 +186,41 @@ Received chat (including NPC say) carries packet provenance; other game events a
 Outbound local messages are not receipt evidence. `received_self_echo` records a server-returned
 self message with channel/sender/text and `recipient_delivery_confirmed:false`; it does not confirm
 delivery to another player. Legacy self-echo filtering remains unchanged. Received spawn class is exposed as nullable `class_id`.
+### Packet trace
+
+`GET /v2/player/packets?after=N&limit=L&opcode=NAME&command=ID` uses the same bearer
+token as state, commands, and events. Each session automatically keeps its newest 20,000
+application packets across login, world, and zone connections. Start with `after=0`, then
+pass the response's `next` as `after` on the next request with the same filters.
+The response pages in increasing `n` order. `limit` defaults to 500 and accepts 1–2000.
+`opcode` matches the exact trace name, such as `OP_TARGET_MOUSE`. `command` matches the
+command ID from the command URL. Unknown query parameters return HTTP 400.
+`gap:true` means some indices after `after` were evicted, regardless of filters.
+
+Each row has `n`, `at_ms` on the state's `clock_ms` clock, `dir` (`in` or `out`),
+numeric `opcode`, `opcode_name`, `len` in bytes including the opcode, `reliable`,
+`wire_seq`, `command_id`, and `fields`. The outbound reliable sequence identifies the
+first fragment and the inbound sequence identifies the completing fragment.
+`wire_seq` is null for unreliable packets. Outbound `OP_CLIENT_UPDATE` fields include
+`position` and `delta` in wire x/y/z order, `animation`, and `heading` in wire units.
+`OP_TARGET_COMMAND` and `OP_TARGET_MOUSE` carry `target_id`. Inbound `OP_DAMAGE` carries
+`source`, `target`, signed `damage`, and `spell`. Other rows have empty `fields`.
+
+The network owner tags packets sent directly from a tagged mailbox drain, including the
+awaited merchant open and buy sends. Inbound packets, periodic movement, deferred loot
+traffic, and automatic follow-ups have a null `command_id`. Outbound rows record send
+attempts. Reliable retransmits reuse the original wire bytes and increment transport
+counters without adding another application row.
+
+The response's `counters` are session totals. `sent` counts successful UDP sends, including
+control traffic. `resent` is the subset sent by the reliable resend or deferred control
+queue. `received` counts UDP datagrams before decoding. `dropped_unretried` is
+`NetHealth.send_failures_unretried`. `sequence_gaps` counts distinct future sequences
+buffered while waiting for an earlier reliable sequence, even if the earlier packet later
+arrives.
+
+### Loot evidence
+
 Automatic corpse looting and automatic zone-line requests are disabled for CPU sessions.
 Only explicit `loot` requests begin looting, including for the character's own kills. The ordinary
 flow requests each received corpse catalog slot once, one item at a time. An unacknowledged take

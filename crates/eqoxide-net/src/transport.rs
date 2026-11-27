@@ -2,16 +2,27 @@
 //!
 //! Ported from the Python reference at eq_client/connection/stream.py.
 
+use super::packet_telemetry::{self, Dir, SessionTrace};
+use super::protocol::*;
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use eqoxide_ipc::SessionDropCause;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use super::protocol::*;
-use eqoxide_ipc::SessionDropCause;
+tokio::task_local! {
+    static PACKET_TRACE: SessionTrace;
+}
+
+/// Login, world, and zone streams opened by this owner share a single headless trace.
+pub async fn with_packet_trace<F: Future>(trace: SessionTrace, session: F) -> F::Output {
+    PACKET_TRACE.scope(trace, session).await
+}
 
 /// Upper bound on datagrams drained (and ACKed) per `poll_recv` call. Generous enough to clear a
 /// zone-in spawn burst in one wake, but bounded so a sustained flood can't monopolize the loop —
@@ -513,6 +524,7 @@ pub struct EqStream {
     /// four loops didn't mirror, so a >15s world reconnect reported `connected: false` on a healthy
     /// link. Whoever receives the datagram owns the clock — a future loop gets this for free.
     net_health: eqoxide_ipc::NetHealthShared,
+    packet_trace: Option<SessionTrace>,
 }
 
 impl EqStream {
@@ -539,6 +551,7 @@ impl EqStream {
             force_send_refusals: std::cell::Cell::new(0),
             frags: FragmentBuffer::new(),
             net_health,
+            packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
             app_tx,
         };
 
@@ -665,11 +678,20 @@ impl EqStream {
 
     /// Send an application-level EQ packet (2-byte LE opcode + payload).
     pub fn send_app_packet(&mut self, opcode: u16, payload: &[u8]) {
+        self.send_app_packet_with_command(opcode, payload, None);
+    }
+
+    /// The drain passes the ID carried by this request. Retries replay datagrams without making
+    /// another app trace row, and tick-driven sends have no mailbox command to attribute.
+    pub(crate) fn send_app_packet_with_command(
+        &mut self,
+        opcode: u16,
+        payload: &[u8],
+        command: Option<&Arc<str>>,
+    ) {
         // Telemetry boundary (#525): record BEFORE send_reliable assigns the sequence, so `send_seq`
         // is the sequence this packet's first datagram will carry. Zero cost when disabled.
-        super::packet_telemetry::capture(
-            super::packet_telemetry::Dir::Out, opcode, payload, true, Some(self.send_seq),
-        );
+        self.capture_app(Dir::Out, opcode, payload, Some(self.send_seq), command);
         let mut app_data = Vec::with_capacity(2 + payload.len());
         app_data.write_u16::<byteorder::LittleEndian>(opcode).unwrap();
         app_data.extend_from_slice(payload);
@@ -713,9 +735,7 @@ impl EqStream {
     /// (eqoxide#127). Only valid for opcodes whose low byte is non-zero (the raw-app-packet marker).
     pub fn send_app_packet_unreliable(&mut self, opcode: u16, payload: &[u8]) -> std::io::Result<()> {
         // Telemetry boundary (#525): unreliable — no sequence number. Zero cost when disabled.
-        super::packet_telemetry::capture(
-            super::packet_telemetry::Dir::Out, opcode, payload, false, None,
-        );
+        self.capture_app(Dir::Out, opcode, payload, None, None);
         debug_assert!(opcode & 0xFF != 0, "raw app packets need a non-zero low opcode byte");
         let body = encode_raw_app(
             opcode, payload,
@@ -727,7 +747,21 @@ impl EqStream {
         // `send_failures` and `send_failures_unretried` by `transmit`. This is the one send class
         // where "it did not go out" is genuinely unrecoverable at the transport layer, which is
         // exactly why it must be observable rather than discarded.
-        self.transmit(&datagram, SendRetry::None)
+        self.transmit(&datagram, SendRetry::None, false)
+    }
+
+    fn capture_app(
+        &self,
+        dir: Dir,
+        opcode: u16,
+        payload: &[u8],
+        wire_seq: Option<u16>,
+        command: Option<&Arc<str>>,
+    ) {
+        packet_telemetry::capture(dir, opcode, payload, wire_seq.is_some(), wire_seq);
+        if let Some(trace) = &self.packet_trace {
+            trace.capture(dir, opcode, payload, wire_seq, command.cloned());
+        }
     }
 
     /// Poll for incoming data. Non-blocking. Returns false if the socket is closed.
@@ -822,7 +856,7 @@ impl EqStream {
             // The entry stays in `self.sent` with its backoff advanced, so the very next due pass
             // re-sends this same datagram — the recovery is this loop itself, and there is no caller
             // above it to hand an error to. Not silent: `transmit` stamps `NetHealth` + WARNs.
-            if let Err(e) = self.transmit(&self.sent[i].datagram, SendRetry::Retransmitted) {
+            if let Err(e) = self.transmit(&self.sent[i].datagram, SendRetry::Retransmitted, true) {
                 tracing::debug!("NET: retransmit of seq {} failed ({:?}); will retry on the next \
                                  backoff pass (#612)", self.sent[i].seq, e.kind());
             }
@@ -863,7 +897,7 @@ impl EqStream {
         raw.extend_from_slice(&payload);
         raw = self.append_crc(raw);
         self.flush_pending_control();
-        self.transmit(&raw, SendRetry::None)
+        self.transmit(&raw, SendRetry::None, false)
     }
 
     // ── Internal send helpers ─────────────────────────────────────────────────
@@ -916,7 +950,7 @@ impl EqStream {
     /// It is deliberately ONE retry, not a loop: a genuine `EAGAIN` must stay observable rather
     /// than being spun on inside a non-blocking send path, and the tick retry is the recovery.
     #[must_use = "a send outcome must be handled — discarding it is the #612 agent-honesty bug"]
-    fn transmit(&self, datagram: &[u8], retry: SendRetry) -> std::io::Result<()> {
+    fn transmit(&self, datagram: &[u8], retry: SendRetry, is_resend: bool) -> std::io::Result<()> {
         #[cfg(test)]
         let attempt: std::io::Result<usize> = if self.force_send_refusals.get() > 0 {
             self.force_send_refusals.set(self.force_send_refusals.get() - 1);
@@ -927,7 +961,12 @@ impl EqStream {
         #[cfg(not(test))]
         let attempt = self.attempt_send(datagram);
         match attempt {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Some(trace) = &self.packet_trace {
+                    trace.record_send(is_resend);
+                }
+                Ok(())
+            }
             Err(e) => self.record_send_failure(datagram, retry, e),
         }
     }
@@ -1026,7 +1065,7 @@ impl EqStream {
     /// the same discipline `poll_resend` relies on — and again before any new control send.
     fn flush_pending_control(&mut self) {
         while let Some(front) = self.pending_control.front() {
-            match self.transmit(front, SendRetry::Deferred) {
+            match self.transmit(front, SendRetry::Deferred, true) {
                 Ok(()) => {}
                 // Still refused. It must stay at the FRONT — popping and re-pushing would reorder it
                 // behind anything queued in between — and we stop, so nothing overtakes it.
@@ -1102,7 +1141,7 @@ impl EqStream {
             self.defer_control(raw);
             return Ok(());
         }
-        match self.transmit(&raw, SendRetry::Deferred) {
+        match self.transmit(&raw, SendRetry::Deferred, false) {
             Err(e) if is_transient(&e) => {
                 self.defer_control(raw);
                 Ok(())
@@ -1215,7 +1254,7 @@ impl EqStream {
         let mut raw = vec![0x00, opcode];
         raw.extend_from_slice(encoded_inner);
         let datagram = self.append_crc(raw);
-        let outcome = self.transmit(&datagram, SendRetry::Retransmitted);
+        let outcome = self.transmit(&datagram, SendRetry::Retransmitted, false);
         // Pushed to the resend window on FAILURE too — deliberately, and this is the reason the
         // reliable path can honestly report a failed send without it meaning "lost" (#612): a
         // datagram that never reached the socket is in exactly the same position as one lost in
@@ -1291,6 +1330,9 @@ impl EqStream {
     // ── Receive dispatch ──────────────────────────────────────────────────────
 
     fn on_raw_recv(&mut self, data: &[u8]) {
+        if let Some(trace) = &self.packet_trace {
+            trace.record_receive();
+        }
         // Strip the outer CRC that trails every datagram.
         let body_end = data.len().saturating_sub(self.session.crc_bytes as usize);
         let body = &data[..body_end];
@@ -1314,9 +1356,7 @@ impl EqStream {
             ) {
                 // Telemetry boundary (#525): raw unreliable app packet (e.g. NPC position
                 // broadcasts) — no reliable sequence. Zero cost when disabled.
-                super::packet_telemetry::capture(
-                    super::packet_telemetry::Dir::In, opcode, &payload, false, None,
-                );
+                self.capture_app(Dir::In, opcode, &payload, None, None);
                 let _ = self.app_tx.send(AppPacket { opcode, payload });
             }
             return;
@@ -1450,7 +1490,10 @@ impl EqStream {
                 }
             }
             SeqClass::Future => {
-                self.recv_buf.insert(seq, (data, is_fragment));
+                let first_arrival = self.recv_buf.insert(seq, (data, is_fragment)).is_none();
+                if let Some(trace) = self.packet_trace.as_ref().filter(|_| first_arrival) {
+                    trace.record_sequence_gap();
+                }
                 // Mirror the server's own receive path (EQEmu `eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:715`,
                 // `SendOutOfOrderAck(stream_id, sequence)`): on a gap, immediately OutOfOrderAck the
                 // out-of-order packet we just BUFFERED. The server's `OutOfOrderAck` handler drops that
@@ -1568,9 +1611,7 @@ impl EqStream {
         }
         let opcode = Cursor::new(&data[..2]).read_u16::<byteorder::LittleEndian>().unwrap();
         // Telemetry boundary (#525): reliable iff we know a sequence for it. Zero cost when disabled.
-        super::packet_telemetry::capture(
-            super::packet_telemetry::Dir::In, opcode, &data[2..], rel_seq.is_some(), rel_seq,
-        );
+        self.capture_app(Dir::In, opcode, &data[2..], rel_seq, None);
         let payload = data[2..].to_vec();
         let _ = self.app_tx.send(AppPacket { opcode, payload });
     }
@@ -1720,6 +1761,7 @@ pub(crate) async fn test_stream_with_health(
         force_send_refusals: std::cell::Cell::new(0),
         frags: FragmentBuffer::new(),
         net_health,
+        packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
         app_tx: tx,
     };
     (stream, rx)
@@ -1750,6 +1792,7 @@ pub(crate) async fn test_stream_with_peer(
         force_send_refusals: std::cell::Cell::new(0),
         frags: FragmentBuffer::new(),
         net_health,
+        packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
         app_tx: tx,
     };
     (stream, rx, peer_sock, stream_addr)
@@ -1782,6 +1825,7 @@ pub(crate) async fn test_stream_with_peer_encoded(
         force_send_refusals: std::cell::Cell::new(0),
         frags: FragmentBuffer::new(),
         net_health,
+        packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
         app_tx: tx,
     };
     (stream, rx, peer_sock, stream_addr)
@@ -2090,6 +2134,39 @@ mod tests {
         assert_eq!(classify_seq(2, 0xF001), SeqClass::Future);
         // …while a seq just below `next` (also near the top) is a past duplicate.
         assert_eq!(classify_seq(0xF000, 0xF001), SeqClass::Duplicate);
+    }
+
+    #[tokio::test]
+    async fn packet_trace_counts_transport_retries_and_gaps_without_duplicate_app_rows() {
+        use crate::protocol::OP_TARGET_MOUSE;
+
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, mut rx, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+        let id = Arc::from("target");
+        stream.send_app_packet_with_command(OP_TARGET_MOUSE, &42u32.to_le_bytes(), Some(&id));
+        stream.sent[0].sent_at = Instant::now() - std::time::Duration::from_secs(2);
+        stream.poll_resend();
+
+        let target_page = trace.page(0, 10, None, Some("target"));
+        assert_eq!(target_page.packets.len(), 1);
+        assert_eq!(target_page.counts.sent, 2);
+        assert_eq!(target_page.counts.resent, 1);
+
+        let future = [0, OP_PACKET, 0, 1, 0x34, 0x12];
+        stream.on_raw_recv(&future);
+        stream.on_raw_recv(&future);
+        stream.on_raw_recv(&[0, OP_PACKET, 0, 0, 0x34, 0x12]);
+        assert_eq!(rx.try_recv().unwrap().opcode, 0x1234);
+        assert_eq!(rx.try_recv().unwrap().opcode, 0x1234);
+        assert!(rx.try_recv().is_err());
+
+        let page = trace.page(0, 10, None, None);
+        assert_eq!(page.packets.len(), 3);
+        assert_eq!(page.counts.received, 3);
+        assert_eq!(page.counts.sequence_gaps, 1);
+        assert_eq!(page.counts.resent, 1);
     }
 
     #[tokio::test]

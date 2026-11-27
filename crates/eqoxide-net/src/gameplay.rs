@@ -221,7 +221,9 @@ pub async fn run_gameplay_phase(
         // alive (keepalives below still fire) until CAMP_DURATION elapses, then set `shutdown` so
         // the disconnect is clean (the server has set `instalog`, so no linkdead). Cancelling sends
         // a Standing `OP_SpawnAppearance`, which disables the server-side camp timer.
-        if let Some(cmd) = camp.lock().unwrap().take().and_then(|cmd|cmd.for_epoch(gs.zone_epoch)) {
+        let camp_request = action_loop.take_camp(&camp)
+            .and_then(|(cmd, id)| cmd.for_epoch(gs.zone_epoch).map(|cmd| (cmd, id)));
+        if let Some((cmd, command_id)) = camp_request {
             let now      = std::time::Instant::now();
             let current  = *camp_until.lock().unwrap();
             let (next, action) = camp_apply(cmd, current, now, CAMP_DURATION);
@@ -229,18 +231,20 @@ pub async fn run_gameplay_phase(
             use crate::protocol::build_spawn_appearance_packet;
             match action {
                 CampAction::Started => {
-                    s.send_app_packet(OP_CAMP, &[]);
+                    s.send_app_packet_with_command(OP_CAMP, &[], command_id.as_ref());
                     // Sit, like the real client — camping is a seated action and standing cancels it.
-                    s.send_app_packet(OP_SPAWN_APPEARANCE,
-                        &build_spawn_appearance_packet(gs.player_id as u16, 14, 110));
+                    s.send_app_packet_with_command(OP_SPAWN_APPEARANCE,
+                        &build_spawn_appearance_packet(gs.player_id as u16, 14, 110),
+                        command_id.as_ref());
                     gs.sitting = true;
                     gs.log_msg("system", "Camping to desktop...");
                     tracing::info!("EQ: camp started — clean shutdown in {}s", CAMP_DURATION.as_secs());
                 }
                 CampAction::Cancelled => {
                     // Standing both cancels the server camp timer and stands the character back up.
-                    s.send_app_packet(OP_SPAWN_APPEARANCE,
-                        &build_spawn_appearance_packet(gs.player_id as u16, 14, 100));
+                    s.send_app_packet_with_command(OP_SPAWN_APPEARANCE,
+                        &build_spawn_appearance_packet(gs.player_id as u16, 14, 100),
+                        command_id.as_ref());
                     gs.sitting = false;
                     gs.log_msg("system", "Camp cancelled.");
                     tracing::info!("EQ: camp cancelled");
