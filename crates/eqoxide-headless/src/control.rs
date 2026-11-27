@@ -497,6 +497,17 @@ impl Control {
         self.event_batch(after).unwrap().events.into_iter().map(|e| e.event).collect()
     }
 
+    /// The final status of a command, retained or evicted. A host decision that depends on how a
+    /// command ended must use this: an evicted receipt is still terminal.
+    pub fn settled_status(&self, id: &str) -> Option<CommandStatus> {
+        let journal = self.shared.journal.lock().unwrap();
+        journal
+            .entries
+            .get(id)
+            .map(|e| e.receipt.status)
+            .or_else(|| journal.tombstones.get(&digest(id.as_bytes())).map(|t| t.status))
+    }
+
     fn lookup(&self, id: &str) -> Result<CommandReceipt, ApiError> {
         let journal = self.shared.journal.lock().unwrap();
         if let Some(entry) = journal.entries.get(id) {
@@ -562,6 +573,10 @@ impl Control {
         let mut changes = Vec::new();
         for id in live {
             let Some(entry) = journal.entries.get_mut(&id) else { continue };
+            // `camp` spans the readiness drop it causes (design A2.2): it settles by its own path.
+            if entry.dispatched && entry.request.as_ref().is_some_and(|r| matches!(r.operation, Operation::Camp)) {
+                continue;
+            }
             entry.receipt.status = if entry.receipt.status == CommandStatus::Accepted && !entry.dispatched {
                 CommandStatus::Refused
             } else {
@@ -582,12 +597,7 @@ impl Control {
     /// the capacity checks (a 503 consumes nothing), then write the identity, its outcome and the
     /// receipt event in one step under the journal lock.
     fn admit(&self, id: String, identity: Value) -> Result<(StatusCode, CommandReceipt, String), ApiError> {
-        if id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        {
+        if !valid_command_id(&id) {
             return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_command_id".into(), None));
         }
         let payload = digest(canonical(&identity).as_bytes());
@@ -609,6 +619,10 @@ impl Control {
         }
         // Unit operations carry nothing but their kind; an internally tagged enum would ignore
         // extra fields there, so they are checked here (`deny_unknown_fields` covers the rest).
+        // Only a JSON object is a command; serde would also accept a positional array.
+        if !identity.is_object() {
+            return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid_command_payload".into(), None));
+        }
         let unit_with_extras = identity["operation"].as_object().is_some_and(|op| {
             matches!(op.get("kind").and_then(Value::as_str),
                 Some("stop" | "attack_off" | "sit" | "stand" | "merchant_close" | "camp"))
@@ -772,7 +786,7 @@ impl Control {
 }
 
 /// The payload as compared for a retry: serialized JSON (keys are sorted, since `serde_json` is
-/// built without `preserve_order`) with `-0.0` written as `0`, the one value JSON equality and
+/// built without `preserve_order`) with `-0.0` written as `0.0`, the one value JSON equality and
 /// text equality disagree on.
 fn canonical(value: &Value) -> String {
     fn norm(v: &Value) -> Value {
@@ -792,6 +806,12 @@ fn digest(bytes: &[u8]) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&full[..16]);
     out
+}
+
+fn valid_command_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 fn changed_payload() -> ApiError {
@@ -859,6 +879,10 @@ async fn put_command(
     Path(id): Path<String>,
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // The ID is checked before the body (design A3): an invalid ID is 400 whatever follows.
+    if !valid_command_id(&id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_command_id".into(), None));
+    }
     // A body that is not JSON is the same 422 as a payload of the wrong shape.
     let Json(body) = body.map_err(|_| {
         ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid_command_payload".into(), None)

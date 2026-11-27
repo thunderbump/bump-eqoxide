@@ -950,12 +950,18 @@ fn one_hour_at_five_commands_per_second_keeps_admitting_and_loses_no_receipt() {
         if n % 1000 == 999 {
             let batch = control.event_batch(cursor).unwrap();
             assert!(!batch.gap, "the reader lost events at command {n}");
-            for event in batch.events.iter().filter(|e| e.event["kind"] == "command") {
+            let mut expected = cursor + 1;
+            for event in &batch.events {
+                let n: u64 = event.cursor.rsplit_once(':').unwrap().1.parse().unwrap();
+                assert_eq!(n, expected, "cursors are contiguous");
+                expected += 1;
+                if event.event["kind"] != "command" { continue; }
                 let receipt = &event.event["command"];
                 let entry = seen.entry(receipt["id"].as_str().unwrap().to_owned()).or_default();
                 match receipt["status"].as_str().unwrap() {
                     "accepted" => entry.0 = true,
-                    _ => entry.1 = true,
+                    "applied_local" => entry.1 = true,
+                    other => panic!("unexpected status {other}"),
                 }
             }
             cursor = batch.cursor.rsplit_once(':').unwrap().1.parse().unwrap();
@@ -1015,6 +1021,7 @@ fn the_live_limit_counts_pending_safety_commands() {
     }
     let blocked = control.admit("walk".into(), movement()).unwrap_err();
     assert_eq!((blocked.0, blocked.1.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "live_command_limit"));
+    assert!(control.command("walk").is_none(), "a 503 consumes no identity");
     assert_eq!(control.admit("off-64".into(), request(json!({"kind":"attack_off"}))).unwrap().0,
         StatusCode::ACCEPTED, "a safety command is still admitted");
 }
@@ -1033,6 +1040,14 @@ async fn malformed_bodies_are_422_and_consume_nothing() {
     let extra = request(json!({"kind":"attack_off","lease_ms":5}));
     let (status, body) = authorized(&control, "PUT", path, Some(extra)).await;
     assert_eq!((status, body["error"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_command_payload")));
+    let (status, _) = authorized(&control, "PUT", path,
+        Some(json!(["session-1", 4, null, null, {"kind":"attack_off","lease_ms":5}]))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "a positional array is not a command");
+    let bad_id = Request::builder().method("PUT").uri("/v2/player/commands/bad%20id")
+        .header("authorization", "Bearer private-test-token").header("content-type", "application/json")
+        .body(Body::from("{")).unwrap();
+    assert_eq!(control.router().oneshot(bad_id).await.unwrap().status(), StatusCode::BAD_REQUEST,
+        "the ID is checked before the body");
     assert_eq!(authorized(&control, "PUT", path, Some(movement())).await.0, StatusCode::ACCEPTED,
         "the same ID is still free");
 }

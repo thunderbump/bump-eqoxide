@@ -332,7 +332,7 @@ impl Host {
                 if transaction {
                     // The receipt as it stands, not this report: a fenced `unknown` stays unknown,
                     // and so does the latch, whatever arrives later.
-                    let settled = self.control.command(&id).map_or(status, |r| r.status);
+                    let settled = self.control.settled_status(&id).unwrap_or(status);
                     self.transaction_uncertain.store(
                         !matches!(settled, Status::Confirmed | Status::Refused), Ordering::Release);
                 }
@@ -757,7 +757,7 @@ async fn complete_await<T: serde::Serialize>(
         // Keep admission closed while a packet is outstanding and after an unknown outcome. Read
         // the receipt as it stands: late evidence for a fenced `unknown` is not applied, so it must
         // not reopen transactions either.
-        let settled = control.command(&id).map_or(status, |r| r.status);
+        let settled = control.settled_status(&id).unwrap_or(status);
         uncertain.store(!matches!(settled, Status::Confirmed | Status::Refused), Ordering::Release);
     }
 }
@@ -1595,6 +1595,29 @@ mod execution_claim_tests {
         assert!(host.transaction_uncertain.load(Ordering::Acquire), "transactions stay blocked");
     }
 
+    /// Review of PR #6: the same holds once the fenced receipt has been evicted.
+    #[tokio::test]
+    async fn a_late_receipt_after_eviction_keeps_transactions_blocked() {
+        let mut host = super::tests::host();
+        host.control = Control::new("test-session".into(), "test-credential".into(), 1, 100).unwrap();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(&host.control, "buy", json!({"kind":"buy","slot":1,"quantity":1})).await;
+        host.control.drain_actions();
+        host.control.mark_dispatched("buy").unwrap();
+        host.transaction_uncertain.store(true, Ordering::Release);
+        host.control.set_ready(false);
+        host.control.set_ready(true);
+        put(&host.control, "walk", json!({"kind":"move_for","east":1,"north":0,"duration_ms":100})).await;
+        host.control.set_ready(false); // a second terminal receipt evicts the buy
+        assert!(host.control.command("buy").is_none(), "premise: the buy was evicted");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(ipc::CommandResult::Resolved(json!({"late":true}))).unwrap();
+        complete_await(host.control.clone(), "buy".into(), rx, "server_buy_receipt",
+            Some(host.transaction_uncertain.clone())).await;
+        assert!(host.transaction_uncertain.load(Ordering::Acquire), "an evicted unknown still blocks");
+    }
+
     /// central-6ly1.1 review: game events and self echoes evicted from their bounded source queues
     /// before the host saw them are reported.
     #[test]
@@ -1608,6 +1631,39 @@ mod execution_claim_tests {
         host.update_knowledge(&gs);
         let events = host.control.events_after_for_test(0);
         assert_eq!(events[0], json!({"kind":"source_events_dropped","source":"game_event","count":5}));
+        let mut gs = GameState::new();
+        for n in 0..40u64 {
+            gs.received_self_echoes.push_back(eqoxide_core::game_state::ReceivedSelfEcho {
+                id: n + 1, channel: 8, sender: "Me".into(), text: "hi".into(), truncated: false,
+            });
+        }
+        while gs.received_self_echoes.len() > 32 {
+            gs.received_self_echoes.pop_front();
+        }
+        host.update_knowledge(&gs);
+        let events = host.control.events_after_for_test(0);
+        assert!(events.contains(&json!({"kind":"source_events_dropped","source":"self_echo","count":8})));
+    }
+
+    /// Review of PR #6: the action-tracker path follows the receipt as it stands too.
+    #[tokio::test]
+    async fn a_late_tracker_confirmation_cannot_reopen_transactions() {
+        let mut host = super::tests::host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(&host.control, "sell", json!({"kind":"sell","slot":1,"quantity":1})).await;
+        host.control.drain_actions();
+        host.control.mark_dispatched("sell").unwrap();
+        host.transaction_uncertain.store(true, Ordering::Release);
+        host.control.set_ready(false); // fenced to unknown
+        let tracker = host.command.actions();
+        let context = tracker.begin_for_zone("sell", 1);
+        assert!(context.scope(async { host.command.request_sit(true) }).await, "premise: accepted");
+        host.action_ids.insert(context.id(), ("sell".into(), true));
+        tracker.finish(context.id(), "confirmed", "late");
+        host.update_knowledge(&GameState::new());
+        assert_eq!(host.control.command("sell").unwrap().status, Status::Unknown);
+        assert!(host.transaction_uncertain.load(Ordering::Acquire));
     }
 }
 

@@ -82,9 +82,10 @@ A command ID is never reusable in a session, including an ID refused at admissio
 - A malformed body consumes nothing and returns 422 `invalid_command_payload`. That covers a body
   that is not JSON, a payload of the wrong shape, and a unit operation such as `stop` with extra
   fields.
-- At most 64 receipts may be live (non-terminal) at once. Past that, ordinary commands get 503
-  `live_command_limit`; `stop` and `attack_off` are still admitted.
-- Payloads compare as JSON values, the same way before and after eviction.
+- While 64 or more receipts are live (non-terminal), ordinary commands get 503
+  `live_command_limit`. `stop` and `attack_off` are still admitted, and count toward the 64.
+- Payloads compare as parsed JSON values, the same way before and after eviction: `-0.0` equals
+  `0.0`, but `1` and `1.0` differ.
 
 Do not retry an uncertain transaction under a new ID.
 
