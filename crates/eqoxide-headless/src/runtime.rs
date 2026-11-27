@@ -218,7 +218,9 @@ impl Host {
             view.step_seq = view.step_seq.wrapping_add(1);
         }
         if let Some((_, issued)) = taken {
-            view.correction_adopted = issued;
+            // Monotonic: zone entry may have settled a later correction while this step ran, and
+            // publishing this one's older count would roll that back.
+            view.correction_adopted = view.correction_adopted.max(issued);
         }
         view.pos = body.pos;
         view.heading = self.heading;
@@ -1011,6 +1013,26 @@ mod tests {
         let view = *host.controller_slots.controller_view.lock().unwrap();
         assert_eq!(view.correction_adopted, 3);
         assert!((view.pos[0] - 40.0).abs() < 0.01, "published with the corrected position");
+    }
+    /// central-vgwu review round 4: a step that took an older correction must not roll back a
+    /// later one that zone entry settled while the step ran.
+    #[test]
+    fn an_in_flight_step_cannot_roll_back_a_settled_correction() {
+        let mut host = host();
+        let col = floor();
+        let mut gs = GameState::new();
+        gs.zone_epoch = 1;
+        {
+            let mut view = host.controller_slots.controller_view.lock().unwrap();
+            view.correction_issued = 1;
+            *host.controller_slots.pos_correction.lock().unwrap() = Some([40.0, 0.0, 0.0]);
+        }
+        // The race's end state: zone entry has already settled correction 2 while this step
+        // holds correction 1, stamped with the count it read when it took the slot.
+        host.controller_slots.controller_view.lock().unwrap().correction_adopted = 2;
+        host.step(&gs, Some(&col), true, Instant::now(), 0.02);
+        let view = *host.controller_slots.controller_view.lock().unwrap();
+        assert_eq!(view.correction_adopted, 2, "adoption never moves backwards");
     }
     #[test]
     fn state_publishes_the_last_position_send() {
