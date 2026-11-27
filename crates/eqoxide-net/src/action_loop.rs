@@ -585,6 +585,14 @@ pub struct ActionLoop {
     /// `ControllerView::step_seq` and `pos` as of the last physics step this streamer observed.
     seen_step_seq:    u64,
     step_pos:         [f32; 3],
+    /// A physics step since the last send moved the body more than the rest threshold.
+    stepped_since_send: bool,
+    /// The view's zone epoch the step baseline belongs to; a new epoch reseeds it.
+    rest_epoch:       Option<u64>,
+    /// A server correction handed to the controller and not yet visible in the view. Until the
+    /// view shows it, a stationary step describes the body the server just moved away, and a rest
+    /// flush would send that stale position back.
+    pending_adopt:    Option<[f32; 3]>,
     streamed_init:    bool,
 }
 
@@ -697,6 +705,9 @@ impl ActionLoop {
             last_sent_heading: 0.0,
             seen_step_seq: 0,
             step_pos: [0.0, 0.0, 0.0],
+            stepped_since_send: false,
+            rest_epoch: None,
+            pending_adopt: None,
             last_movement_history_send: Instant::now(),
             streamed_init: false,
         }
@@ -2729,8 +2740,10 @@ impl ActionLoop {
             self.last_streamed = gp;
             self.last_pos_send = Instant::now();
             self.last_sent_pos = gp;
+            self.last_sent_heading = view.heading;
             self.seen_step_seq = view.step_seq;
             self.step_pos = view.pos;
+            self.rest_epoch = view.zone_epoch;
             self.streamed_init = true;
             return;
         }
@@ -2782,6 +2795,9 @@ impl ActionLoop {
             self.last_streamed = gp;
             self.last_pos_send = Instant::now();
             self.last_sent_pos = gp;
+            self.seen_step_seq = view.step_seq;
+            self.step_pos = view.pos;
+            self.pending_adopt = Some(gp);
             return;
         }
         // Normal: stream the controller's position at cadence, then mirror into gs for game logic.
@@ -2795,16 +2811,40 @@ impl ActionLoop {
         // Decide rest per published PHYSICS step, not per net tick: this loop ticks about twice
         // per CPU physics step, so a tick that sees no displacement is usually just between
         // steps. One step with no displacement is a real stop, and the server learns it now.
-        let mut at_rest = false;
-        if view.step_seq != self.seen_step_seq {
-            let s = [pos[0] - self.step_pos[0], pos[1] - self.step_pos[1], pos[2] - self.step_pos[2]];
-            at_rest = s[0] * s[0] + s[1] * s[1] + s[2] * s[2] <= REST_STEP_SQ;
+        let dist_sq = |a: [f32; 3], b: [f32; 3]| {
+            (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+        };
+        // A new zone and an unadopted correction give no rest evidence: reseed and wait for the
+        // next step. A correction counts as adopted once the view is within the correction radius.
+        if view.zone_epoch != self.rest_epoch {
+            self.rest_epoch = view.zone_epoch;
+            self.pending_adopt = None;
             self.seen_step_seq = view.step_seq;
             self.step_pos = pos;
         }
+        if let Some(target) = self.pending_adopt {
+            let a = [pos[0] - target[0], pos[1] - target[1]];
+            if a[0] * a[0] + a[1] * a[1] > CORRECTION_SQ {
+                self.seen_step_seq = view.step_seq;
+                self.step_pos = pos;
+            } else {
+                self.pending_adopt = None;
+            }
+        }
+        let mut at_rest = false;
+        if view.step_seq != self.seen_step_seq {
+            at_rest = dist_sq(pos, self.step_pos) <= REST_STEP_SQ;
+            self.stepped_since_send |= !at_rest;
+            self.seen_step_seq = view.step_seq;
+            self.step_pos = pos;
+        }
+        // The first rest after motion is sent at once. Later rest updates (a slow slide along a
+        // wall that stays under the per-step threshold, a turn in place) keep the moving throttle,
+        // so a body that creeps cannot send one update per physics step.
+        let rest_drift = dist_sq(pos, self.last_sent_pos) > 0.01 || view.heading != self.last_sent_heading;
         let rest_owed = self.last_sent_moving
-            || pos != self.last_sent_pos
-            || view.heading != self.last_sent_heading;
+            || self.stepped_since_send
+            || (rest_drift && since >= POS_SEND_MOVING_MS);
         if at_rest && rest_owed {
             // `from == to`: zero delta and animation 0, the native "standing here" update.
             use eqoxide_core::game_state::PositionSendReason::Rest;
@@ -2857,7 +2897,7 @@ impl ActionLoop {
     fn send_position_update(
         &mut self,
         stream:  &mut EqStream,
-        gs:      &mut GameState,
+        gs:      &GameState,
         from: [f32; 3],
         to: [f32; 3],
         heading: f32,
@@ -2888,11 +2928,13 @@ impl ActionLoop {
 
         let buf = encode_client_position_update(
             self.position_seq, gs.player_id as u16, to, [dx, dy, dz], eq_heading, anim);
-        gs.last_position_send = Some(eqoxide_core::game_state::PositionSend {
-            seq: self.position_seq, pos: to, delta: [dx, dy, dz], heading, animation: anim, reason,
-            at: Instant::now(),
-        });
+        self.controller.controller_view.lock().unwrap().last_position_send =
+            Some(eqoxide_core::game_state::PositionSend {
+                seq: self.position_seq, pos: to, delta: [dx, dy, dz], heading, animation: anim, reason,
+                at: Instant::now(),
+            });
         self.last_sent_moving = anim != 0 || dist > 0.0;
+        self.stepped_since_send = false;
         self.last_sent_heading = heading;
         self.position_seq = self.position_seq.wrapping_add(1);
         // Position is a transient firehose — send it UNRELIABLY (ack_req=false), exactly like the
@@ -4045,7 +4087,9 @@ mod tests {
 
     /// Every `OP_ClientUpdate` the peer socket has received so far, decoded as
     /// `(seq, [x, y, wire_z], [dx, dy, dz], anim)`. Same identity encode as the test above.
-    fn drain_client_updates(peer: &tokio::net::UdpSocket) -> Vec<(u16, [f32; 3], [f32; 3], i32)> {
+    async fn drain_client_updates(peer: &tokio::net::UdpSocket) -> Vec<(u16, [f32; 3], [f32; 3], i32)> {
+        // Loopback delivery is not synchronous with the send call.
+        tokio::time::sleep(Duration::from_millis(2)).await;
         let f = |d: &[u8], at: usize| f32::from_le_bytes(d[at..at + 4].try_into().unwrap());
         let mut out = Vec::new();
         let mut buf = [0u8; 512];
@@ -4065,6 +4109,42 @@ mod tests {
         out
     }
 
+    fn last_send(nav: &ActionLoop) -> Option<eqoxide_core::game_state::PositionSend> {
+        nav.controller.controller_view.lock().unwrap().last_position_send
+    }
+
+    /// A streamer with an initialized view at `pos`, past its baseline tick.
+    async fn rest_fixture(pos: [f32; 3])
+        -> (EqStream, tokio::net::UdpSocket, ActionLoop, GameState)
+    {
+        let (mut stream, _rx, peer, _addr) =
+            crate::transport::test_stream_with_peer(Default::default()).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.player_x = pos[0];
+        gs.player_y = pos[1];
+        gs.player_z = pos[2];
+        {
+            let mut view = nav.controller.controller_view.lock().unwrap();
+            view.initialized = true;
+            view.pos = pos;
+        }
+        nav.stream_position(&mut stream, &mut gs); // baseline tick, sends nothing
+        assert!(drain_client_updates(&peer).await.is_empty());
+        (stream, peer, nav, gs)
+    }
+
+    /// One CPU physics step published at `pos`.
+    fn publish_step(nav: &ActionLoop, pos: [f32; 3]) {
+        let mut view = nav.controller.controller_view.lock().unwrap();
+        view.step_seq += 1;
+        view.pos = pos;
+    }
+
+    const NET_TICK_MS: u64 = 10;
+    /// The CPU host's 35 u/s intent over one 20 ms physics step.
+    const CPU_STEP_U: f32 = 35.0 * 0.020;
+
     /// central-vgwu: when the body stops, the server must hear the resting position at once, with
     /// zero delta and animation 0, not 1.3 s later at the keepalive with the run's delta still on
     /// it. The CPU host publishes a physics step every 20 ms and the net loop ticks every 10 ms,
@@ -4076,47 +4156,31 @@ mod tests {
     #[tokio::test]
     async fn resting_position_is_sent_within_two_net_ticks_of_stopping_vgwu() {
         use eqoxide_core::game_state::PositionSendReason;
-        let (mut stream, _rx, peer, _addr) =
-            crate::transport::test_stream_with_peer(Default::default()).await;
-        let mut nav = new_loop();
-        let mut gs = GameState::new();
-        {
-            let mut view = nav.controller.controller_view.lock().unwrap();
-            view.initialized = true;
-            view.pos = [0.0, 0.0, 0.0];
-        }
-        nav.stream_position(&mut stream, &mut gs); // baseline tick, sends nothing
-        assert!(drain_client_updates(&peer).is_empty());
-
-        const NET_TICK_MS: u64 = 10;
-        let step = 35.0 * 0.020; // the CPU host's 35 u/s intent over one 20 ms physics step
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
         let mut x = 0.0f32;
         // 200 ms of movement: 20 net ticks, a physics step on every second one.
         for tick in 0..20 {
             tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
             if tick % 2 == 1 {
-                x += step;
-                let mut view = nav.controller.controller_view.lock().unwrap();
-                view.step_seq += 1;
-                view.pos = [x, 0.0, 0.0];
+                x += CPU_STEP_U;
+                publish_step(&nav, [x, 0.0, 0.0]);
             }
             nav.stream_position(&mut stream, &mut gs);
-            assert_ne!(gs.last_position_send.map(|s| s.reason), Some(PositionSendReason::Rest),
+            assert_ne!(last_send(&nav).map(|s| s.reason), Some(PositionSendReason::Rest),
                 "false stop: a net tick between physics steps (tick {tick}) was read as rest");
         }
-        let moving_packets = drain_client_updates(&peer);
-        assert!(moving_packets.iter().all(|p| p.3 != 0),
-            "every packet while moving must carry a moving animation: {moving_packets:?}");
+        assert!(drain_client_updates(&peer).await.iter().all(|p| p.3 != 0),
+            "every packet while moving must carry a moving animation");
 
         // Hold still: the next physics step republishes the same position.
         let mut rest = None;
         for tick in 0..2 {
             tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
             if tick == 0 {
-                nav.controller.controller_view.lock().unwrap().step_seq += 1;
+                publish_step(&nav, [x, 0.0, 0.0]);
             }
             nav.stream_position(&mut stream, &mut gs);
-            if let Some(p) = drain_client_updates(&peer).into_iter().last() {
+            if let Some(p) = drain_client_updates(&peer).await.into_iter().last() {
                 rest = Some(p);
                 break;
             }
@@ -4128,41 +4192,154 @@ mod tests {
         assert_eq!(delta, [0.0, 0.0, 0.0], "a resting body reports zero delta");
         assert_eq!(anim, 0, "and animation 0");
 
-        let sent = gs.last_position_send.expect("state records the last send");
+        let sent = last_send(&nav).expect("the view records the last send");
         assert_eq!((sent.seq, sent.pos, sent.reason), (seq, [x, 0.0, 0.0], PositionSendReason::Rest),
-            "state publishes the sequence and position of the packet actually sent");
+            "the record carries the sequence and position of the packet actually sent");
         assert!(sent.at.elapsed() < Duration::from_millis(100), "and when it was sent");
 
         // Still at rest on later steps: the flush is owed once, then the keepalive cadence resumes.
         for _ in 0..4 {
             tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
-            nav.controller.controller_view.lock().unwrap().step_seq += 1;
+            publish_step(&nav, [x, 0.0, 0.0]);
             nav.stream_position(&mut stream, &mut gs);
         }
-        assert!(drain_client_updates(&peer).is_empty(), "a body already reported at rest is not re-sent each step");
+        assert!(drain_client_updates(&peer).await.is_empty(), "a body already reported at rest is not re-sent each step");
+    }
+
+    /// central-vgwu review: the moving update can land exactly on the final position. The stop is
+    /// still owed, because that update told the server the body was moving.
+    ///
+    /// MUTATION CHECK: drop `self.last_sent_moving ||` from `rest_owed` → RED.
+    #[tokio::test]
+    async fn a_moving_update_at_the_final_position_is_still_followed_by_a_rest_update_vgwu() {
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
+        let mut x = 0.0f32;
+        let moving = loop {
+            tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+            x += CPU_STEP_U;
+            publish_step(&nav, [x, 0.0, 0.0]);
+            nav.stream_position(&mut stream, &mut gs);
+            if let Some(p) = drain_client_updates(&peer).await.pop() {
+                break p;
+            }
+            assert!(x < 50.0, "the moving throttle never sent");
+        };
+        assert_eq!(moving.1[0], x, "premise: the moving update carries the final position");
+        assert_ne!(moving.3, 0, "premise: and a moving animation");
+        tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
+        publish_step(&nav, [x, 0.0, 0.0]);
+        nav.stream_position(&mut stream, &mut gs);
+        let rest = drain_client_updates(&peer).await.pop().expect("the stop is owed after a moving update");
+        assert_eq!((rest.1[0], rest.2, rest.3), (x, [0.0; 3], 0));
+    }
+
+    /// central-vgwu review B1: a step the host published before it adopted a server correction
+    /// shows the body where the server no longer has it. It must not be sent as a rest update.
+    ///
+    /// MUTATION CHECK: delete the `pending_adopt` block in `stream_position` → RED.
+    #[tokio::test]
+    async fn a_step_from_before_a_correction_is_not_sent_as_rest_vgwu() {
+        let a = [10.0, 0.0, 0.0];
+        let b = [500.0, 0.0, 0.0];
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture(a).await;
+        publish_step(&nav, a); // the host's idle step at A, not yet seen by the streamer
+        [gs.player_x, gs.player_y, gs.player_z] = b; // the server moves us to B
+        nav.stream_position(&mut stream, &mut gs);
+        let correction = drain_client_updates(&peer).await.pop().expect("premise: the correction is re-streamed");
+        assert_eq!(correction.1[0], b[0]);
+        // The host has not adopted yet and publishes another idle step at A.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
+            publish_step(&nav, a);
+            nav.stream_position(&mut stream, &mut gs);
+            assert!(drain_client_updates(&peer).await.iter().all(|p| p.1[0] != a[0]),
+                "the pre-correction position was sent back as rest");
+        }
+        // Once the view shows B, rest detection resumes; B was already sent, so nothing is owed.
+        publish_step(&nav, b);
+        nav.stream_position(&mut stream, &mut gs);
+        publish_step(&nav, b);
+        nav.stream_position(&mut stream, &mut gs);
+        assert!(nav.pending_adopt.is_none(), "adoption clears the guard");
+    }
+
+    /// central-vgwu review: a slow slide under the per-step rest threshold must not send one rest
+    /// update per physics step.
+    #[tokio::test]
+    async fn a_slow_slide_keeps_the_moving_throttle_vgwu() {
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
+        let mut x = 0.0f32;
+        let mut sent = 0;
+        // 400 ms of 0.007 u per step, under REST_STEP_SQ's 0.01 u.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+            x += 0.007;
+            publish_step(&nav, [x, 0.0, 0.0]);
+            nav.stream_position(&mut stream, &mut gs);
+            sent += drain_client_updates(&peer).await.len();
+        }
+        assert!(sent <= 2, "a creeping body sent {sent} updates in 400 ms");
+    }
+
+    /// central-vgwu review: turning in place sends the new heading, at the moving cadence rather
+    /// than once per physics step.
+    ///
+    /// MUTATION CHECK: make `rest_owed` ignore `since` → RED.
+    #[tokio::test]
+    async fn turning_in_place_keeps_the_moving_throttle_vgwu() {
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
+        let mut sent = Vec::new();
+        for i in 1..=20 {
+            tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+            {
+                let mut view = nav.controller.controller_view.lock().unwrap();
+                view.step_seq += 1;
+                view.heading = 5.0 * i as f32;
+            }
+            nav.stream_position(&mut stream, &mut gs);
+            sent.extend(drain_client_updates(&peer).await);
+        }
+        assert!(!sent.is_empty(), "a turn in place must reach the server before the keepalive");
+        assert!(sent.len() <= 3, "a turn in place sent {} updates in 400 ms", sent.len());
+        assert!(sent.iter().all(|p| p.2 == [0.0; 3] && p.3 == 0), "with zero delta and animation");
+    }
+
+    /// central-vgwu review: a body that spawns idle facing anything but north sends no stop.
+    #[tokio::test]
+    async fn an_idle_spawn_sends_no_rest_update_vgwu() {
+        let (mut stream, peer, mut nav, mut gs) = {
+            let (mut stream, _rx, peer, _addr) =
+                crate::transport::test_stream_with_peer(Default::default()).await;
+            let mut nav = new_loop();
+            let mut gs = GameState::new();
+            {
+                let mut view = nav.controller.controller_view.lock().unwrap();
+                view.initialized = true;
+                view.heading = 90.0;
+            }
+            nav.stream_position(&mut stream, &mut gs);
+            (stream, peer, nav, gs)
+        };
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
+            publish_step(&nav, [0.0; 3]);
+            nav.stream_position(&mut stream, &mut gs);
+        }
+        assert!(drain_client_updates(&peer).await.is_empty());
     }
 
     /// central-vgwu: a publisher that never counts steps (the graphical render loop) keeps the
     /// plain throttle and never gets a rest flush.
     #[tokio::test]
     async fn no_rest_flush_without_a_step_signal_vgwu() {
-        let (mut stream, _rx, peer, _addr) =
-            crate::transport::test_stream_with_peer(Default::default()).await;
-        let mut nav = new_loop();
-        let mut gs = GameState::new();
-        {
-            let mut view = nav.controller.controller_view.lock().unwrap();
-            view.initialized = true;
-            view.pos = [0.0, 0.0, 0.0];
-        }
-        nav.stream_position(&mut stream, &mut gs);
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
         nav.controller.controller_view.lock().unwrap().pos = [3.0, 0.0, 0.0];
         for _ in 0..5 {
             tokio::time::sleep(Duration::from_millis(10)).await;
             nav.stream_position(&mut stream, &mut gs);
         }
-        assert!(drain_client_updates(&peer).is_empty(), "nothing before the 280 ms throttle");
-        assert!(gs.last_position_send.is_none());
+        assert!(drain_client_updates(&peer).await.is_empty(), "nothing before the 280 ms throttle");
+        assert!(last_send(&nav).is_none());
     }
 
     /// #643: This pins the publisher half of the net→HTTP path (the HTTP half is pinned by the app

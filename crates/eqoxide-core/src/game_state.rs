@@ -1081,28 +1081,6 @@ pub struct ControllerHold {
     pub secs: f32,
 }
 
-/// One client-side body relocation — the destination and how far the body was moved to get there.
-///
-/// Emitted by the `#845` last-resort placement (`CharacterController::last_resort_placement`), the
-/// only path that moves the local player without the driver asking and without a server correction
-/// behind it. It exists so an agent driving the HTTP API can both *detect* an unrequested `pos`
-/// jump (via the monotonic `GameState::client_relocations` counter) and *attribute* it (via
-/// `GameState::last_relocation`), instead of seeing a bare coordinate change with nothing to pin it
-/// on. That gap was #925.
-///
-/// `distance` is the full 3-D move from the pre-placement position to `to` — deliberately NOT the
-/// horizontal-only figure the `#845` `warn!` line logs, because the placement can change height and
-/// an agent comparing `pos` deltas needs the number that matches what it will observe.
-///
-/// `PartialEq` matters for the same reason it does on [`ControllerHold`]: this rides inside
-/// [`GameState`], whose snapshot dedup (`eq_net::gameplay::publish_snapshot`) only republishes when
-/// the state actually changed. `[f32; 3]` + `f32` compares fine — and because neither member ever
-/// advances on its own (unlike `ControllerHold::secs`), a settled `Some(r)` compares equal frame to
-/// frame and costs exactly one extra republish per relocation.
-///
-/// Deliberately NOT `serde::Serialize` (sibling [`ControllerHold`] is not either): nothing
-/// serialises this type. The HTTP path builds `PlayerRelocationView` from it in `eqoxide-http`,
-/// which is where the wire field names and the `detail` prose live.
 /// Why `ActionLoop::stream_position` put an `OP_ClientUpdate` on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionSendReason {
@@ -1143,6 +1121,28 @@ pub struct PositionSend {
     pub at: std::time::Instant,
 }
 
+/// One client-side body relocation — the destination and how far the body was moved to get there.
+///
+/// Emitted by the `#845` last-resort placement (`CharacterController::last_resort_placement`), the
+/// only path that moves the local player without the driver asking and without a server correction
+/// behind it. It exists so an agent driving the HTTP API can both *detect* an unrequested `pos`
+/// jump (via the monotonic `GameState::client_relocations` counter) and *attribute* it (via
+/// `GameState::last_relocation`), instead of seeing a bare coordinate change with nothing to pin it
+/// on. That gap was #925.
+///
+/// `distance` is the full 3-D move from the pre-placement position to `to` — deliberately NOT the
+/// horizontal-only figure the `#845` `warn!` line logs, because the placement can change height and
+/// an agent comparing `pos` deltas needs the number that matches what it will observe.
+///
+/// `PartialEq` matters for the same reason it does on [`ControllerHold`]: this rides inside
+/// [`GameState`], whose snapshot dedup (`eq_net::gameplay::publish_snapshot`) only republishes when
+/// the state actually changed. `[f32; 3]` + `f32` compares fine — and because neither member ever
+/// advances on its own (unlike `ControllerHold::secs`), a settled `Some(r)` compares equal frame to
+/// frame and costs exactly one extra republish per relocation.
+///
+/// Deliberately NOT `serde::Serialize` (sibling [`ControllerHold`] is not either): nothing
+/// serialises this type. The HTTP path builds `PlayerRelocationView` from it in `eqoxide-http`,
+/// which is where the wire field names and the `detail` prose live.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Relocation {
     /// Where the body was put, in `[east, north, up]` (`pos`) order.
@@ -1576,9 +1576,6 @@ pub struct GameState {
     /// happened this zone. ZONE-SCOPED: `begin_zone_in` clears it, because `to` names a point in the
     /// zone being left. The `client_relocations` counter above is what survives a zone change.
     pub last_relocation: Option<Relocation>,
-    /// The last `OP_ClientUpdate` this client attempted for itself (central-vgwu). Not cleared on
-    /// zone-in: its `seq` keeps counting across zones.
-    pub last_position_send: Option<PositionSend>,
 
     // Loot state
     /// Corpse spawn_ids queued for auto-looting (populated by OP_BecomeCorpse).

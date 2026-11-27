@@ -105,6 +105,11 @@ pub struct ControllerView {
     /// Zero forever means "no step signal": the streamer then never sends a rest flush and keeps
     /// the plain 280 ms / 1300 ms cadence. The graphical render loop does not publish it.
     pub step_seq: u64,
+    /// The last self `OP_ClientUpdate` the net streamer attempted (central-vgwu). Written by the
+    /// net thread, never by a publisher. It lives here rather than in `GameState` so a keepalive
+    /// does not change the published snapshot, which the graphical render loop treats as
+    /// activity.
+    pub last_position_send: Option<eqoxide_core::game_state::PositionSend>,
     pub pos:     [f32; 3],
     pub heading: f32,
     /// False until the render thread has spawned and seeded the controller. The net streamer must
@@ -503,7 +508,7 @@ pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_st
 ///
 /// The render thread is NOT this slot's only writer, and the rendered-frame republish above is not
 /// this slot's only cadence (#1044 review round 1, finding D — same undercount shape as
-/// #1022/#1037, found while checking whether this claim could be left alone). Two NET-thread
+/// #1022/#1037, found while checking whether this claim could be left alone). Three NET-thread
 /// writers also mutate the published view in production, both deliberately and both outside the
 /// frame cadence:
 ///
@@ -519,6 +524,8 @@ pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_st
 ///   every ~10 ms outer-loop pass once the view reads `initialized` — it returns early above that
 ///   line before then — consuming the render thread's one-shot fall signal so it can fire exactly
 ///   once.
+/// * `ActionLoop::stream_position` writes `last_position_send` after each self `OP_ClientUpdate`
+///   it attempts (central-vgwu). No publisher writes that field.
 ///
 /// So a consumer must not read "published by the render thread on every rendered frame" as a
 /// guarantee that every field it sees was authored by the render thread on the last frame.

@@ -556,8 +556,12 @@ fn clock_ms(started: Instant, at: Instant) -> u64 {
 }
 /// The last self-position update put on the wire. The datagram is unreliable: this proves the
 /// attempt and its content, never that the server received it.
-fn position_send_json(gs: &GameState, started: Instant, now: Instant) -> Value {
-    gs.last_position_send.map_or(Value::Null, |sent| {
+fn position_send_json(
+    sent: Option<eqoxide_core::game_state::PositionSend>,
+    started: Instant,
+    now: Instant,
+) -> Value {
+    sent.map_or(Value::Null, |sent| {
         json!({"sequence":sent.seq,"position":sent.pos,"delta":sent.delta,"heading":sent.heading,
             "animation":sent.animation,"reason":sent.reason.as_str(),"sent_at_ms":clock_ms(started,sent.at),
             "age_ms":now.saturating_duration_since(sent.at).as_millis() as u64,"delivery_confirmed":false})
@@ -799,6 +803,9 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         host.update_knowledge(&gs);
         if now >= publish_at {
             let position = host.body.as_ref().map(|body| body.pos);
+            let last_send = host.controller_slots.controller_view.lock().unwrap().last_position_send;
+            // Read the clock after the record, so `sent_at_ms` can never exceed `clock_ms`.
+            let state_now = Instant::now();
             let mut nearby: Vec<_> = gs
                 .world
                 .entities
@@ -814,13 +821,13 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             let entities:Vec<_>=nearby.iter().map(|entity|json!({"id":entity.spawn_id,"class_id":entity.class_id,"name":entity.name,"npc":entity.is_npc,"dead":entity.dead,
                 "position":[entity.x,entity.y,entity.z],"hp_pct":entity.hp_pct,"level":entity.level,
                 "los":position.zip(col.as_ref()).map(|(p,c)|c.line_clear([p[0],p[1],p[2]+5.0],[entity.x,entity.y,entity.z+5.0],0.0)),"los_source":"local_native_static_geometry"})).collect();
-            control.publish_state(host.epoch,json!({"clock_ms":clock_ms(started,now),"phase":if terminal.is_some(){"failed"}else if ready{"ready"}else{"not_ready"},"failure":terminal,
+            control.publish_state(host.epoch,json!({"clock_ms":clock_ms(started,state_now),"phase":if terminal.is_some(){"failed"}else if ready{"ready"}else{"not_ready"},"failure":terminal,
                 "freshness":{"network_tick_age_ms":tick_age,"inbound_age_ms":inbound_age,"link_age_ms":link_age},
                 "zone":{"id":gs.world.zone_id,"name":gs.world.zone_name,"instance_id":Value::Null},"geometry":geometry,
                 "self":{"id":gs.player_id,"name":gs.player_name,"position":position,"position_source":"local_prediction_from_received_self_spawn",
                     "heading":host.heading,"on_ground":host.body.as_ref().map(|b|b.on_ground),"in_water":host.body.as_ref().map(|b|b.in_water),
                     "hp":{"value":gs.cur_hp,"max":gs.max_hp,"known":gs.max_hp>0,"confirmed":gs.hp_confirmed},"sitting":gs.sitting,
-                    "last_position_send":position_send_json(&gs,started,now),
+                    "last_position_send":position_send_json(last_send,started,state_now),
                     "target_id":gs.target_id,"attack_on":gs.auto_attack,"motion_active":host.motion.is_some(),"hold":gs.player_hold.map(|hold|json!({"reason":hold.reason.as_str(),"seconds":hold.secs}))},
                 "nearby":{"available":gs.player_pos_known,"complete":false,"scope":"received_roster_within_radius","radius":500,"limit":256,"truncated":truncated,"entities":entities},
                 "inventory":{"known":gs.inventory_received,"revision":host.inventory_revision,"items":gs.inventory,"source":"received_with_local_prediction","coin":gs.coin,"coin_confirmed":gs.coin_confirmed},
@@ -981,15 +988,14 @@ mod tests {
     fn state_publishes_the_last_position_send() {
         use eqoxide_core::game_state::{PositionSend, PositionSendReason};
         let started = Instant::now();
-        let mut gs = GameState::new();
-        assert_eq!(position_send_json(&gs, started, started), Value::Null);
+        assert_eq!(position_send_json(None, started, started), Value::Null);
         let at = started + Duration::from_millis(1500);
-        gs.last_position_send = Some(PositionSend {
+        let sent = Some(PositionSend {
             seq: 41, pos: [1.0, 2.0, 3.0], delta: [0.0; 3], heading: 90.0, animation: 0,
             reason: PositionSendReason::Rest, at,
         });
         assert_eq!(
-            position_send_json(&gs, started, at + Duration::from_millis(20)),
+            position_send_json(sent, started, at + Duration::from_millis(20)),
             json!({"sequence":41,"position":[1.0,2.0,3.0],"delta":[0.0,0.0,0.0],"heading":90.0,
                 "animation":0,"reason":"rest","sent_at_ms":1500,"age_ms":20,"delivery_confirmed":false})
         );
