@@ -106,6 +106,10 @@ enum Fields {
         name: String,
         position: [f32; 3],
         heading: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        npc: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hp_percent: Option<u8>,
     },
     InboundPosition {
         entity: u16,
@@ -307,7 +311,7 @@ fn decode_fields(dir: Dir, opcode: u16, body: &[u8]) -> Fields {
             animation: u32_at(34) & 0x3ff,
             heading: u32_at(14) & 0xfff,
         },
-        (Dir::In, p::OP_ZONE_ENTRY) => {
+        (Dir::In, p::OP_ZONE_ENTRY | p::OP_NEW_SPAWN) => {
             if let Some((spawn, _, heading)) = p::parse_rof2_spawn_with_wire_heading(body) {
                 // The wire reader returns ASCII names. Cap malformed long names so decoded
                 // metadata cannot bypass the trace's per-row byte bound.
@@ -321,6 +325,8 @@ fn decode_fields(dir: Dir, opcode: u16, body: &[u8]) -> Fields {
                     name,
                     position: [spawn.x, spawn.y, spawn.z],
                     heading,
+                    npc: (opcode == p::OP_NEW_SPAWN).then_some(spawn.npc),
+                    hp_percent: (opcode == p::OP_NEW_SPAWN).then_some(spawn.cur_hp),
                 }
             } else {
                 Fields::Empty {}

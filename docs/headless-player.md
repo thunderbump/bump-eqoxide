@@ -237,6 +237,7 @@ Headings use the raw protocol units.
 | Opcode | Direction | Fields |
 | --- | --- | --- |
 | `OP_ZONE_ENTRY` (0x5089) | Inbound | `entity`, `name`, `position`, `heading` |
+| `OP_NEW_SPAWN` (0x6097) | Inbound | `entity`, `name`, `npc`, `hp_percent`, `position`, `heading` |
 | `OP_CLIENT_UPDATE` (0x7dfc) | Inbound | `entity`, `position`, `heading` |
 | `OP_CLIENT_UPDATE` (0x7dfc) | Outbound | `sequence`, `position`, `delta`, `animation`, `heading` |
 | `OP_TARGET_COMMAND` (0x58e2) | Both | `target_id` |
@@ -246,7 +247,9 @@ Headings use the raw protocol units.
 | `OP_DELETE_SPAWN` (0x7280) | Inbound | `entity` |
 
 Outbound `OP_CLIENT_UPDATE` uses the payload's own 16-bit `sequence` counter.
-Its unreliable transport `wire_seq` is null. Other opcodes have empty `fields`.
+Its unreliable transport `wire_seq` is null. The `OP_NEW_SPAWN` `npc` byte uses
+0 for a player, 1 for an NPC, 2 for a player's corpse, and 3 for an NPC's corpse.
+Other opcodes have empty `fields`.
 
 The network owner tags outbound packets emitted by a command drain, including
 awaited merchant open and buy. The explicit loot command ID

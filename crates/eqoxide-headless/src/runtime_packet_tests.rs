@@ -431,3 +431,28 @@ async fn correction_adoption_discards_late_pre_correction_provenance() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["command_id"], Value::Null);
 }
+
+
+/// Removing the expiry-step ID leaves this rest untagged because there was no moving send.
+#[tokio::test]
+async fn expiring_turn_owns_rest_without_a_prior_moving_send() {
+    use eqoxide_core::game_state::PositionSendReason;
+
+    let mut session = Session::new().await;
+    let floor = floor();
+    session.gs.world.zone_name = "synthetic".into();
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.02);
+    session.drain();
+
+    session.dispatch("turn", json!({"kind":"move_for","east":1,"north":0,"duration_ms":1})).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The lease expired before the next physics step. Its new heading still needs a rest update.
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.02);
+    session.drain();
+
+    let view = session.host.controller_slots.controller_view.lock().unwrap();
+    assert!(view.active_motion_command.is_none());
+    assert_eq!(view.last_position_send.unwrap().reason, PositionSendReason::Rest);
+    drop(view);
+    session.assert_packets("turn", &[OP_CLIENT_UPDATE]).await;
+}

@@ -742,27 +742,46 @@ async fn packet_trace_rejects_unknown_queries_and_out_of_range_limits() {
 
 // Payload bodies from the Qeynos2 stop-timing-v2 journey on 2026-11-27.
 
+// Keep the captured spawn layout and set a nonzero raw heading.
+const SPAWN_BODY: &str = concat!(
+    "436c69656e7461620001000000010000a0400000000000000000000000000000010100000064",
+    "000000000000000000000000000000000000000000000000c040001f85eb3e3333333f010000",
+    "00008c010000ffffffff00000000070064000000000000000000000000000000000000000000",
+    "000000000000000000ffffffffffffffff000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000055020000000018e30f18006400000000000000000000000000000030303030",
+    "3030303030303030303030300000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000",
+);
+
 #[tokio::test]
 async fn packet_trace_decodes_zone_entry_wire_payload() {
     assert_inbound_wire_fields(
         eqoxide_net::protocol::OP_ZONE_ENTRY,
         "OP_ZONE_ENTRY",
-        // Keep the captured layout and set a nonzero raw heading.
-        concat!(
-            "436c69656e7461620001000000010000a0400000000000000000000000000000010100000064",
-            "000000000000000000000000000000000000000000000000c040001f85eb3e3333333f010000",
-            "00008c010000ffffffff00000000070064000000000000000000000000000000000000000000",
-            "000000000000000000ffffffffffffffff000000000000000000000000000000000000000000",
-            "0000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000000000000055020000000018e30f18006400000000000000000000000000000030303030",
-            "3030303030303030303030300000000000000000000000000000000000000000000000000000",
-            "000000000000000000000000",
-        ),
+        SPAWN_BODY,
         json!({"entity":1, "name":"Clientab", "position":[-925.0,1194.0,3.125], "heading":769}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_new_spawn_wire_fields() {
+    let mut body = SPAWN_BODY.to_owned();
+    // Change the NPC and HP bytes. Race 1 uses the same equipment layout for this fixture.
+    body.replace_range(2 * 18..2 * 19, "01");
+    body.replace_range(2 * 37..2 * 38, "51");
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_NEW_SPAWN,
+        "OP_NEW_SPAWN",
+        &body,
+        json!({
+            "entity": 1, "name": "Clientab", "npc": 1, "hp_percent": 81,
+            "position": [-925.0,1194.0,3.125], "heading": 769,
+        }),
     ).await;
 }
 
@@ -821,6 +840,7 @@ async fn packet_trace_raw_payload_is_opt_in_and_truncated() {
     use eqoxide_net::packet_telemetry::Dir;
     let control = control(1, 1);
     control.packet_trace.capture(Dir::Out, 0xfffe, &[0xab; 513], None, None);
+    control.packet_trace.capture(Dir::Out, 0xfffe, &[0xcd; 512], None, None);
     control.packet_trace.capture(Dir::Out, 0xfffe, &[0x00, 0xde], None, None);
 
     let (_, default) = authorized(&control, "GET", "/v2/player/packets", None).await;
@@ -831,8 +851,11 @@ async fn packet_trace_raw_payload_is_opt_in_and_truncated() {
     assert_eq!(packets[0]["payload_hex"], "ab".repeat(512));
     assert_eq!(packets[0]["payload_truncated"], true);
     assert_eq!(packets[0]["len"], 515);
-    assert_eq!(packets[1]["payload_hex"], "00de");
+    assert_eq!(packets[1]["payload_hex"], "cd".repeat(512));
     assert_eq!(packets[1]["payload_truncated"], false);
+    assert_eq!(packets[1]["len"], 514);
+    assert_eq!(packets[2]["payload_hex"], "00de");
+    assert_eq!(packets[2]["payload_truncated"], false);
     assert_eq!(
         authorized(&control, "GET", "/v2/player/packets?raw=2", None).await.0,
         StatusCode::BAD_REQUEST,

@@ -8,7 +8,7 @@ use super::packet_telemetry::{
 use super::protocol::*;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use eqoxide_ipc::SessionDropCause;
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -1615,17 +1615,15 @@ impl EqStream {
                         self.incoming_high_water = Some(seq);
                     }
                 }
-                match self.recv_buf.entry(seq) {
-                    Entry::Occupied(mut entry) => {
-                        // Keep the first socket arrival while preserving the existing payload
-                        // replacement and ACK behavior for a buffered retransmission.
-                        let arrival = entry.get().arrival;
-                        entry.insert(OrderedDatagram { arrival, ..packet });
-                    }
-                    Entry::Vacant(entry) => {
-                        entry.insert(packet);
-                    }
-                }
+                // Keep the first socket arrival while preserving the existing payload
+                // replacement and ACK behavior for a buffered retransmission.
+                let buffered = self.recv_buf.entry(seq).or_insert(OrderedDatagram {
+                    bytes: Vec::new(),
+                    is_fragment,
+                    arrival,
+                });
+                buffered.bytes = packet.bytes;
+                buffered.is_fragment = is_fragment;
                 // Mirror the server's own receive path (EQEmu `eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:715`,
                 // `SendOutOfOrderAck(stream_id, sequence)`): on a gap, immediately OutOfOrderAck the
                 // out-of-order packet we just BUFFERED. The server's `OutOfOrderAck` handler drops that

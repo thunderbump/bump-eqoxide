@@ -4194,6 +4194,29 @@ mod tests {
         (stream, peer, nav, gs)
     }
 
+    /// Removing the prior moving send's ID leaves rest untagged when the stopped view has no ID.
+    #[tokio::test]
+    async fn rest_inherits_last_moving_command_without_a_terminal_id() {
+        use crate::{packet_telemetry::SessionTrace, transport::with_packet_trace};
+        use eqoxide_core::game_state::PositionSendReason;
+
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, _peer, mut nav, mut gs) =
+            with_packet_trace(trace.clone(), rest_fixture([0.0; 3])).await;
+        nav.last_pos_send = Instant::now() - Duration::from_millis(300);
+        nav.controller.controller_view.lock().unwrap().active_motion_command = Some("move".into());
+        publish_step(&nav, [9.0, 0.0, 0.0]);
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(last_send(&nav).unwrap().reason, PositionSendReason::Moving);
+        assert!(nav.last_sent_moving);
+
+        nav.controller.controller_view.lock().unwrap().active_motion_command = None;
+        publish_step(&nav, [9.0, 0.0, 0.0]);
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(last_send(&nav).unwrap().reason, PositionSendReason::Rest);
+        assert_eq!(trace.page(0, 10, Some("OP_CLIENT_UPDATE"), Some("move")).packets.len(), 2);
+    }
+
     /// One CPU physics step published at `pos`.
     fn publish_step(nav: &ActionLoop, pos: [f32; 3]) {
         let mut view = nav.controller.controller_view.lock().unwrap();
