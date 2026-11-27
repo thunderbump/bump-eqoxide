@@ -430,6 +430,8 @@ pub async fn run_gameplay_phase(
                         gs.player_y = y;
                         gs.player_z = z;
                         gs.player_pos_known = true; // server-driven teleport destination (#513)
+                        gs.record_server_position([x, y, z], gs.player_heading,
+                            eqoxide_core::game_state::ServerPositionSource::Relocation);
                         // #660 B2: the SERVER has now told us where we are, so the position is no longer the
                         // client's crossing guess. This is the ONLY kind of event that clears it — the zone echo
                         // settles which ZONE, not where in it.

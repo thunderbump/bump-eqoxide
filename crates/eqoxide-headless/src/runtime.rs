@@ -133,7 +133,10 @@ struct Host {
     last_echo: u64,
     /// The last `CombatRecord::id` and death instant published as events (central-6ly1.8).
     last_combat: u64,
-    last_death: Option<std::time::Instant>,
+    last_death_count: u32,
+    /// The self position in the last published state: every range check measures from this, so a
+    /// script reading state sees the same distances the host decides with (central-6ly1.8).
+    published_position: Option<[f32; 3]>,
 }
 impl Host {
     fn outcome(&self, id: &str, status: Status, reason: Option<&str>, evidence: Option<Value>) {
@@ -266,24 +269,30 @@ impl Host {
         if let Some(echo) = gs.received_self_echoes.back() {
             self.last_echo = echo.id;
         }
-        let name_of = |id: u32| -> Option<String> {
-            if id == gs.player_id && id != 0 {
-                return Some(gs.player_name.clone());
+        // Records older than the bounded source queue were evicted unseen: say so, never silently.
+        if let Some(first) = gs.combat_records.front() {
+            if first.id > self.last_combat + 1 {
+                self.control.publish_event(json!({"kind":"source_events_dropped","source":"combat",
+                    "count":first.id - self.last_combat - 1}));
             }
-            gs.world.entities.get(&id).map(|e| e.name.clone())
-        };
+        }
         for hit in gs.combat_records.iter().filter(|r| r.id > self.last_combat) {
-            self.control.publish_event(json!({"kind":"combat","source":"received_packet",
-                "source_id":hit.source_id,"target_id":hit.target_id,"source_name":name_of(hit.source_id),
-                "target_name":name_of(hit.target_id),"amount":hit.amount,"spell_id":hit.spell_id,
-                "damage_type":hit.damage_type,"result":hit.result.as_str()}));
+            self.control.publish_event(json!({"kind":"combat","source":"received_packet","record_id":hit.id,
+                "zone_epoch":hit.zone_epoch,"source_id":hit.source_id,"target_id":hit.target_id,
+                "source_name":hit.source_name,"target_name":hit.target_name,"amount":hit.amount,
+                "spell_id":hit.spell_id,"damage_type":hit.damage_type,"result":hit.result.as_str()}));
         }
         if let Some(hit) = gs.combat_records.back() {
             self.last_combat = hit.id;
         }
-        if gs.died_at.is_some() && gs.died_at != self.last_death {
-            self.last_death = gs.died_at;
-            self.control.publish_event(json!({"kind":"died","source":"received_packet",
+        if gs.death_count != self.last_death_count {
+            // Two deaths between host reads leave only the latest killer: report the miss.
+            let missed = gs.death_count.wrapping_sub(self.last_death_count).saturating_sub(1);
+            if missed > 0 {
+                self.control.publish_event(json!({"kind":"source_events_dropped","source":"death","count":missed}));
+            }
+            self.last_death_count = gs.death_count;
+            self.control.publish_event(json!({"kind":"died","source":"received_packet","death_count":gs.death_count,
                 "killer":{"id":gs.killer_id,"name":known_killer_name(&gs.killed_by)}}));
         }
         for event in self.command.actions().take_events() {
@@ -311,7 +320,7 @@ impl Host {
     ) {
         let id = command.id;
         let req = command.request;
-        let me = self.body.as_ref().map(|body| body.pos);
+        let me = self.published_position;
         if req.zone_epoch != self.epoch || (!ready && !req.operation.is_priority()) {
             self.outcome(
                 &id,
@@ -757,7 +766,8 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         last_event: 0,
         last_echo: 0,
         last_combat: 0,
-        last_death: None,
+        last_death_count: 0,
+        published_position: None,
     };
     let (net_tx, mut net) = tokio::sync::oneshot::channel();
     let config = profile.login_config();
@@ -890,6 +900,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         host.update_knowledge(&gs);
         if now >= publish_at {
             let position = host.body.as_ref().map(|body| body.pos);
+            host.published_position = position;
             let last_send = host.controller_slots.controller_view.lock().unwrap().last_position_send;
             // Read the clock after the record, so `sent_at_ms` can never exceed `clock_ms`.
             let state_now = Instant::now();
@@ -967,7 +978,8 @@ mod tests {
             last_event: 0,
             last_echo: 0,
         last_combat: 0,
-        last_death: None,
+        last_death_count: 0,
+        published_position: None,
         }
     }
     fn floor() -> Collision {
@@ -1116,16 +1128,49 @@ mod tests {
         gs.player_pos_known = true;
         gs.player_x = 1000.0; // the mirror disagrees with the body
         gs.world.entities.insert(7, rat(7, 25.0));
-        gs.world.entities.insert(8, rat(8, 10.0));
-        gs.world.entities.insert(9, rat(9, 10.0));
+        for id in (8..40).rev() {
+            gs.world.entities.insert(id, rat(id, 10.0));
+        }
         let me = Some([0.0, 0.0, 0.0]);
         assert!(observed_entity(&gs, me, 7, 30.0), "25 units from the body is in range");
         assert!(!observed_entity(&gs, None, 7, 30.0), "no body, no range");
         let (nearby, truncated) = roster(&gs, me);
-        let order: Vec<_> = nearby.iter().map(|(d, e)| (e.spawn_id, *d)).collect();
-        assert_eq!(order, vec![(8, 10.0), (9, 10.0), (7, 25.0)], "nearest first, ties by spawn ID");
+        let order: Vec<_> = nearby.iter().map(|(_, e)| e.spawn_id).collect();
+        let mut expected: Vec<u32> = (8..40).collect();
+        expected.push(7);
+        assert_eq!(order, expected, "nearest first, ties by spawn ID");
+        assert_eq!(nearby.last().unwrap().0, 25.0, "and each entry carries its distance");
         assert!(!truncated);
         assert!(roster(&gs, None).0.is_empty());
+    }
+    /// central-6ly1.8: a dispatched command measures range from the position the last state
+    /// publication showed, not from the body (which steps between publications) or the mirror.
+    ///
+    /// MUTATION CHECK: set `me` in `dispatch` from `self.body` or from `gs.player_x` → RED.
+    #[tokio::test]
+    async fn dispatch_measures_range_from_the_published_position() {
+        use tower::ServiceExt;
+        let mut host = host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        host.body = Some(CharacterController::new([1000.0, 0.0, 0.0]));
+        host.published_position = Some([0.0, 0.0, 0.0]);
+        let mut gs = GameState::new();
+        gs.zone_epoch = 1;
+        gs.player_x = -1000.0;
+        gs.world.entities.insert(7, rat(7, 25.0));
+        let body = json!({"session":"test-session","zone_epoch":1,"operation":{"kind":"target","entity_id":7}});
+        let request = axum::http::Request::builder().method("PUT").uri("/v2/player/commands/t1")
+            .header("authorization", "Bearer test-credential").header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string())).unwrap();
+        let response = host.control.router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+        for command in host.control.drain_actions() {
+            host.dispatch(command, &gs, true, Instant::now()).await;
+        }
+        let receipt = host.control.command("t1").unwrap();
+        assert_ne!(receipt.status, Status::Refused,
+            "25 units from the published position is in range: {receipt:?}");
     }
     /// central-6ly1.8: the server's view of self beside the prediction, and the vitals.
     #[test]
@@ -1163,22 +1208,43 @@ mod tests {
         gs.player_name = "Me".into();
         gs.world.entities.insert(7, rat(7, 5.0));
         let swing = |id| CombatRecord { id, source_id: 1, target_id: 7, amount: 3, spell_id: None,
-            damage_type: 1, result: CombatResult::Hit, at: Instant::now() };
+            damage_type: 1, result: CombatResult::Hit, source_name: Some("Me".into()),
+            target_name: Some("a_rat".into()), zone_epoch: 1, at: Instant::now() };
         gs.combat_records.push_back(swing(1));
         gs.combat_records.push_back(swing(2));
         host.update_knowledge(&gs);
         host.update_knowledge(&gs);
         gs.died_at = Some(Instant::now());
+        gs.death_count = 1;
         gs.killer_id = Some(7);
         gs.killed_by = "a_rat".into();
+        // The roster now names spawn 7 differently: the record keeps the name from its packet.
+        gs.world.entities.get_mut(&7).unwrap().name = "a_guard".into();
         host.update_knowledge(&gs);
         host.update_knowledge(&gs);
         let batch = host.control.events_after_for_test(0);
         let kinds: Vec<_> = batch.iter().map(|e| e["kind"].as_str().unwrap().to_owned()).collect();
         assert_eq!(kinds, vec!["combat", "combat", "died"]);
-        assert_eq!(batch[0], json!({"kind":"combat","source":"received_packet","source_id":1,"target_id":7,
-            "source_name":"Me","target_name":"a_rat","amount":3,"spell_id":null,"damage_type":1,"result":"hit"}));
+        assert_eq!(batch[0], json!({"kind":"combat","source":"received_packet","record_id":1,"zone_epoch":1,
+            "source_id":1,"target_id":7,"source_name":"Me","target_name":"a_rat","amount":3,"spell_id":null,
+            "damage_type":1,"result":"hit"}));
         assert_eq!(batch[2]["killer"], json!({"id":7,"name":"a_rat"}));
+
+        // Records evicted before the host saw them, and two deaths between reads, are reported.
+        gs.combat_records.clear();
+        gs.combat_records.push_back(swing(9));
+        gs.death_count = 3;
+        host.update_knowledge(&gs);
+        let batch = host.control.events_after_for_test(0);
+        let tail: Vec<_> = batch[3..].iter().map(|e| (e["kind"].as_str().unwrap().to_owned(),
+            e.get("source").and_then(Value::as_str).unwrap_or_default().to_owned(),
+            e.get("count").cloned().unwrap_or(Value::Null))).collect();
+        assert_eq!(tail, vec![
+            ("source_events_dropped".to_owned(), "combat".to_owned(), json!(6)),
+            ("combat".to_owned(), "received_packet".to_owned(), Value::Null),
+            ("source_events_dropped".to_owned(), "death".to_owned(), json!(1)),
+            ("died".to_owned(), "received_packet".to_owned(), Value::Null),
+        ]);
     }
     #[test]
     fn state_publishes_the_last_position_send() {
@@ -1245,7 +1311,8 @@ mod transaction_admission_tests {
             last_event: 0,
             last_echo: 0,
         last_combat: 0,
-        last_death: None,
+        last_death_count: 0,
+        published_position: None,
         };
         let mut gs = GameState::new();
         gs.inventory_received = true;

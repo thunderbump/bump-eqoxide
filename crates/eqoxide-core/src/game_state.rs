@@ -1088,6 +1088,10 @@ pub enum ServerPositionSource {
     Update,
     /// A self `OP_ClientUpdate` that moved the player more than the correction radius.
     Correction,
+    /// The received self spawn at zone entry.
+    Spawn,
+    /// A server-directed placement: a bind respawn or a same-zone teleport.
+    Relocation,
 }
 
 impl ServerPositionSource {
@@ -1095,6 +1099,8 @@ impl ServerPositionSource {
         match self {
             Self::Update => "server_update",
             Self::Correction => "server_correction",
+            Self::Spawn => "server_spawn",
+            Self::Relocation => "server_relocation",
         }
     }
 }
@@ -1131,6 +1137,12 @@ pub struct CombatRecord {
     /// The wire `type` byte: EQEmu's damage-type code for the swing or spell, not a skill ID.
     pub damage_type: u8,
     pub result: CombatResult,
+    /// Names resolved when the packet arrived, so a later spawn-ID reuse cannot rename them.
+    /// `None` when the spawn was not known then.
+    pub source_name: Option<String>,
+    pub target_name: Option<String>,
+    /// `GameState::zone_epoch` when the packet arrived.
+    pub zone_epoch: u64,
     pub at: std::time::Instant,
 }
 
@@ -1825,6 +1837,8 @@ pub struct GameState {
     /// The killer's spawn ID from the death packet, kept when its name is unknown (central-6ly1.8).
     /// `None` until a death, and when the packet named spawn 0.
     pub killer_id: Option<u32>,
+    /// Self deaths this session, so a consumer can tell two deaths from one (central-6ly1.8).
+    pub death_count: u32,
     pub died_at: Option<std::time::Instant>,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
@@ -1883,6 +1897,13 @@ impl GameState {
     /// survive exactly one tick before the departed zone's hold came back — which is the opposite of
     /// what the comments on those two lines claim to achieve. This function cannot reach the view
     /// itself (`eqoxide-core` sits below `eqoxide-ipc`), so the pairing lives there.
+    /// Record a position the server asserted for the player, in the feet datum (central-6ly1.8).
+    pub fn record_server_position(&mut self, pos: [f32; 3], heading: f32, source: ServerPositionSource) {
+        self.server_self_position = Some(ServerSelfPosition {
+            pos, heading, source, at: std::time::Instant::now(),
+        });
+    }
+
     pub fn begin_zone_in(&mut self) {
         self.zone_epoch = self.zone_epoch.checked_add(1).expect("zone epoch exhausted");
         self.world.entities.clear();
@@ -4571,7 +4592,7 @@ pub(crate) mod tests {
             xp_pct: _,
             coin: _, coin_confirmed: _, unverified_buys: _,
             // Death record: `last_cast`-shaped — a true record of something that already happened.
-            player_dead: _, player_dead_since: _, killed_by: _, killer_id: _, died_at: _, last_cast: _,
+            player_dead: _, player_dead_since: _, killed_by: _, killer_id: _, death_count: _, died_at: _, last_cast: _,
             // Group/guild/social: keyed by NAME, and a group follows the player across a zone line.
             group_members: _, group_leader: _, pending_invite: _,
             guild_names: _, guild_members: _, pending_guild_invite: _, who_roster: _,
