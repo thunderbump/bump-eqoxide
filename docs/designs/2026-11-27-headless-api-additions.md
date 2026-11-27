@@ -41,6 +41,9 @@ revision 2, which is withdrawn: `target` keeps sending `OP_TargetMouse`.
 | 18 | Movement and attack-lease deadlines | Wall clock | Accumulated physics time for movement; the attack lease stays on the network owner's monotonic clock (A7) |
 | 19 | Readiness on stdout | `API_PORT=` before login | Also `EQOXIDE_READY` and `EQOXIDE_EXIT` lines (A6) |
 | 20 | `session_ended` event | Published when the network task ends | Kept. The EXIT line carries the typed cause |
+| 21 | Reason codes | `busy`, `session_or_zone_not_ready`, `precondition_failed_or_network_mailbox_busy`, `queued_without_server_receipt`, `superseded_by_safety_command` | Replaced by the A2 codes. Admission: `not_ready`, `dead`, `busy_merchant`, `busy_inventory`, `busy_same_kind`, `lifecycle_pending`. Claim (A2.3): `cancelled`, `network_mailbox_busy`, `dispatch_timeout`. Evidence: `no_server_evidence_within_window`, `no_server_receipt_in_protocol`. `superseded_by_safety_command` remains for a `move_for`, `goto` or `attack` cancelled by `stop` or `attack_off` |
+| 22 | Death and readiness | Death makes the host not Ready, which fences every pending command | Death is not a readiness drop. A2.5 |
+| 23 | `sit`, `stand`, `say`, `tell`, `sell`, `merchant_close`, `inventory_move` receipts | `unknown` straight after dispatch | `sent`, then `unknown`, until the registry promotes the operation |
 
 The `motion_expired` and `motion_stopped` events stay alongside `completion`. `say "/camp"` stays
 a local camp toggle and is routed through the `camp` lifecycle rules (A2.5).
@@ -100,6 +103,13 @@ Receipt fields: `id`, `status`, `terminal`, `reason`, `detail`, `evidence`, `acc
 - Priority commands: `stop` cancels every unclaimed `move_for` and `goto`, and `attack_off`
   cancels every unclaimed `attack`. Priority work is claimed before ordinary work in the same
   tick.
+- **Single-slot mailboxes.** When a request's mailbox slot is still occupied, the host retries the
+  dispatch every host tick until the claim deadline. If the slot never frees, the command becomes
+  `refused` with `network_mailbox_busy`.
+- **Named implementation work for the claim:**
+  - `camp`, `respawn` and `cross_zone` get `Action` labels and go through the tracker.
+  - The tracker's 30 s `expire` and its epoch fence exempt fence-spanning operations.
+  - Trace capture returns `n`, so a receipt's `evidence.packets` can be filled.
 - Deferred sends carry ownership. A packet sent later on a command's behalf (the loot pipeline's
   requests, the respawn selection, the camp logout, the give trade steps, a `face` heading update)
   carries that command's ID into the trace and the receipt. Ownership ends when the receipt is
@@ -122,8 +132,21 @@ confirms a user `consider`.
 
 ### A2.5 Admission while dead
 
+- Death is not a readiness drop. Readiness no longer includes `player_dead_since`, so a character
+  that logs in dead still reaches Ready and prints `EQOXIDE_READY`.
+- At death, every non-terminal command other than `stop`, `attack_off`, `camp` and `respawn` is
+  fenced with reason `dead`: `refused` if not yet claimed, `unknown` if claimed.
 - While dead, the host admits `stop`, `attack_off`, `camp` and `respawn`. Everything else is
   refused with `dead`.
+- Admission checks run in this order:
+  1. `stale_session`
+  2. `stale_zone_epoch`
+  3. `invalid_operation`
+  4. `not_ready`
+  5. `dead`
+  6. the conflict classes, in A2.4 order
+
+  `stop` and `attack_off` skip checks 4 to 6. Checks 1 to 3 still apply to them.
 - `respawn` while alive is refused with `not_dead`.
 - `say "/camp"` follows `camp`'s rules.
 
@@ -146,6 +169,7 @@ PUT processing order:
      - an expired one returns 410 `command_id_expired` with `{"status","reason"}`.
    - Changed payload: 409 `command_id_reused_with_changed_payload`, expired or not.
    - A known ID is always answered, even when every limit below is reached.
+   - GET on an ID refused at admission returns that refusal's receipt, like any other receipt.
 3. **New ID.**
    - The ID's identity record is written first, so the ID is never reusable from this point.
    - `stop` and `attack_off` are always admitted. They draw on 1024 identities reserved for them.
@@ -246,6 +270,9 @@ Each leaf is `satisfied`, `pending`, `impossible` or `gap`.
 
 ### Readiness timeout and signals
 
+- A zone-entry failure before the first Ready ends the process with `login_failed` and
+  `reason: "zone_entry"`. After the first Ready, a failed zone change publishes `zone_failed`. The
+  process exits `session_lost` only if the session is gone.
 - If the host is not Ready within `ready_timeout_ms` (profile, default 120 000), it exits with
   `never_ready`.
 - SIGINT, SIGTERM and SIGHUP request normal logout. A signal before Ready ends the login attempt
@@ -376,26 +403,26 @@ native-server run, requested through coordination.
 | `move_for` | – | `applied_local` | Local | `expired`, `stopped`, `superseded`, `interrupted` | Shipped. Completion is new |
 | `stop` | – | `applied_local` | Local | – | Shipped |
 | `goto` | .4 | `applied_local` | Local | `arrived`, `blocked`, `timeout`, `stopped`, `superseded`, `interrupted` | Semantics in B3 |
-| `face` | .4 | `applied_local` | Local; the heading update is an owned deferred send | `sent` with sequence and `n`, or `interrupted` | Server receipt is checked from the server log in the live test (amended .4 AC) |
+| `face` | .4 | `applied_local` | Local; the heading update is an owned deferred send | `heading_sent` with sequence and `n`, or `interrupted` | Native rebroadcasts a heading-only change to other clients, so the live test checks it from a second headless client's `nearby[].heading`. Proposed in place of the server-log wording of the .4 AC |
 | `jump` | .4 | `applied_local` | Local | – | Needs `on_ground`, not `in_water`, not sitting. Allowed while moving |
 | `attack_off` | – | `applied_local` | Local; owns its `OP_AutoAttack` packet | – | Row 14 |
-| `target` | .7 | `sent` → `unknown` | None direct. Native `OP_TargetMouse` gets no reply (`eqemu:zone/client_packet.cpp@cd66dd0a6:15125`). The server-side target is proven by an attributed swing | – | Amended .7 AC. Row 15 of revision 2 is withdrawn |
+| `target` | .7 | `sent` → `unknown` | None direct. Native `OP_TargetMouse` gets no reply (`eqemu:zone/client_packet.cpp@cd66dd0a6:15125`). The server-side target is proven by an attributed swing | – | Amended .7 AC. Row 15 of revision 2 is withdrawn. Candidate: the `OP_Consider` reply the target drain already requests, which needs the same-kind rule with `consider` |
 | `attack` | .7 | `sent` → `unknown` | Candidate: the first `OP_Damage` with source = self, target = the target at claim, melee, sent after the claim and within the lease | – | Native sends no toggle reply (`@cd66dd0a6:3517`). Riposte and in-flight swings need defining before promotion |
 | `sit`, `stand` | – | `sent` → `unknown` | None. Native `Handle_OP_SpawnAppearance` excludes the sender (`@cd66dd0a6:14771`) | – | `self.sitting` is the client's own state |
-| `say`, `tell`, `chat` | .9 | `sent` → `unknown` | Candidate: the self-echo, per channel. A tell echo uses channel 14 | – | Normalisation needs defining |
+| `say`, `tell`, `chat` | .9 | `sent` → `unknown` | Candidates: `tell` on `ChatChannel_TellEcho` (`eqemu:zone/worldserver.cpp@cd66dd0a6:237`), which proves delivery; `TOLD_NOT_ONLINE` means not delivered. For other channels, the self-echo, which depends on chat filters (`eqemu:zone/entity.cpp@cd66dd0a6:2275`) | – | Text can be redacted or garbled; `#` and `^` commands give no echo |
 | `hail` | .9 | `sent` → `unknown` | NPC speech is an observation, not evidence | – | – |
 | `consider` | .9 | `sent` → `unknown` | Candidate: an `OP_Consider` reply naming the entity, with the self-probe excluded | – | Sends a consider only; no retarget |
-| `cast` | .9 | `sent` → `unknown` | Candidate: the awaited path's `CastEnd`: `completed`, `fizzled`, `interrupted`, plus a server refusal as `refused` | – | `gem` 0–8. The target is in the payload; no retarget |
+| `cast` | .9 | `sent` → `unknown` | Candidate: the awaited path's `CastEnd`: `completed`, `fizzled`, `interrupted`, plus `cast_failed` as `refused` | – | `gem` 0–8. The target is in the payload; no retarget. The window must match `CAST_PENDING_REAP` (14 s) and the 30 s echo quarantine |
 | `memorize` | .9 | `sent` → `unknown` | Candidate: the `OP_MemorizeSpell` echo | – | `gem` 0–8 |
 | `door` | .9 | `sent` → `unknown` | `OP_MoveDoor` is a broadcast, so it is an observation only | – | – |
 | `loot` | – | `confirmed` on `corpse_opened` | Shipped. Ownership of the pipeline's packets is in PR #4 | – | – |
 | `merchant_open`, `buy` | – | `confirmed` / `refused` | Shipped: the server echo; `OP_ShopEndConfirm` for buy. An unsolicited shop end makes the receipt `unknown` | – | Merchant-context serialisation (A2.4) |
-| `merchant_close` | – | `sent` → `unknown` | Candidate: `OP_ShopEndConfirm` while no buy is pending | – | – |
-| `sell` | – | `sent` → `unknown` | Candidate: `OP_ShopPlayerSell` echo | – | – |
+| `merchant_close` | – | `sent` → `unknown` | Candidate: `OP_ShopEndConfirm`, which native always sends (`eqemu:zone/client.cpp@cd66dd0a6:13285`), while no buy is pending | – | Merchant-context class |
+| `sell` | – | `sent` → `unknown` | Candidate: `OP_ShopPlayerSell` echo; `itemslot = -1` means vetoed, which becomes `refused` with `sell_vetoed` | – | – |
 | `inventory_move` | – | `sent` → `unknown` | None. Native applies the move silently | – | The transaction lock remains |
 | `give` | .9 | `sent` → `unknown` | `returned` needs a received matching item; `accepted` evidence is to be defined | – | Inventory serialisation; ambiguous results lock transactions |
 | `respawn` | .5 | `sent` → `unknown` at 30 s | Candidate: recovery after this death's hover window, either Ready after re-entry or in-zone recovery | – | Needs a native run. The bind selection is sent once; the reliable transport retransmits |
-| `cross_zone` | .6 | `sent` → `unknown` at 60 s | Candidate: `zoned` with the expected destination | – | Needs a native run. Semantics in B3 |
+| `cross_zone` | .6 | `sent` → `unknown` at 60 s | Candidate: `zoned` whose zone equals the standing line's destination. A `SendZoneCancel` (`success = 1` with the current zone, `eqemu:zone/zoning.cpp@cd66dd0a6:382`) becomes `refused` with `zone_change_cancelled` | – | Needs a native run. Semantics in B3 |
 | `camp` | .3 | EXIT line | `camp_timer_completed_logout_sent` | – | A6 |
 
 ## B3. Semantics that do not depend on evidence
@@ -430,7 +457,7 @@ Behaviour:
 - Takes exactly one of `heading` (degrees counter-clockwise from north, as in state) or
   `entity_id`.
 - During `goto` or `move_for` it is refused with `moving`. A newer `face` supersedes an older one,
-  which completes `superseded`.
+  which completes `superseded`. The completion result for a sent heading is `heading_sent`.
 - The heading update bypasses the 280 ms rest spacing.
 - While a correction is unadopted the update waits for adoption, for at most 2 s. After that it
   completes `interrupted` with `correction_pending`.
@@ -465,6 +492,13 @@ Behaviour:
 - `give` takes `entity_id`, `slot` and the current `inventory_revision`.
 - `chat` takes a `channel` (`group`, `guild`, `shout`, `ooc` or `auction`) and `text` of 1–512
   bytes.
+
+### `server_position` (shipped in .8)
+
+The server never sends a client its own ordinary position updates, because the rebroadcast
+excludes the sender. `self.server_position` is therefore set only by server-originated moves:
+corrections, summons, translocations and zone placement. It is null in normal play. Proposed
+amendment to the .8 AC: "the last server-asserted self position".
 
 ### New state and events
 
