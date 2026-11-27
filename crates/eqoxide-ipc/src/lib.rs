@@ -2358,8 +2358,12 @@ impl ControllerSlots {
     pub fn begin_zone_in(&self, gs: &mut eqoxide_core::game_state::GameState) {
         gs.begin_zone_in();
         // The sole network writer clears departed-zone corrections before publishing new entry.
-        self.pos_correction.lock().unwrap().take();
+        // Under the view lock (view, then slot, the order every writer uses), and the dropped
+        // correction counts as settled: nothing is pending for the controller to adopt, and an
+        // issue count left ahead of the adopt count would keep the rest flush off for good.
         let mut view = self.controller_view.lock().unwrap();
+        self.pos_correction.lock().unwrap().take();
+        view.correction_adopted = view.correction_issued;
         if view.zone_epoch.is_some() { view.initialized = false; }
         view.invalidate_disclosures();
         // #925: the relocation really happened, so it still counts — but its destination named a

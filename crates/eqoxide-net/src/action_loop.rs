@@ -581,7 +581,7 @@ pub struct ActionLoop {
     /// Position as of the last packet actually sent by `send_position_update`'s throttled callers
     /// (`stream_position`'s normal + correction paths) — see the note on `last_streamed` above.
     last_sent_pos:    [f32; 3],
-    /// Whether the last packet sent described motion (a non-zero delta or animation), and the
+    /// Whether the last packet sent carried a moving animation, and the
     /// heading it carried. Together with `last_sent_pos` these decide whether a rest flush is
     /// owed (central-vgwu).
     last_sent_moving: bool,
@@ -2827,16 +2827,19 @@ impl ActionLoop {
         let unadopted = view.correction_adopted != view.correction_issued;
         let adopting = view.correction_adopted != self.seen_adopted;
         self.seen_adopted = view.correction_adopted;
-        if view.zone_epoch != self.rest_epoch || unadopted || adopting {
+        if view.zone_epoch != self.rest_epoch || unadopted {
             if view.zone_epoch != self.rest_epoch {
                 self.rest_epoch = view.zone_epoch;
                 self.last_sent_moving = false;
-            }
-            if !unadopted {
                 self.stepped_since_send = false;
             }
             self.seen_step_seq = view.step_seq;
             self.step_pos = pos;
+        } else if adopting {
+            // Measure the adopting step from the correction already sent, not from the stale
+            // view: the teleport itself is not motion, but any travel past the correction is.
+            self.step_pos = self.last_sent_pos;
+            self.stepped_since_send = false;
         }
         let mut at_rest = false;
         if view.step_seq != self.seen_step_seq {
@@ -2940,7 +2943,9 @@ impl ActionLoop {
             seq: self.position_seq, pos: to, delta: [dx, dy, dz], heading, animation: anim, reason,
             at: Instant::now(),
         };
-        self.last_sent_moving = anim != 0 || dist > 0.0;
+        // "Moving" is what the animation told the server. A keepalive over a slow creep carries a
+        // small delta at animation 0 and owes no immediate stop.
+        self.last_sent_moving = anim != 0;
         self.stepped_since_send = false;
         self.last_sent_heading = heading;
         self.position_seq = self.position_seq.wrapping_add(1);
@@ -4304,6 +4309,89 @@ mod tests {
         }
         assert!(drain_client_updates(&peer).await.is_empty(),
             "adopting a correction already sent owes the server no second update");
+    }
+
+    /// central-vgwu review round 3: a zone entry that drops an unadopted correction must not leave
+    /// the rest flush off in the new zone.
+    ///
+    /// MUTATION CHECK: drop `view.correction_adopted = view.correction_issued` from
+    /// `ControllerSlots::begin_zone_in` → RED.
+    #[tokio::test]
+    async fn a_correction_dropped_by_zone_entry_does_not_disable_rest_vgwu() {
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
+        [gs.player_x, gs.player_y, gs.player_z] = [500.0, 0.0, 0.0];
+        nav.stream_position(&mut stream, &mut gs); // correction issued, never adopted
+        let _ = drain_client_updates(&peer).await;
+        nav.controller.begin_zone_in(&mut gs); // the zone line wins the race
+        {
+            let mut view = nav.controller.controller_view.lock().unwrap();
+            view.zone_epoch = Some(gs.zone_epoch);
+            view.initialized = true;
+            view.pos = [500.0, 0.0, 0.0];
+        }
+        let mut x = 500.0;
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+            x += CPU_STEP_U;
+            publish_step(&nav, [x, 0.0, 0.0]);
+            nav.stream_position(&mut stream, &mut gs);
+        }
+        let _ = drain_client_updates(&peer).await;
+        tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+        publish_step(&nav, [x, 0.0, 0.0]);
+        nav.stream_position(&mut stream, &mut gs);
+        let rest = drain_client_updates(&peer).await.pop().expect("a stop in the new zone is sent at once");
+        assert_eq!((rest.1[0], rest.3), (x, 0));
+    }
+
+    /// central-vgwu review round 3: the step that adopts a correction can also travel; that travel
+    /// is real motion and its stop is owed.
+    ///
+    /// MUTATION CHECK: reseed `step_pos = pos` on the adopting step → RED.
+    #[tokio::test]
+    async fn travel_on_the_adopting_step_is_still_reported_vgwu() {
+        let b = [500.0, 0.0, 0.0];
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
+        [gs.player_x, gs.player_y, gs.player_z] = b;
+        nav.stream_position(&mut stream, &mut gs);
+        let _ = drain_client_updates(&peer).await;
+        tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
+        adopt_correction(&nav);
+        let moved = [b[0] + CPU_STEP_U, 0.0, 0.0];
+        nav.controller.controller_view.lock().unwrap().pos = moved; // teleport, then one step of travel
+        nav.stream_position(&mut stream, &mut gs);
+        tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+        publish_step(&nav, moved);
+        nav.stream_position(&mut stream, &mut gs);
+        let rest = drain_client_updates(&peer).await.pop().expect("the stop after the travel is sent");
+        assert_eq!((rest.1[0], rest.3), (moved[0], 0));
+    }
+
+    /// central-vgwu review round 3: a keepalive over a creep carries a small delta at animation 0
+    /// and must not make the next creep step an immediate rest update.
+    ///
+    /// MUTATION CHECK: set `last_sent_moving` from `dist > 0.0` as well → RED.
+    #[tokio::test]
+    async fn a_keepalive_over_a_creep_owes_no_immediate_rest_vgwu() {
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
+        let mut x = 0.0f32;
+        let mut packets = Vec::new();
+        // 1.6 s of a jitter that nets 0.001 u per step: under the 0.1 u rest drift until well past
+        // the 1300 ms keepalive, which then carries a small delta at animation 0.
+        for i in 0..80 {
+            tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+            x += if i % 2 == 0 { 0.011 } else { -0.009 };
+            publish_step(&nav, [x, 0.0, 0.0]);
+            nav.stream_position(&mut stream, &mut gs);
+            for p in drain_client_updates(&peer).await {
+                packets.push((Instant::now(), p));
+            }
+        }
+        assert!(packets.iter().any(|(_, p)| p.2 != [0.0; 3]), "premise: a keepalive with a delta was sent");
+        for w in packets.windows(2) {
+            assert!(w[1].0 - w[0].0 >= Duration::from_millis(250),
+                "a creep sent two updates {:?} apart", w[1].0 - w[0].0);
+        }
     }
 
     /// central-vgwu review: motion left unsent in one zone owes the next zone nothing.
