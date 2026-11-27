@@ -261,6 +261,20 @@ impl Host {
             self.merchant_revision += 1;
             self.merchant_value = merchant;
         }
+        // The source queues are bounded (200 events, 32 echoes): anything evicted before this tick
+        // saw it is reported, never silently lost (design A4).
+        if let Some(first) = gs.chat_events.front() {
+            if first.id > self.last_event + 1 {
+                self.control.publish_event(json!({"kind":"source_events_dropped","source":"game_event",
+                    "count":first.id - self.last_event - 1}));
+            }
+        }
+        if let Some(first) = gs.received_self_echoes.front() {
+            if first.id > self.last_echo + 1 {
+                self.control.publish_event(json!({"kind":"source_events_dropped","source":"self_echo",
+                    "count":first.id - self.last_echo - 1}));
+            }
+        }
         for event in gs.chat_events.iter().filter(|e| e.id > self.last_event) {
             self.control.publish_event(json!({"kind":"received_game_event","source":if event.category=="chat" {"received_packet"} else {"client_game_event"},"event_id":event.id,
                 "category":event.category,"event_kind":event.kind,"from":event.from,"directed":event.directed,"text":event.text}));
@@ -313,12 +327,15 @@ impl Host {
                     "refused" => Status::Refused,
                     _ => Status::Unknown,
                 };
-                if transaction {
-                    self.transaction_uncertain
-                        .store(status == Status::Unknown, Ordering::Release);
-                }
                 let evidence = (status==Status::Confirmed).then(||json!({"kind":"server_action_receipt","action":event.kind,"detail":event.reason}));
-                self.outcome(&id, status, Some(&event.reason), evidence);
+                let _ = self.control.publish_outcome(&id, status, Some(event.reason.clone()), evidence);
+                if transaction {
+                    // The receipt as it stands, not this report: a fenced `unknown` stays unknown,
+                    // and so does the latch, whatever arrives later.
+                    let settled = self.control.command(&id).map_or(status, |r| r.status);
+                    self.transaction_uncertain.store(
+                        !matches!(settled, Status::Confirmed | Status::Refused), Ordering::Release);
+                }
             }
         }
     }
@@ -735,11 +752,14 @@ async fn complete_await<T: serde::Serialize>(
             None,
         ),
     };
-    if let Some(uncertain) = uncertain {
-        // Keep admission closed while a packet is outstanding and after an unknown outcome.
-        uncertain.store(status == Status::Unknown, Ordering::Release);
-    }
     let _ = control.publish_outcome(&id, status, reason, evidence);
+    if let Some(uncertain) = uncertain {
+        // Keep admission closed while a packet is outstanding and after an unknown outcome. Read
+        // the receipt as it stands: late evidence for a fenced `unknown` is not applied, so it must
+        // not reopen transactions either.
+        let settled = control.command(&id).map_or(status, |r| r.status);
+        uncertain.store(!matches!(settled, Status::Confirmed | Status::Refused), Ordering::Release);
+    }
 }
 
 fn load_collision(dir: &std::path::Path, zone: &str) -> Result<(Arc<Collision>, Value), String> {
@@ -1552,6 +1572,42 @@ mod execution_claim_tests {
         .await;
         assert!(!host.transaction_uncertain.load(Ordering::Acquire));
         assert_eq!(host.control.command("buy").unwrap().status, Status::Refused);
+    }
+
+    /// central-6ly1.1 review: a buy fenced to `unknown` keeps transactions blocked even if its
+    /// server receipt arrives later; the receipt is terminal, and so is the uncertainty.
+    #[tokio::test]
+    async fn a_late_receipt_for_a_fenced_buy_keeps_transactions_blocked() {
+        let host = super::tests::host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(&host.control, "buy", json!({"kind":"buy","slot":1,"quantity":1})).await;
+        host.control.drain_actions();
+        host.control.mark_dispatched("buy").unwrap();
+        host.transaction_uncertain.store(true, Ordering::Release);
+        host.control.set_ready(false); // fence: dispatched, so unknown
+        assert_eq!(host.control.command("buy").unwrap().status, Status::Unknown);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(ipc::CommandResult::Resolved(json!({"late":true}))).unwrap();
+        complete_await(host.control.clone(), "buy".into(), rx, "server_buy_receipt",
+            Some(host.transaction_uncertain.clone())).await;
+        assert_eq!(host.control.command("buy").unwrap().status, Status::Unknown);
+        assert!(host.transaction_uncertain.load(Ordering::Acquire), "transactions stay blocked");
+    }
+
+    /// central-6ly1.1 review: game events and self echoes evicted from their bounded source queues
+    /// before the host saw them are reported.
+    #[test]
+    fn evicted_source_events_are_reported() {
+        let mut host = super::tests::host();
+        host.control = Control::new("test-session".into(), "test-credential".into(), 16, 1000).unwrap();
+        let mut gs = GameState::new();
+        for _ in 0..205 {
+            gs.push_event("chat", "say", "someone", false, "hello");
+        }
+        host.update_knowledge(&gs);
+        let events = host.control.events_after_for_test(0);
+        assert_eq!(events[0], json!({"kind":"source_events_dropped","source":"game_event","count":5}));
     }
 }
 

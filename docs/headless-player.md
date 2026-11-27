@@ -78,8 +78,13 @@ A command ID is never reusable in a session, including an ID refused at admissio
   `session_id_space_exhausted`. `stop` and `attack_off` each keep a reserve of 1024 more, then get
   503 `safety_reserve_exhausted`.
 - A 503 consumes no identity, so the same ID can be retried.
-- A refusal at admission returns 409 with the receipt and `"admitted": false`. A malformed body is
-  422 `invalid_command_payload` and consumes nothing.
+- A refusal at admission returns 409 with the receipt and `"admitted": false`.
+- A malformed body consumes nothing and returns 422 `invalid_command_payload`. That covers a body
+  that is not JSON, a payload of the wrong shape, and a unit operation such as `stop` with extra
+  fields.
+- At most 64 receipts may be live (non-terminal) at once. Past that, ordinary commands get 503
+  `live_command_limit`; `stop` and `attack_off` are still admitted.
+- Payloads compare as JSON values, the same way before and after eviction.
 
 Do not retry an uncertain transaction under a new ID.
 
@@ -201,6 +206,9 @@ port is bound; every
 state's `event_cursor` verbatim. Gaps are explicit; reread state and outstanding commands after one.
 Each event is `{cursor, at_ms, event}`, and the buffer keeps the newest 32 768. State publication is
 not an event, so an idle long-poll waits its full timeout. Read state with `GET /v2/player/state`.
+State's `clock_ms` is read when the state is read, so no `*_at_ms` is newer than it. If the host's
+bounded source queues (200 game events, 32 self echoes) dropped anything before it was forwarded,
+the host publishes `source_events_dropped` with `source` and `count`.
 Received chat (including NPC say) carries packet provenance; other game events are labeled client events.
 Outbound local messages are not receipt evidence. `received_self_echo` records a server-returned
 self message with channel/sender/text and `recipient_delivery_confirmed:false`; it does not confirm

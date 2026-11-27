@@ -198,11 +198,21 @@ pub struct EventBatch {
 }
 
 struct Entry {
-    request: CommandRequest,
-    // Preserve the JSON numbers before f32 conversion when checking changed retries.
-    identity: Value,
+    /// Kept while the command is live; dropped once terminal, so retained receipts hold no input.
+    request: Option<CommandRequest>,
+    /// Digest of the canonical JSON payload, taken before f32 conversion, so a changed retry is
+    /// caught the same way whether the receipt is retained or already evicted.
+    payload: [u8; 16],
     receipt: CommandReceipt,
     dispatched: bool,
+    /// The newest event cursor right after this command's admission event, for replays.
+    event_cursor: String,
+}
+
+impl Entry {
+    fn is_priority(&self) -> bool {
+        self.request.as_ref().is_some_and(|r| r.operation.is_priority())
+    }
 }
 
 /// An evicted receipt keeps only enough to answer a replay: its identity never becomes reusable.
@@ -378,6 +388,8 @@ impl Control {
         object.insert("zone_epoch".into(), json!(journal.zone_epoch));
         object.insert("revision".into(), json!(journal.revision));
         object.insert("event_cursor".into(), json!(self.cursor(journal.sequence)));
+        // The clock at read time, so no `*_at_ms` in a receipt or event can be newer than it.
+        object.insert("clock_ms".into(), json!(self.now_ms()));
         state
     }
 
@@ -390,9 +402,10 @@ impl Control {
         ids.into_iter()
             .filter_map(|id| {
                 let entry = journal.entries.get(&id)?;
+                let request = entry.request.clone()?;
                 (entry.receipt.status == CommandStatus::Accepted).then(|| AdmittedCommand {
                     id,
-                    request: entry.request.clone(),
+                    request,
                 })
             })
             .collect()
@@ -434,8 +447,8 @@ impl Control {
         {
             return Err("refused/unknown outcomes require a reason".into());
         }
-        let now_ms = self.now_ms();
         let mut journal = self.shared.journal.lock().unwrap();
+        let now_ms = self.now_ms();
         let entry = journal.entries.get_mut(id).ok_or("unknown command id")?;
         let previous = entry.receipt.status;
         if previous == status && entry.receipt.reason == reason && entry.receipt.evidence == evidence {
@@ -499,12 +512,15 @@ impl Control {
     fn retire_locked(&self, journal: &mut Journal, id: &str) {
         if journal.live.remove(id) {
             journal.retained.push_back(id.to_owned());
+            if let Some(entry) = journal.entries.get_mut(id) {
+                entry.request = None;
+            }
         }
         while journal.retained.len() > self.shared.retain_capacity {
             let Some(old) = journal.retained.pop_front() else { break };
             if let Some(entry) = journal.entries.remove(&old) {
                 journal.tombstones.insert(digest(old.as_bytes()), Tombstone {
-                    payload: digest(entry.identity.to_string().as_bytes()),
+                    payload: entry.payload,
                     status: entry.receipt.status,
                     reason: entry.receipt.reason,
                 });
@@ -565,7 +581,7 @@ impl Control {
     /// PUT processing in the frozen order of design A3: validate the ID, answer a known ID, run
     /// the capacity checks (a 503 consumes nothing), then write the identity, its outcome and the
     /// receipt event in one step under the journal lock.
-    fn admit(&self, id: String, identity: Value) -> Result<(StatusCode, CommandReceipt), ApiError> {
+    fn admit(&self, id: String, identity: Value) -> Result<(StatusCode, CommandReceipt, String), ApiError> {
         if id.is_empty()
             || id.len() > 128
             || !id
@@ -574,21 +590,32 @@ impl Control {
         {
             return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_command_id".into(), None));
         }
-        let now_ms = self.now_ms();
+        let payload = digest(canonical(&identity).as_bytes());
         let mut journal = self.shared.journal.lock().unwrap();
+        let now_ms = self.now_ms();
         if let Some(existing) = journal.entries.get(&id) {
-            return if existing.identity == identity {
-                Ok((StatusCode::OK, existing.receipt.clone()))
+            return if existing.payload == payload {
+                Ok((StatusCode::OK, existing.receipt.clone(), existing.event_cursor.clone()))
             } else {
                 Err(changed_payload())
             };
         }
         if let Some(tomb) = journal.tombstones.get(&digest(id.as_bytes())) {
-            return if tomb.payload == digest(identity.to_string().as_bytes()) {
+            return if tomb.payload == payload {
                 Err(expired(tomb))
             } else {
                 Err(changed_payload())
             };
+        }
+        // Unit operations carry nothing but their kind; an internally tagged enum would ignore
+        // extra fields there, so they are checked here (`deny_unknown_fields` covers the rest).
+        let unit_with_extras = identity["operation"].as_object().is_some_and(|op| {
+            matches!(op.get("kind").and_then(Value::as_str),
+                Some("stop" | "attack_off" | "sit" | "stand" | "merchant_close" | "camp"))
+                && op.len() != 1
+        });
+        if unit_with_extras {
+            return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid_command_payload".into(), None));
         }
         let request: CommandRequest = serde_json::from_value(identity.clone()).map_err(|_| {
             ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid_command_payload".into(), None)
@@ -607,12 +634,8 @@ impl Control {
                 return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "safety_reserve_exhausted".into(), None));
             }
         }
-        let live_ordinary = journal
-            .live
-            .iter()
-            .filter(|live| journal.entries.get(*live).is_some_and(|e| !e.request.operation.is_priority()))
-            .count();
-        if !safety && live_ordinary >= LIVE_LIMIT {
+        // Every live receipt counts toward the limit; only safety commands are exempt from it.
+        if !safety && journal.live.len() >= LIVE_LIMIT {
             return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "live_command_limit".into(), None));
         }
         // From here the identity is consumed, whatever the outcome.
@@ -635,9 +658,7 @@ impl Control {
             Some("not_ready".to_owned())
         } else if !safety
             && journal.live.iter().any(|live| {
-                journal.entries.get(live).is_some_and(|e| {
-                    !e.request.operation.is_priority() && e.receipt.status.busy()
-                })
+                journal.entries.get(live).is_some_and(|e| !e.is_priority() && e.receipt.status.busy())
             })
         {
             Some("busy".to_owned())
@@ -668,8 +689,9 @@ impl Control {
                 live.sort();
                 for live_id in live {
                     let Some(entry) = journal.entries.get_mut(&live_id) else { continue };
+                    let Some(live_request) = entry.request.as_ref() else { continue };
                     let cancel = matches!(
-                        (&request.operation, &entry.request.operation),
+                        (&request.operation, &live_request.operation),
                         (Operation::Stop, Operation::MoveFor { .. })
                             | (Operation::AttackOff, Operation::Attack { .. })
                     );
@@ -701,17 +723,21 @@ impl Control {
             id.clone(),
             Entry {
                 dispatched: false,
-                request,
-                identity,
+                request: Some(request),
+                payload,
                 receipt: receipt.clone(),
+                event_cursor: String::new(),
             },
         );
+        let cursor = self.event_locked(&mut journal, json!({"kind":"command","command":receipt}));
+        if let Some(entry) = journal.entries.get_mut(&id) {
+            entry.event_cursor = cursor.clone();
+        }
         if status != CommandStatus::Accepted {
             // Terminal at birth: straight into the eviction queue, never live.
             journal.live.insert(id.clone());
             self.retire_locked(&mut journal, &id);
         }
-        self.event_locked(&mut journal, json!({"kind":"command","command":receipt}));
         Ok((
             if status == CommandStatus::Accepted {
                 StatusCode::ACCEPTED
@@ -719,12 +745,8 @@ impl Control {
                 StatusCode::CONFLICT
             },
             receipt,
+            cursor,
         ))
-    }
-
-    /// The newest event cursor, as returned beside a PUT so a wait can start after it.
-    fn current_cursor(&self) -> String {
-        self.cursor(self.shared.journal.lock().unwrap().sequence)
     }
 
     fn event_batch(&self, after: u64) -> Result<EventBatch, ApiError> {
@@ -747,6 +769,21 @@ impl Control {
             gap,
         })
     }
+}
+
+/// The payload as compared for a retry: serialized JSON (keys are sorted, since `serde_json` is
+/// built without `preserve_order`) with `-0.0` written as `0`, the one value JSON equality and
+/// text equality disagree on.
+fn canonical(value: &Value) -> String {
+    fn norm(v: &Value) -> Value {
+        match v {
+            Value::Number(n) if n.as_f64() == Some(0.0) && n.is_f64() => json!(0.0),
+            Value::Array(a) => Value::Array(a.iter().map(norm).collect()),
+            Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), norm(v))).collect()),
+            other => other.clone(),
+        }
+    }
+    norm(value).to_string()
 }
 
 /// First 16 bytes of SHA-256: identities and payloads of evicted commands, compared on replay.
@@ -820,11 +857,15 @@ async fn get_command(
 async fn put_command(
     State(control): State<Control>,
     Path(id): Path<String>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let (code, receipt) = control.admit(id, body)?;
+    // A body that is not JSON is the same 422 as a payload of the wrong shape.
+    let Json(body) = body.map_err(|_| {
+        ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid_command_payload".into(), None)
+    })?;
+    let (code, receipt, cursor) = control.admit(id, body)?;
     let mut value = serde_json::to_value(receipt).unwrap();
-    value["event_cursor"] = json!(control.current_cursor());
+    value["event_cursor"] = json!(cursor);
     Ok((code, Json(value)))
 }
 
@@ -861,8 +902,18 @@ async fn get_events(
     if !batch.events.is_empty() || batch.gap || wait == 0.0 {
         return Ok(Json(batch));
     }
-    let _ = tokio::time::timeout(Duration::from_secs_f64(wait), changed.changed()).await;
-    Ok(Json(control.event_batch(after)?))
+    // Recheck after every wake until events arrive or the original deadline passes, so a wake
+    // that brought no event cannot end the poll early.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(wait);
+    loop {
+        if tokio::time::timeout_at(deadline, changed.changed()).await.is_err() {
+            return Ok(Json(control.event_batch(after)?));
+        }
+        let batch = control.event_batch(after)?;
+        if !batch.events.is_empty() || batch.gap {
+            return Ok(Json(batch));
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -881,15 +932,12 @@ async fn get_packets(
 ) -> Result<Json<Value>, ApiError> {
     let limit = query.limit.unwrap_or(500);
     if !(1..=2000).contains(&limit) {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "limit_must_be_between_1_and_2000".into(),
-        ));
+        return Err(ApiError(StatusCode::BAD_REQUEST, "limit_must_be_between_1_and_2000".into(), None));
     }
     let raw = match query.raw {
         None | Some(0) => false,
         Some(1) => true,
-        Some(_) => return Err(ApiError(StatusCode::BAD_REQUEST, "raw_must_be_0_or_1".into())),
+        Some(_) => return Err(ApiError(StatusCode::BAD_REQUEST, "raw_must_be_0_or_1".into(), None)),
     };
     let mut page = control.packet_trace.page(
         query.after.unwrap_or(0),
