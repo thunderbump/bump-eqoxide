@@ -1255,7 +1255,12 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         // the WASD override / lerp), so they don't jerk the character. Only surface + count GENUINE
         // corrections (anti-cheat snaps, wall clips, teleports), which are much larger.
         const CORRECTION_SQ: f32 = 144.0; // 12u — above normal movement jitter, below real rubber-bands
-        if dx * dx + dy * dy > CORRECTION_SQ {
+        let corrected = dx * dx + dy * dy > CORRECTION_SQ;
+        let now = std::time::Instant::now();
+        if corrected {
+            gs.last_server_correction = Some(eqoxide_core::game_state::ServerCorrection {
+                from: [gs.player_x, gs.player_y, gs.player_z], to: [upd.x, upd.y, z_foot], at: now,
+            });
             tracing::info!("SERVER_CORRECT: player pos ({:.1},{:.1},{:.1}) → ({:.1},{:.1},{:.1}) delta ({:.1},{:.1},{:.1})",
                       gs.player_x, gs.player_y, gs.player_z, upd.x, upd.y, upd.z, dx, dy, dz);
             gs.log_msg("zone", &format!("Server corrected position by ({:.0},{:.0},{:.0})", dx, dy, dz));
@@ -1274,6 +1279,13 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
 
         // Keep the player's heading live from real server position updates.
         gs.player_heading = upd.heading;
+        use eqoxide_core::game_state::{ServerPositionSource, ServerSelfPosition};
+        gs.server_self_position = Some(ServerSelfPosition {
+            pos: [upd.x, upd.y, z_foot],
+            heading: upd.heading,
+            source: if corrected { ServerPositionSource::Correction } else { ServerPositionSource::Update },
+            at: now,
+        });
     } else if let Some(e) = gs.world.entities.get_mut(&sid) {
         e.x = upd.x;
         e.y = upd.y;
@@ -2098,6 +2110,25 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     };
     tracing::info!("EQ: combat: {msg}");
     gs.log_msg("combat", &msg);
+    // central-6ly1.8: the same packet, structured, so a caller need not parse the text above.
+    gs.next_combat_id += 1;
+    gs.combat_records.push_back(eqoxide_core::game_state::CombatRecord {
+        id: gs.next_combat_id,
+        source_id,
+        target_id,
+        amount: damage.max(0),
+        spell_id: (spellid != 0 && spellid != SPELL_UNKNOWN).then_some(spellid),
+        skill: payload[4],
+        result: if spellid != 0 && spellid != SPELL_UNKNOWN && damage <= 0 {
+            eqoxide_core::game_state::CombatResult::Landed
+        } else {
+            eqoxide_core::game_state::CombatResult::from_wire(damage)
+        },
+        at: std::time::Instant::now(),
+    });
+    while gs.combat_records.len() > eqoxide_core::game_state::COMBAT_RECORD_CAP {
+        gs.combat_records.pop_front();
+    }
 
     // #1005: NO local HP arithmetic here. The "optimistic local HP" block that used to sit at this
     // point (eqoxide#55) subtracted `damage`@9 from `gs.cur_hp` and recomputed `hp_pct` from it, to
@@ -4459,6 +4490,39 @@ mod tests {
     }
 
     #[test]
+    fn apply_combat_damage_keeps_a_structured_record_6ly1_8() {
+        use super::apply_combat_damage;
+        use eqoxide_core::game_state::CombatResult;
+        let dmg = |target: u16, source: u16, skill: u8, spell: u32, damage: i32| -> [u8; 13] {
+            let mut b = [0u8; 13];
+            b[0..2].copy_from_slice(&target.to_le_bytes());
+            b[2..4].copy_from_slice(&source.to_le_bytes());
+            b[4] = skill;
+            b[5..9].copy_from_slice(&spell.to_le_bytes());
+            b[9..13].copy_from_slice(&damage.to_le_bytes());
+            b
+        };
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        apply_combat_damage(&mut gs, &dmg(99, 7, 1, 0, 24));
+        apply_combat_damage(&mut gs, &dmg(7, 99, 2, 0, -4));
+        apply_combat_damage(&mut gs, &dmg(99, 7, 0, 13, 0));
+        let r: Vec<_> = gs.combat_records.iter()
+            .map(|r| (r.id, r.source_id, r.target_id, r.amount, r.spell_id, r.skill, r.result)).collect();
+        assert_eq!(r, vec![
+            (1, 7, 99, 24, None, 1, CombatResult::Hit),
+            (2, 99, 7, 0, None, 2, CombatResult::Dodge),
+            (3, 7, 99, 0, Some(13), 0, CombatResult::Landed),
+        ]);
+        for _ in 0..eqoxide_core::game_state::COMBAT_RECORD_CAP {
+            apply_combat_damage(&mut gs, &dmg(99, 7, 1, 0, 1));
+        }
+        assert_eq!(gs.combat_records.len(), eqoxide_core::game_state::COMBAT_RECORD_CAP);
+        assert_eq!(gs.combat_records.back().unwrap().id, 3 + eqoxide_core::game_state::COMBAT_RECORD_CAP as u64,
+            "ids keep counting after eviction");
+    }
+
+    #[test]
     fn apply_combat_damage_formats_hits_misses_and_special_sentinels() {
         // #262: damage>0 = a hit, ==0 = a clean miss (no "(type=N)" leak), <0 = an EQEmu
         // special-outcome sentinel (zone/common.h DMG_*) rendered with native wording — never
@@ -5964,6 +6028,32 @@ mod tests {
     /// the sibling test in `action_loop` sets the field by hand: removing the clear from THIS
     /// handler left that one green (the #660 NB1 bug class, in the fix for #660 NB1). A hand-set
     /// field proves the type works; only the handler proves the client does.
+    /// central-6ly1.8: a self update records where the server put us, and whether it was a
+    /// correction, in the foot datum; another spawn's update records nothing.
+    #[test]
+    fn a_self_position_update_records_the_server_position_6ly1_8() {
+        use super::apply_position_update;
+        use crate::protocol::encode_position_update;
+        use eqoxide_core::game_state::ServerPositionSource;
+        let off = eqoxide_core::coord::WIRE_Z_OFFSET;
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        apply_position_update(&mut gs, &encode_position_update(2, 10.0, 20.0, 30.0, 0.0));
+        assert!(gs.server_self_position.is_none());
+
+        apply_position_update(&mut gs, &encode_position_update(1, 5.0, 0.0, 10.0 + off, 0.0));
+        let p = gs.server_self_position.expect("recorded");
+        assert_eq!(p.pos, [5.0, 0.0, 10.0]);
+        assert_eq!(p.source, ServerPositionSource::Update, "within 12u of the origin start");
+        assert!(gs.last_server_correction.is_none());
+
+        apply_position_update(&mut gs, &encode_position_update(1, 105.0, 0.0, 10.0 + off, 0.0));
+        let p = gs.server_self_position.expect("recorded");
+        assert_eq!(p.source, ServerPositionSource::Correction);
+        let c = gs.last_server_correction.expect("a correction is recorded");
+        assert_eq!((c.from, c.to), ([5.0, 0.0, 10.0], [105.0, 0.0, 10.0]));
+    }
+
     #[test]
     fn a_server_position_update_clears_the_provisional_crossing_marker_543() {
         use super::apply_position_update;
