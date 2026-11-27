@@ -2002,6 +2002,7 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
         gs.killed_by = gs.world.entities.get(&killer_id).map(|e| e.name.clone())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| "something".to_string());
+        gs.killer_id = (killer_id != 0).then_some(killer_id);
         gs.died_at   = Some(std::time::Instant::now());
         gs.hp_pct    = 0.0;
         gs.player_dead = true; // dead pose (eqoxide#61)

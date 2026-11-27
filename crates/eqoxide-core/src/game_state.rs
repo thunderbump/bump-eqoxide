@@ -1822,6 +1822,9 @@ pub struct GameState {
     /// happened. Unlike `player_dead_since` these PERSIST past the respawn so `/v1/observe/debug`
     /// can report a recent death (dead / killed_by / died_ago_secs) even after reviving. (#284)
     pub killed_by: String,
+    /// The killer's spawn ID from the death packet, kept when its name is unknown (central-6ly1.8).
+    /// `None` until a death, and when the packet named spawn 0.
+    pub killer_id: Option<u32>,
     pub died_at: Option<std::time::Instant>,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
@@ -4568,7 +4571,7 @@ pub(crate) mod tests {
             xp_pct: _,
             coin: _, coin_confirmed: _, unverified_buys: _,
             // Death record: `last_cast`-shaped — a true record of something that already happened.
-            player_dead: _, player_dead_since: _, killed_by: _, died_at: _, last_cast: _,
+            player_dead: _, player_dead_since: _, killed_by: _, killer_id: _, died_at: _, last_cast: _,
             // Group/guild/social: keyed by NAME, and a group follows the player across a zone line.
             group_members: _, group_leader: _, pending_invite: _,
             guild_names: _, guild_members: _, pending_guild_invite: _, who_roster: _,

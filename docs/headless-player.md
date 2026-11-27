@@ -108,9 +108,34 @@ process provides no exactly-once guarantee across a crash.
 
 State contains one published revision, native geometry digest, network tick/inbound/link ages,
 predicted feet position, vitals, inventory and catalog revisions. The roster is received knowledge
-within 500 units, sorted by spawn ID and capped at 256. `complete:false` discloses that it is not
-an authoritative world roster; truncation is separate. LOS is a local static native-map query.
-Unknown instance ID is null. Inventory includes local prediction and does not prove a save.
+within 500 units of the predicted position, nearest first (ties by spawn ID) and capped at 256.
+Each entity carries `distance` from that position, `heading` and the nine `equipment` material IDs
+as received. Every range check on a command uses the same predicted position and distance.
+`complete:false` discloses that it is not an authoritative world roster; truncation is separate.
+LOS is a local static native-map query. Unknown instance ID is null. Inventory includes local
+prediction and does not prove a save.
+
+Beside the prediction, `self` carries what the server said:
+- `server_position`: the last self position update from the server. Its fields are `position`
+  (feet datum), `heading`, `source` and `at_ms`. `source` is `server_update`, or
+  `server_correction` when the update moved the player more than 12 units. Cleared at zone entry.
+- `corrections`: `count` for the session, and `last` (`from`, `to`, `at_ms`), which is cleared at
+  zone entry.
+- `level`.
+- `mana` and `endurance`, each `{value, max, known}`. `endurance.confirmed` is true once a server
+  update has arrived.
+- `xp`: `{pct}`.
+- `buffs`: `{slot, spell_id, ticks_remaining}`. A negative `ticks_remaining` means permanent.
+- `skills`.
+- `dead`.
+- `killer`: `{id, name}` after a death. `id` comes from the death packet and is kept even when
+  `name` is unknown, in which case `name` is null.
+
+Each received `OP_Damage` is also published as a `combat` event: `source_id`, `target_id`,
+`source_name`, `target_name`, `amount` (the damage on a `hit`, else 0), `spell_id` (null for melee),
+`skill` and `result`. `result` is one of `hit`, `miss`, `block`, `parry`, `riposte`, `dodge`,
+`invulnerable`, `rune`, `landed` (a spell with no positive damage) or `other`. A death of self is
+published once as `died`, with the same `killer`.
 
 ### Self-position updates
 
