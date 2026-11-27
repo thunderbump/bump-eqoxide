@@ -789,11 +789,14 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             .map_err(|_| "system clock before epoch")?
             .as_nanos()
     );
-    let started = Instant::now();
     let wiring = Wiring::new(profile.maps_dir.clone());
+    // 65 536 terminal receipts kept in full, 1 048 576 identities, a 32 768-event buffer (design
+    // A3, A4). The control owns the host clock so every `at_ms`, `clock_ms` and packet `at_ms`
+    // share one origin.
+    let control = Control::new(session, profile.control_token.clone(), 65_536, 32_768)?;
+    let started = control.started();
     let trace = eqoxide_net::packet_telemetry::SessionTrace::new(started);
-    let control = Control::new(session, profile.control_token.clone(), 4096, 2048)?
-        .with_packet_trace(trace.clone());
+    let control = control.with_packet_trace(trace.clone());
     let router = control.router();
     let api = tokio::spawn(async move { axum::serve(listener, router).await });
     println!("API_PORT={}", profile.api_port);

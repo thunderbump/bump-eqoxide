@@ -141,10 +141,12 @@ async fn lost_response_retry_returns_receipt_without_dispatching_or_renewing_mot
             Some(json!({"kind":"physical_controller_armed","deadline_ms":300})),
         )
         .unwrap();
-    let (status, body) = authorized(&control, "PUT", path, Some(movement())).await;
+    let (status, mut body) = authorized(&control, "PUT", path, Some(movement())).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "applied_local");
+    assert!(body["event_cursor"].is_string(), "a PUT reports the cursor after admission");
     assert!(control.drain_actions().is_empty());
+    body.as_object_mut().unwrap().remove("event_cursor");
     assert_eq!(authorized(&control, "GET", path, None).await.1, body);
     let mut changed = movement();
     changed["operation"]["duration_ms"] = json!(301);
@@ -161,51 +163,69 @@ async fn lost_response_retry_returns_receipt_without_dispatching_or_renewing_mot
     );
 }
 
-#[test]
-fn journal_never_evicts_and_has_a_separate_reserve_for_each_safety_verb() {
-    let control = control(1, 20);
-    control.admit("walk".into(), movement()).unwrap();
-    assert_eq!(
+/// central-6ly1.1: terminal receipts are evicted past the retention bound, but an evicted ID is
+/// never reusable: a replay answers 410 with its final status, a changed payload 409.
+#[tokio::test]
+async fn terminal_receipts_are_evicted_but_their_ids_never_return() {
+    let control = control(2, 50);
+    for id in ["a", "b", "c"] {
+        control.admit(id.into(), movement()).unwrap();
+        control.drain_actions();
         control
-            .admit("new".into(), request(json!({"kind":"sit"})))
-            .unwrap_err()
-            .0,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-    control
-        .admit("stop".into(), request(json!({"kind":"stop"})))
-        .unwrap();
-    control
-        .admit("off".into(), request(json!({"kind":"attack_off"})))
-        .unwrap();
-    let actions = control.drain_actions();
-    assert_eq!(
-        actions.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-        vec!["stop", "off"]
-    );
-    assert_eq!(
-        control.command("walk").unwrap().status,
-        CommandStatus::Refused
-    );
-    assert_eq!(
-        control
-            .admit("stop-again".into(), request(json!({"kind":"stop"})))
-            .unwrap_err()
-            .0,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-    assert_eq!(
-        control.admit("walk".into(), movement()).unwrap().1.status,
-        CommandStatus::Refused
-    );
-    assert_eq!(
-        control
-            .admit("off".into(), request(json!({"kind":"attack_off"})))
-            .unwrap()
-            .0,
-        StatusCode::OK
-    );
+            .publish_outcome(id, CommandStatus::AppliedLocal, None, Some(json!({"kind":"controller_intent"})))
+            .unwrap();
+    }
+    assert!(control.command("a").is_none(), "the oldest terminal receipt was evicted");
+    assert!(control.command("c").is_some());
+    let (status, body) = authorized(&control, "GET", "/v2/player/commands/a", None).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body, json!({"error":"command_id_expired","status":"applied_local","reason":null}));
+    let (status, _) = authorized(&control, "PUT", "/v2/player/commands/a", Some(movement())).await;
+    assert_eq!(status, StatusCode::GONE, "a replay of an expired ID never runs again");
     assert!(control.drain_actions().is_empty());
+    let mut changed = movement();
+    changed["operation"]["duration_ms"] = json!(301);
+    let (status, body) = authorized(&control, "PUT", "/v2/player/commands/a", Some(changed)).await;
+    assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("command_id_reused_with_changed_payload")));
+}
+
+/// central-6ly1.1: a refusal at admission consumes an identity but no live slot; once the
+/// identity space is gone a 503 consumes nothing, and each safety verb has its own reserve.
+/// central-6ly1.7: a readiness drop or zone change fences only live receipts; an earlier
+/// `applied_local` stays exactly as it was.
+#[test]
+fn fences_never_rewrite_terminal_receipts() {
+    let control = control(10, 50);
+    control.admit("walk".into(), movement()).unwrap();
+    control.drain_actions();
+    control
+        .publish_outcome("walk", CommandStatus::AppliedLocal, None, Some(json!({"kind":"controller_intent"})))
+        .unwrap();
+    let before = control.command("walk").unwrap();
+    control.set_ready(false);
+    control.publish_state(5, json!({})).unwrap();
+    assert_eq!(control.command("walk").unwrap(), before);
+}
+
+#[test]
+fn identity_space_and_safety_reserves() {
+    let control = control(2, 500); // 32 identities, a reserve of one per safety verb
+    for n in 0..32 {
+        let mut stale = movement();
+        stale["session"] = json!("someone-else");
+        let (code, receipt) = control.admit(format!("r{n}"), stale).unwrap();
+        assert_eq!((code, receipt.reason.as_deref(), receipt.admitted), (StatusCode::CONFLICT, Some("stale_session"), Some(false)));
+    }
+    let full = control.admit("next".into(), movement()).unwrap_err();
+    assert_eq!((full.0, full.1.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "session_id_space_exhausted"));
+    let again = control.admit("next".into(), movement()).unwrap_err();
+    assert_eq!(again.0, StatusCode::SERVICE_UNAVAILABLE, "the 503 consumed no identity");
+    assert_eq!(control.admit("stop".into(), request(json!({"kind":"stop"}))).unwrap().0, StatusCode::ACCEPTED);
+    assert_eq!(control.admit("off".into(), request(json!({"kind":"attack_off"}))).unwrap().0, StatusCode::ACCEPTED);
+    let spent = control.admit("stop-2".into(), request(json!({"kind":"stop"}))).unwrap_err();
+    assert_eq!((spent.0, spent.1.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "safety_reserve_exhausted"));
+    assert_eq!(control.admit("stop".into(), request(json!({"kind":"stop"}))).unwrap().0, StatusCode::OK,
+        "a known ID is still answered when every limit is reached");
 }
 
 #[test]
@@ -390,26 +410,15 @@ fn outcomes_require_evidence_and_cannot_invent_or_regress_success() {
             Some(json!({"kind":"queue_accepted"}))
         )
         .is_err());
-    control
-        .publish_outcome(
-            "move",
-            CommandStatus::Unknown,
-            Some("connection_lost".into()),
-            None,
-        )
-        .unwrap();
-    // Late genuine server evidence can reconcile uncertainty.
-    control
-        .publish_outcome(
-            "move",
-            CommandStatus::Confirmed,
-            None,
-            Some(json!({"kind":"server_position_update"})),
-        )
-        .unwrap();
+    // A terminal receipt never changes (central-6ly1.7): not to unknown, not to confirmed.
     assert!(control
-        .publish_outcome("move", CommandStatus::Unknown, Some("timeout".into()), None)
+        .publish_outcome("move", CommandStatus::Unknown, Some("connection_lost".into()), None)
         .is_err());
+    assert!(control
+        .publish_outcome("move", CommandStatus::Confirmed, None, Some(json!({"kind":"server_position_update"})))
+        .is_err());
+    let receipt = control.command("move").unwrap();
+    assert_eq!((receipt.status, receipt.terminal), (CommandStatus::AppliedLocal, true));
 }
 
 #[test]
@@ -489,6 +498,7 @@ fn revision_fences_are_preserved_for_host_admission_and_command_identity() {
 #[tokio::test]
 async fn event_gaps_and_process_identity_are_explicit() {
     let control = control(10, 2);
+    control.publish_event(json!({"kind":"chat","text":"zeroth"}));
     control.publish_event(json!({"kind":"chat","text":"first"}));
     control.publish_event(json!({"kind":"chat","text":"second"}));
     let (status, batch) =
@@ -498,6 +508,7 @@ async fn event_gaps_and_process_identity_are_explicit() {
     assert_eq!(batch["events"].as_array().unwrap().len(), 2);
     assert_eq!(batch["cursor"], "session-1:3");
     assert_eq!(batch["events"][0]["event"]["text"], "first");
+    assert!(batch["events"][0]["at_ms"].is_u64(), "each event carries the host clock");
     let state = authorized(&control, "GET", "/v2/player/state", None)
         .await
         .1;
@@ -521,14 +532,27 @@ async fn event_gaps_and_process_identity_are_explicit() {
 }
 
 #[tokio::test]
-async fn long_poll_wakes_for_publication_and_returns_empty_on_timeout() {
+async fn long_poll_ignores_state_publication_and_wakes_for_events() {
     let control = control(10, 10);
+    // central-6ly1.1: state publication is not an event. An idle poll waits its full timeout.
+    let started = std::time::Instant::now();
+    let idle = control.clone();
+    let task = tokio::spawn(async move {
+        authorized(&idle, "GET", "/v2/player/events?after=session-1:0&wait=0.3", None).await
+    });
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        control.publish_state(4, json!({"phase":"ready"})).unwrap();
+    }
+    let (_, batch) = task.await.unwrap();
+    assert!(batch["events"].as_array().unwrap().is_empty(), "no state_changed events");
+    assert!(started.elapsed() >= Duration::from_millis(300), "the poll waited its full timeout");
     let waiting = control.clone();
     let task = tokio::spawn(async move {
         authorized(
             &waiting,
             "GET",
-            "/v2/player/events?after=session-1:1&wait=1",
+            "/v2/player/events?after=session-1:0&wait=1",
             None,
         )
         .await
@@ -544,12 +568,12 @@ async fn long_poll_wakes_for_publication_and_returns_empty_on_timeout() {
     let (_, batch) = authorized(
         &control,
         "GET",
-        "/v2/player/events?after=session-1:2&wait=0.001",
+        "/v2/player/events?after=session-1:1&wait=0.001",
         None,
     )
     .await;
     assert!(batch["events"].as_array().unwrap().is_empty());
-    assert_eq!(batch["cursor"], "session-1:2");
+    assert_eq!(batch["cursor"], "session-1:1");
 }
 
 #[tokio::test]
@@ -575,7 +599,7 @@ async fn simultaneous_same_id_admission_enqueues_once() {
 }
 
 #[tokio::test]
-async fn fence_after_dispatch_is_unknown_and_accepts_a_late_server_receipt() {
+async fn fence_after_dispatch_is_unknown_and_a_late_receipt_cannot_change_it() {
     let control = control(8, 16);
     let body = request(json!({"kind":"buy","slot":1,"quantity":1}));
     let (_, receipt) = authorized(&control, "PUT", "/v2/player/commands/buy-1", Some(body)).await;
@@ -587,17 +611,18 @@ async fn fence_after_dispatch_is_unknown_and_accepts_a_late_server_receipt() {
         control.command("buy-1").unwrap().status,
         CommandStatus::Unknown
     );
-    control
+    // central-6ly1.7: the fenced receipt is terminal; late evidence cannot rewrite it.
+    assert!(control
         .publish_outcome(
             "buy-1",
             CommandStatus::Confirmed,
             None,
             Some(json!({"kind":"server_buy_receipt"})),
         )
-        .unwrap();
+        .is_err());
     assert_eq!(
         control.command("buy-1").unwrap().status,
-        CommandStatus::Confirmed
+        CommandStatus::Unknown
     );
 }
 

@@ -12,8 +12,9 @@ use axum::{
 use eqoxide_net::packet_telemetry::SessionTrace;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -149,16 +150,30 @@ impl CommandStatus {
     fn busy(self) -> bool {
         matches!(self, Self::Accepted | Self::Sent)
     }
+    /// A terminal receipt is never rewritten (central-6ly1.7, design A2.2).
+    pub fn terminal(self) -> bool {
+        !self.busy()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct CommandReceipt {
     pub id: String,
     pub status: CommandStatus,
+    pub terminal: bool,
+    /// Always a snake_case code for `refused` and `unknown`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Prose for a human, beside the code. Never matched by scripts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Value>,
+    pub accepted_at_ms: u64,
+    pub updated_at_ms: u64,
+    /// `false` on a refusal at admission: it took no live slot. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admitted: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +185,8 @@ pub struct AdmittedCommand {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerEvent {
     pub cursor: String,
+    /// Host clock (`clock_ms` in state) when the event was published.
+    pub at_ms: u64,
     pub event: Value,
 }
 
@@ -188,31 +205,53 @@ struct Entry {
     dispatched: bool,
 }
 
+/// An evicted receipt keeps only enough to answer a replay: its identity never becomes reusable.
+struct Tombstone {
+    payload: [u8; 16],
+    status: CommandStatus,
+    reason: Option<String>,
+}
+
 struct Journal {
     zone_epoch: u64,
     ready: bool,
     revision: u64,
     state: Value,
     entries: HashMap<String, Entry>,
-    ordinary_count: usize,
-    stop_reserve: bool,
-    attack_off_reserve: bool,
+    /// Non-terminal entries. Bounded by `LIVE_LIMIT` for ordinary work.
+    live: HashSet<String>,
+    /// Terminal entries in the order they became terminal; the front is evicted first.
+    retained: VecDeque<String>,
+    tombstones: HashMap<[u8; 16], Tombstone>,
+    /// Identities issued from the ordinary space, and from each safety verb's reserve.
+    identities: usize,
+    stop_reserve_used: usize,
+    attack_off_reserve_used: usize,
     priority: VecDeque<String>,
     ordinary: VecDeque<String>,
     sequence: u64,
     events: VecDeque<(u64, PlayerEvent)>,
 }
 
+/// At most this many ordinary commands may be non-terminal at once (design A3).
+const LIVE_LIMIT: usize = 64;
+
 struct Shared {
     session: String,
     authorization: String,
-    capacity: usize,
+    /// Full receipts kept after they become terminal. Identities: sixteen times this. Each
+    /// safety verb's reserve past the identity limit: one sixty-fourth of it, at least one.
+    retain_capacity: usize,
+    identity_capacity: usize,
+    safety_reserve: usize,
     event_capacity: usize,
+    started: Instant,
     journal: Mutex<Journal>,
     changed: watch::Sender<u64>,
 }
 
-/// Clones share one journal and one action queue. Command identities are never evicted.
+/// Clones share one journal and one action queue. A command ID is never reusable in a session:
+/// terminal receipts are evicted beyond `retain_capacity`, but their identity is kept.
 #[derive(Clone)]
 pub struct Control {
     shared: Arc<Shared>,
@@ -220,7 +259,7 @@ pub struct Control {
 }
 
 impl Control {
-    /// Capacity counts ordinary journal entries, plus one reserved entry per safety verb.
+    /// `journal_capacity` is the number of terminal receipts kept in full (design A3).
     /// A new process must receive a new session identity, even for the same character.
     pub fn new(
         session: String,
@@ -250,8 +289,11 @@ impl Control {
             shared: Arc::new(Shared {
                 session,
                 authorization: format!("Bearer {credential}"),
-                capacity: journal_capacity,
+                retain_capacity: journal_capacity,
+                identity_capacity: journal_capacity.saturating_mul(16),
+                safety_reserve: (journal_capacity / 64).max(1),
                 event_capacity,
+                started: Instant::now(),
                 changed,
                 journal: Mutex::new(Journal {
                     zone_epoch: 0,
@@ -259,9 +301,12 @@ impl Control {
                     revision: 0,
                     state: json!({"phase":"starting"}),
                     entries: HashMap::new(),
-                    ordinary_count: 0,
-                    stop_reserve: false,
-                    attack_off_reserve: false,
+                    live: HashSet::new(),
+                    retained: VecDeque::new(),
+                    tombstones: HashMap::new(),
+                    identities: 0,
+                    stop_reserve_used: 0,
+                    attack_off_reserve_used: 0,
                     priority: VecDeque::new(),
                     ordinary: VecDeque::new(),
                     sequence: 0,
@@ -287,8 +332,18 @@ impl Control {
             .with_state(self.clone())
     }
 
+    /// The host clock origin. State's `clock_ms` and every `at_ms` are measured from this.
+    pub fn started(&self) -> Instant {
+        self.shared.started
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.shared.started.elapsed().as_millis() as u64
+    }
+
     /// Publication replaces client knowledge atomically. The host supplies field provenance.
     /// Changing epoch fences queued/in-flight commands; the host must also stop physical actions.
+    /// A publication is not an event: it never wakes an event long-poll (central-6ly1.1).
     pub fn publish_state(&self, zone_epoch: u64, state: Value) -> Result<(), String> {
         if !state.is_object() {
             return Err("state must be a JSON object".into());
@@ -303,11 +358,6 @@ impl Control {
         }
         journal.state = state;
         journal.revision += 1;
-        let revision = journal.revision;
-        self.event_locked(
-            &mut journal,
-            json!({"kind":"state_changed","revision":revision}),
-        );
         Ok(())
     }
 
@@ -384,39 +434,31 @@ impl Control {
         {
             return Err("refused/unknown outcomes require a reason".into());
         }
+        let now_ms = self.now_ms();
         let mut journal = self.shared.journal.lock().unwrap();
         let entry = journal.entries.get_mut(id).ok_or("unknown command id")?;
         let previous = entry.receipt.status;
-        let next = CommandReceipt {
-            id: id.into(),
-            status,
-            reason,
-            evidence,
-        };
-        if entry.receipt == next {
-            return Ok(next);
+        if previous == status && entry.receipt.reason == reason && entry.receipt.evidence == evidence {
+            return Ok(entry.receipt.clone());
         }
+        // A terminal receipt never changes (design A2.2): only `accepted` and `sent` move on.
         let allowed = match previous {
             CommandStatus::Accepted => status != CommandStatus::Accepted,
-            CommandStatus::Sent => matches!(
-                status,
-                CommandStatus::AppliedLocal
-                    | CommandStatus::Confirmed
-                    | CommandStatus::Refused
-                    | CommandStatus::Unknown
-            ),
-            CommandStatus::AppliedLocal => {
-                matches!(status, CommandStatus::Confirmed | CommandStatus::Unknown)
-            }
-            CommandStatus::Unknown => {
-                matches!(status, CommandStatus::Confirmed | CommandStatus::Refused)
-            }
-            CommandStatus::Confirmed | CommandStatus::Refused => false,
+            CommandStatus::Sent => status != CommandStatus::Accepted,
+            _ => false,
         };
         if !allowed {
             return Err("invalid command status transition".into());
         }
-        entry.receipt = next.clone();
+        entry.receipt.status = status;
+        entry.receipt.terminal = status.terminal();
+        entry.receipt.reason = reason;
+        entry.receipt.evidence = evidence;
+        entry.receipt.updated_at_ms = now_ms;
+        let next = entry.receipt.clone();
+        if next.terminal {
+            self.retire_locked(&mut journal, id);
+        }
         self.event_locked(&mut journal, json!({"kind":"command","command":next}));
         Ok(next)
     }
@@ -442,6 +484,34 @@ impl Control {
         self.event_batch(after).unwrap().events.into_iter().map(|e| e.event).collect()
     }
 
+    fn lookup(&self, id: &str) -> Result<CommandReceipt, ApiError> {
+        let journal = self.shared.journal.lock().unwrap();
+        if let Some(entry) = journal.entries.get(id) {
+            return Ok(entry.receipt.clone());
+        }
+        match journal.tombstones.get(&digest(id.as_bytes())) {
+            Some(tomb) => Err(expired(tomb)),
+            None => Err(ApiError(StatusCode::NOT_FOUND, "unknown_command_id".into(), None)),
+        }
+    }
+
+    /// A receipt just became terminal: it leaves the live set and joins the eviction queue.
+    fn retire_locked(&self, journal: &mut Journal, id: &str) {
+        if journal.live.remove(id) {
+            journal.retained.push_back(id.to_owned());
+        }
+        while journal.retained.len() > self.shared.retain_capacity {
+            let Some(old) = journal.retained.pop_front() else { break };
+            if let Some(entry) = journal.entries.remove(&old) {
+                journal.tombstones.insert(digest(old.as_bytes()), Tombstone {
+                    payload: digest(entry.identity.to_string().as_bytes()),
+                    status: entry.receipt.status,
+                    reason: entry.receipt.reason,
+                });
+            }
+        }
+    }
+
     fn cursor(&self, sequence: u64) -> String {
         format!("{}:{sequence}", self.shared.session)
     }
@@ -449,10 +519,12 @@ impl Control {
     fn event_locked(&self, journal: &mut Journal, event: Value) -> String {
         journal.sequence += 1;
         let cursor = self.cursor(journal.sequence);
+        let at_ms = self.now_ms();
         journal.events.push_back((
             journal.sequence,
             PlayerEvent {
                 cursor: cursor.clone(),
+                at_ms,
                 event,
             },
         ));
@@ -463,31 +535,36 @@ impl Control {
         cursor
     }
 
+    /// Fences touch only non-terminal receipts (design A2.2). Never-dispatched work is refused;
+    /// dispatched work is unknown.
     fn fence_locked(&self, journal: &mut Journal, reason: &str) {
         journal.priority.clear();
         journal.ordinary.clear();
+        let now_ms = self.now_ms();
+        let mut live: Vec<String> = journal.live.iter().cloned().collect();
+        live.sort();
         let mut changes = Vec::new();
-        for entry in journal.entries.values_mut() {
-            if entry.receipt.status.busy() || entry.receipt.status == CommandStatus::AppliedLocal {
-                entry.receipt.status = if entry.receipt.status == CommandStatus::Accepted {
-                    if entry.dispatched {
-                        CommandStatus::Unknown
-                    } else {
-                        CommandStatus::Refused
-                    }
-                } else {
-                    CommandStatus::Unknown
-                };
-                entry.receipt.reason = Some(reason.into());
-                changes.push(entry.receipt.clone());
-            }
+        for id in live {
+            let Some(entry) = journal.entries.get_mut(&id) else { continue };
+            entry.receipt.status = if entry.receipt.status == CommandStatus::Accepted && !entry.dispatched {
+                CommandStatus::Refused
+            } else {
+                CommandStatus::Unknown
+            };
+            entry.receipt.terminal = true;
+            entry.receipt.reason = Some(reason.into());
+            entry.receipt.updated_at_ms = now_ms;
+            changes.push(entry.receipt.clone());
+            self.retire_locked(journal, &id);
         }
-        changes.sort_by(|a, b| a.id.cmp(&b.id));
         for receipt in changes {
             self.event_locked(journal, json!({"kind":"command","command":receipt}));
         }
     }
 
+    /// PUT processing in the frozen order of design A3: validate the ID, answer a known ID, run
+    /// the capacity checks (a 503 consumes nothing), then write the identity, its outcome and the
+    /// receipt event in one step under the journal lock.
     fn admit(&self, id: String, identity: Value) -> Result<(StatusCode, CommandReceipt), ApiError> {
         if id.is_empty()
             || id.len() > 128
@@ -495,60 +572,75 @@ impl Control {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
         {
-            return Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                "invalid_command_id".into(),
-            ));
+            return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_command_id".into(), None));
         }
+        let now_ms = self.now_ms();
         let mut journal = self.shared.journal.lock().unwrap();
         if let Some(existing) = journal.entries.get(&id) {
             return if existing.identity == identity {
                 Ok((StatusCode::OK, existing.receipt.clone()))
             } else {
-                Err(ApiError(
-                    StatusCode::CONFLICT,
-                    "command_id_reused_with_changed_payload".into(),
-                ))
+                Err(changed_payload())
+            };
+        }
+        if let Some(tomb) = journal.tombstones.get(&digest(id.as_bytes())) {
+            return if tomb.payload == digest(identity.to_string().as_bytes()) {
+                Err(expired(tomb))
+            } else {
+                Err(changed_payload())
             };
         }
         let request: CommandRequest = serde_json::from_value(identity.clone()).map_err(|_| {
-            ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_command_payload".into(),
-            )
+            ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid_command_payload".into(), None)
         })?;
-        // An ordinary full journal cannot consume the dedicated safety reserves.
-        if journal.ordinary_count < self.shared.capacity {
-            journal.ordinary_count += 1;
-        } else {
-            match request.operation {
-                Operation::Stop if !journal.stop_reserve => journal.stop_reserve = true,
-                Operation::AttackOff if !journal.attack_off_reserve => {
-                    journal.attack_off_reserve = true
-                }
+        let safety = request.operation.is_priority();
+        let ordinary_space = journal.identities < self.shared.identity_capacity;
+        if !ordinary_space {
+            let used = match request.operation {
+                Operation::Stop => journal.stop_reserve_used,
+                Operation::AttackOff => journal.attack_off_reserve_used,
                 _ => {
-                    return Err(ApiError(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "command_journal_full".into(),
-                    ))
+                    return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "session_id_space_exhausted".into(), None))
                 }
+            };
+            if used >= self.shared.safety_reserve {
+                return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "safety_reserve_exhausted".into(), None));
             }
         }
+        let live_ordinary = journal
+            .live
+            .iter()
+            .filter(|live| journal.entries.get(*live).is_some_and(|e| !e.request.operation.is_priority()))
+            .count();
+        if !safety && live_ordinary >= LIVE_LIMIT {
+            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "live_command_limit".into(), None));
+        }
+        // From here the identity is consumed, whatever the outcome.
+        if ordinary_space {
+            journal.identities += 1;
+        } else if matches!(request.operation, Operation::Stop) {
+            journal.stop_reserve_used += 1;
+        } else {
+            journal.attack_off_reserve_used += 1;
+        }
+        let mut detail = None;
         let refusal = if request.session != self.shared.session {
-            Some("stale_session".into())
+            Some("stale_session".to_owned())
         } else if request.zone_epoch != journal.zone_epoch {
-            Some("stale_zone_epoch".into())
-        } else if let Err(reason) = request.operation.validate() {
-            Some(reason.into())
-        } else if !request.operation.is_priority() && !journal.ready {
-            Some("not_ready".into())
-        } else if !request.operation.is_priority()
-            && journal
-                .entries
-                .values()
-                .any(|e| !e.request.operation.is_priority() && e.receipt.status.busy())
+            Some("stale_zone_epoch".to_owned())
+        } else if let Err(prose) = request.operation.validate() {
+            detail = Some(prose.to_owned());
+            Some("invalid_operation".to_owned())
+        } else if !safety && !journal.ready {
+            Some("not_ready".to_owned())
+        } else if !safety
+            && journal.live.iter().any(|live| {
+                journal.entries.get(live).is_some_and(|e| {
+                    !e.request.operation.is_priority() && e.receipt.status.busy()
+                })
+            })
         {
-            Some("busy".into())
+            Some("busy".to_owned())
         } else {
             None
         };
@@ -560,14 +652,22 @@ impl Control {
         let receipt = CommandReceipt {
             id: id.clone(),
             status,
+            terminal: status.terminal(),
             reason: refusal,
+            detail,
             evidence: None,
+            accepted_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            admitted: (status == CommandStatus::Refused).then_some(false),
         };
         if status == CommandStatus::Accepted {
             // A queued move must not restart immediately after a higher-priority stop.
             let mut superseded = Vec::new();
-            if request.operation.is_priority() {
-                for entry in journal.entries.values_mut() {
+            if safety {
+                let mut live: Vec<String> = journal.live.iter().cloned().collect();
+                live.sort();
+                for live_id in live {
+                    let Some(entry) = journal.entries.get_mut(&live_id) else { continue };
                     let cancel = matches!(
                         (&request.operation, &entry.request.operation),
                         (Operation::Stop, Operation::MoveFor { .. })
@@ -579,23 +679,26 @@ impl Control {
                         } else {
                             CommandStatus::Refused
                         };
+                        entry.receipt.terminal = true;
                         entry.receipt.reason = Some("superseded_by_safety_command".into());
+                        entry.receipt.updated_at_ms = now_ms;
                         superseded.push(entry.receipt.clone());
                     }
                 }
             }
-            superseded.sort_by(|a, b| a.id.cmp(&b.id));
             for canceled in superseded {
+                self.retire_locked(&mut journal, &canceled.id);
                 self.event_locked(&mut journal, json!({"kind":"command","command":canceled}));
             }
-            if request.operation.is_priority() {
+            if safety {
                 journal.priority.push_back(id.clone());
             } else {
                 journal.ordinary.push_back(id.clone());
             }
+            journal.live.insert(id.clone());
         }
         journal.entries.insert(
-            id,
+            id.clone(),
             Entry {
                 dispatched: false,
                 request,
@@ -603,6 +706,11 @@ impl Control {
                 receipt: receipt.clone(),
             },
         );
+        if status != CommandStatus::Accepted {
+            // Terminal at birth: straight into the eviction queue, never live.
+            journal.live.insert(id.clone());
+            self.retire_locked(&mut journal, &id);
+        }
         self.event_locked(&mut journal, json!({"kind":"command","command":receipt}));
         Ok((
             if status == CommandStatus::Accepted {
@@ -614,13 +722,15 @@ impl Control {
         ))
     }
 
+    /// The newest event cursor, as returned beside a PUT so a wait can start after it.
+    fn current_cursor(&self) -> String {
+        self.cursor(self.shared.journal.lock().unwrap().sequence)
+    }
+
     fn event_batch(&self, after: u64) -> Result<EventBatch, ApiError> {
         let journal = self.shared.journal.lock().unwrap();
         if after > journal.sequence {
-            return Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                "future_event_cursor".into(),
-            ));
+            return Err(ApiError(StatusCode::BAD_REQUEST, "future_event_cursor".into(), None));
         }
         let gap = journal
             .events
@@ -639,11 +749,37 @@ impl Control {
     }
 }
 
+/// First 16 bytes of SHA-256: identities and payloads of evicted commands, compared on replay.
+fn digest(bytes: &[u8]) -> [u8; 16] {
+    let full = Sha256::digest(bytes);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
+}
+
+fn changed_payload() -> ApiError {
+    ApiError(StatusCode::CONFLICT, "command_id_reused_with_changed_payload".into(), None)
+}
+
+fn expired(tomb: &Tombstone) -> ApiError {
+    ApiError::with_body(
+        StatusCode::GONE,
+        json!({"error":"command_id_expired","status":tomb.status,"reason":tomb.reason}),
+    )
+}
+
 #[derive(Debug)]
-struct ApiError(StatusCode, String);
+struct ApiError(StatusCode, String, Option<Value>);
+
+impl ApiError {
+    fn with_body(status: StatusCode, body: Value) -> Self {
+        Self(status, String::new(), Some(body))
+    }
+}
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error":self.1}))).into_response()
+        let body = self.2.unwrap_or_else(|| json!({"error":self.1}));
+        (self.0, Json(body)).into_response()
     }
 }
 
@@ -663,7 +799,7 @@ async fn authenticate(
             .get(axum::http::header::AUTHORIZATION)
             .is_some_and(|value| value.as_bytes() == control.shared.authorization.as_bytes());
     if !valid {
-        return ApiError(StatusCode::UNAUTHORIZED, "unauthorized".into()).into_response();
+        return ApiError(StatusCode::UNAUTHORIZED, "unauthorized".into(), None).into_response();
     }
     next.run(request).await
 }
@@ -676,20 +812,20 @@ async fn get_command(
     State(control): State<Control>,
     Path(id): Path<String>,
 ) -> Result<Json<CommandReceipt>, ApiError> {
-    control
-        .command(&id)
-        .map(Json)
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "unknown_command_id".into()))
+    control.lookup(&id).map(Json)
 }
 
+/// The receipt, plus `event_cursor`: the newest cursor once the command was recorded, so a wait
+/// on its events can pass it as `after` and miss nothing.
 async fn put_command(
     State(control): State<Control>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
-) -> Result<(StatusCode, Json<CommandReceipt>), ApiError> {
-    control
-        .admit(id, body)
-        .map(|(code, receipt)| (code, Json(receipt)))
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let (code, receipt) = control.admit(id, body)?;
+    let mut value = serde_json::to_value(receipt).unwrap();
+    value["event_cursor"] = json!(control.current_cursor());
+    Ok((code, Json(value)))
 }
 
 #[derive(Deserialize)]
@@ -706,27 +842,18 @@ async fn get_events(
     let after = match query.after {
         None => 0,
         Some(cursor) => {
-            let (session, sequence) = cursor.rsplit_once(':').ok_or(ApiError(
-                StatusCode::BAD_REQUEST,
-                "invalid_event_cursor".into(),
-            ))?;
+            let (session, sequence) = cursor.rsplit_once(':').ok_or(ApiError(StatusCode::BAD_REQUEST, "invalid_event_cursor".into(), None))?;
             if session != control.shared.session {
-                return Err(ApiError(
-                    StatusCode::CONFLICT,
-                    "event_cursor_session_changed".into(),
-                ));
+                return Err(ApiError(StatusCode::CONFLICT, "event_cursor_session_changed".into(), None));
             }
             sequence
                 .parse()
-                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_event_cursor".into()))?
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_event_cursor".into(), None))?
         }
     };
     let wait = query.wait.unwrap_or(0.0);
     if !wait.is_finite() || !(0.0..=30.0).contains(&wait) {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "wait_must_be_between_0_and_30_seconds".into(),
-        ));
+        return Err(ApiError(StatusCode::BAD_REQUEST, "wait_must_be_between_0_and_30_seconds".into(), None));
     }
     // Subscribe before inspecting the journal, so publication between read and wait is visible.
     let mut changed = control.shared.changed.subscribe();
