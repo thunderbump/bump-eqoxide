@@ -8,6 +8,24 @@ page documents what is decided and not yet built, and it is trimmed as each part
 Everything here extends `/v2/player`. Existing routes, operations, fields and statuses remain
 unless a section says **changed**.
 
+## Behaviour that changes from client d034b7e
+
+The Rust server validates against client `d034b7e`. Scripts written now must tolerate both columns
+until coordination moves that pin. Coordination approved every row on 2026-11-27.
+
+| Item | d034b7e | After |
+| --- | --- | --- |
+| Stop on the wire | Resting position sent at the next keepalive, up to 1.3 s late, with the run's delta and animation; first zero-delta update about 1.3 s after that | One update with zero delta and animation 0 on the first physics step at rest (central-vgwu) |
+| `state_changed` events | One per state publication, about every 100 ms; long-polls return early | Not published |
+| Terminal receipts | Readiness drop rewrites `applied_local` to `unknown`; `unknown` may become `confirmed`/`refused` | Never change |
+| `target`, `attack` receipts | `unknown` with `processed_without_server_confirmation` | `sent`, then `confirmed` or `unknown` |
+| `reason` | Codes, except validation failures, which are prose | Always a code; prose in `detail` |
+| Refused at admission | Takes a journal slot; ID cannot be reused | No slot; ID can be reused; body has `journaled:false` |
+| Journal capacity | 4096 for the process lifetime, then 503 | Section 3 |
+| `nearby` order | Spawn ID | Distance |
+| `camp` while dead | Refused (`not_ready`) | Admitted |
+| Process exit | Stays `failed` until signalled, then exits 0 | Section 8 |
+
 ## 1. Clock
 
 State carries `clock_ms`, the host's monotonic clock in milliseconds since process start (shipped
