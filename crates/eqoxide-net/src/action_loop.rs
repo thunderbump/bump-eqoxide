@@ -26,6 +26,10 @@ const POS_SEND_KEEPALIVE_MS: u128 = 1300;
 /// counts as at rest. 0.01u per step: a 20 ms CPU step at the slowest movement speed covers far
 /// more, and gravity settling on flat ground covers nothing.
 const REST_STEP_SQ: f32 = 1e-4;
+/// Squared displacement (units²) per published physics step above which the step is motion that
+/// makes the next stop urgent: 0.1u, against 0.7u for the CPU host's 35 u/s over 20 ms. Steps
+/// between this and `REST_STEP_SQ` are a creep and wait for the moving throttle.
+const MOVE_STEP_SQ: f32 = 1e-2;
 /// Interval (ms) between OP_FloatListThing (movement-history) sends. The server's MQGhost detector
 /// (`cheat_manager.cpp`) trips ~70s after movement if this packet never arrives, then re-flags on
 /// every movement check. Sending one benign entry every 30s keeps the 70s timer alive (eqoxide#105).
@@ -585,14 +589,12 @@ pub struct ActionLoop {
     /// `ControllerView::step_seq` and `pos` as of the last physics step this streamer observed.
     seen_step_seq:    u64,
     step_pos:         [f32; 3],
-    /// A physics step since the last send moved the body more than the rest threshold.
+    /// A physics step since the last send moved the body more than `MOVE_STEP_SQ`.
     stepped_since_send: bool,
     /// The view's zone epoch the step baseline belongs to; a new epoch reseeds it.
     rest_epoch:       Option<u64>,
-    /// A server correction handed to the controller and not yet visible in the view. Until the
-    /// view shows it, a stationary step describes the body the server just moved away, and a rest
-    /// flush would send that stale position back.
-    pending_adopt:    Option<[f32; 3]>,
+    /// `ControllerView::correction_adopted` as of the last tick, to see the step that adopts.
+    seen_adopted:     u64,
     streamed_init:    bool,
 }
 
@@ -707,7 +709,7 @@ impl ActionLoop {
             step_pos: [0.0, 0.0, 0.0],
             stepped_since_send: false,
             rest_epoch: None,
-            pending_adopt: None,
+            seen_adopted: 0,
             last_movement_history_send: Instant::now(),
             streamed_init: false,
         }
@@ -2761,7 +2763,13 @@ impl ActionLoop {
         let cd = [gp[0] - self.last_streamed[0], gp[1] - self.last_streamed[1]];
         if cd[0] * cd[0] + cd[1] * cd[1] > CORRECTION_SQ {
             tracing::info!("NAV: server correction → handing controller new pos ({:.1},{:.1},{:.1})", gp[0], gp[1], gp[2]);
-            *self.controller.pos_correction.lock().unwrap() = Some(gp);
+            {
+                // Count under the view lock before the slot is written: a publisher that takes the
+                // slot under the same lock reads the count that belongs to this correction.
+                let mut v = self.controller.controller_view.lock().unwrap();
+                v.correction_issued = v.correction_issued.wrapping_add(1);
+                *self.controller.pos_correction.lock().unwrap() = Some(gp);
+            }
             // #846 review B3: this branch returns EARLY, so `gs.player_x/y/z` keep the SERVER's new
             // coordinates while the two disclosures above still hold the frozen controller's answer
             // about the place we were just moved OUT of — a fresh position beside an old
@@ -2797,7 +2805,6 @@ impl ActionLoop {
             self.last_sent_pos = gp;
             self.seen_step_seq = view.step_seq;
             self.step_pos = view.pos;
-            self.pending_adopt = Some(gp);
             return;
         }
         // Normal: stream the controller's position at cadence, then mirror into gs for game logic.
@@ -2814,27 +2821,28 @@ impl ActionLoop {
         let dist_sq = |a: [f32; 3], b: [f32; 3]| {
             (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
         };
-        // A new zone and an unadopted correction give no rest evidence: reseed and wait for the
-        // next step. A correction counts as adopted once the view is within the correction radius.
-        if view.zone_epoch != self.rest_epoch {
-            self.rest_epoch = view.zone_epoch;
-            self.pending_adopt = None;
+        // A new zone, an unadopted correction and the step that adopts one give no rest evidence:
+        // reseed and wait for the next step. Motion from the departed zone, or the teleport onto a
+        // correction already sent, owes the server nothing.
+        let unadopted = view.correction_adopted != view.correction_issued;
+        let adopting = view.correction_adopted != self.seen_adopted;
+        self.seen_adopted = view.correction_adopted;
+        if view.zone_epoch != self.rest_epoch || unadopted || adopting {
+            if view.zone_epoch != self.rest_epoch {
+                self.rest_epoch = view.zone_epoch;
+                self.last_sent_moving = false;
+            }
+            if !unadopted {
+                self.stepped_since_send = false;
+            }
             self.seen_step_seq = view.step_seq;
             self.step_pos = pos;
         }
-        if let Some(target) = self.pending_adopt {
-            let a = [pos[0] - target[0], pos[1] - target[1]];
-            if a[0] * a[0] + a[1] * a[1] > CORRECTION_SQ {
-                self.seen_step_seq = view.step_seq;
-                self.step_pos = pos;
-            } else {
-                self.pending_adopt = None;
-            }
-        }
         let mut at_rest = false;
         if view.step_seq != self.seen_step_seq {
-            at_rest = dist_sq(pos, self.step_pos) <= REST_STEP_SQ;
-            self.stepped_since_send |= !at_rest;
+            let step_sq = dist_sq(pos, self.step_pos);
+            at_rest = step_sq <= REST_STEP_SQ;
+            self.stepped_since_send |= step_sq > MOVE_STEP_SQ;
             self.seen_step_seq = view.step_seq;
             self.step_pos = pos;
         }
@@ -2928,11 +2936,10 @@ impl ActionLoop {
 
         let buf = encode_client_position_update(
             self.position_seq, gs.player_id as u16, to, [dx, dy, dz], eq_heading, anim);
-        self.controller.controller_view.lock().unwrap().last_position_send =
-            Some(eqoxide_core::game_state::PositionSend {
-                seq: self.position_seq, pos: to, delta: [dx, dy, dz], heading, animation: anim, reason,
-                at: Instant::now(),
-            });
+        let record = eqoxide_core::game_state::PositionSend {
+            seq: self.position_seq, pos: to, delta: [dx, dy, dz], heading, animation: anim, reason,
+            at: Instant::now(),
+        };
         self.last_sent_moving = anim != 0 || dist > 0.0;
         self.stepped_since_send = false;
         self.last_sent_heading = heading;
@@ -2953,6 +2960,8 @@ impl ActionLoop {
                              retransmit; the next update supersedes it (#612)",
                             self.position_seq.wrapping_sub(1), e.kind());
         }
+        // Recorded after the transport call, so state never reports an attempt not yet made.
+        self.controller.controller_view.lock().unwrap().last_position_send = Some(record);
     }
 
     /// Resolve a DRNTP zone-line region's `region_index` to its crossing destination — the target
@@ -4174,9 +4183,11 @@ mod tests {
 
         // Hold still: the next physics step republishes the same position.
         let mut rest = None;
+        // The last moving step was on the last net tick; the next step, 20 ms later, is on the
+        // second net tick from now and is the first that can show rest.
         for tick in 0..2 {
             tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
-            if tick == 0 {
+            if tick == 1 {
                 publish_step(&nav, [x, 0.0, 0.0]);
             }
             nav.stream_position(&mut stream, &mut gs);
@@ -4233,34 +4244,113 @@ mod tests {
         assert_eq!((rest.1[0], rest.2, rest.3), (x, [0.0; 3], 0));
     }
 
+    /// The CPU host taking the correction slot under the view lock, as `Host::step` does, and
+    /// publishing its first step after applying it.
+    fn adopt_correction(nav: &ActionLoop) {
+        let mut view = nav.controller.controller_view.lock().unwrap();
+        let pos = nav.controller.pos_correction.lock().unwrap().take().expect("a correction is pending");
+        view.correction_adopted = view.correction_issued;
+        view.step_seq += 1;
+        view.pos = pos;
+    }
+
     /// central-vgwu review B1: a step the host published before it adopted a server correction
-    /// shows the body where the server no longer has it. It must not be sent as a rest update.
+    /// shows the body where the server no longer has it. It must not be sent as a rest update,
+    /// even when that stale position is within the correction radius of the target, and even
+    /// after the moving throttle has lapsed.
     ///
-    /// MUTATION CHECK: delete the `pending_adopt` block in `stream_position` → RED.
+    /// MUTATION CHECK: drop `|| unadopted` from the reseed condition in `stream_position` → RED.
     #[tokio::test]
     async fn a_step_from_before_a_correction_is_not_sent_as_rest_vgwu() {
-        let a = [10.0, 0.0, 0.0];
-        let b = [500.0, 0.0, 0.0];
-        let (mut stream, peer, mut nav, mut gs) = rest_fixture(a).await;
-        publish_step(&nav, a); // the host's idle step at A, not yet seen by the streamer
+        let a = [0.7, 0.0, 0.0];
+        let b = [12.5, 0.0, 0.0]; // > 12u from the last mirrored 0.0, < 12u from the body at 0.7
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
+        publish_step(&nav, a); // a moving step the streamer has not seen
         [gs.player_x, gs.player_y, gs.player_z] = b; // the server moves us to B
         nav.stream_position(&mut stream, &mut gs);
         let correction = drain_client_updates(&peer).await.pop().expect("premise: the correction is re-streamed");
         assert_eq!(correction.1[0], b[0]);
-        // The host has not adopted yet and publishes another idle step at A.
+        // The host stalls past the moving throttle, then publishes idle steps at A, unadopted.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         for _ in 0..3 {
-            tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
             publish_step(&nav, a);
             nav.stream_position(&mut stream, &mut gs);
-            assert!(drain_client_updates(&peer).await.iter().all(|p| p.1[0] != a[0]),
-                "the pre-correction position was sent back as rest");
+            // The pre-existing moving throttle may still stream the stale view after 280 ms;
+            // that predates the rest flush and is not what this test guards.
+            assert!(drain_client_updates(&peer).await.iter().all(|p| p.1[0] != a[0] || p.3 != 0),
+                "the pre-correction position was sent back as a rest update");
+            tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
         }
-        // Once the view shows B, rest detection resumes; B was already sent, so nothing is owed.
-        publish_step(&nav, b);
+    }
+
+    /// central-vgwu review: the controller's teleport onto a correction is not motion. The
+    /// correction update already told the server where the body rests.
+    ///
+    /// MUTATION CHECK: drop `|| adopting` from the reseed condition → RED.
+    #[tokio::test]
+    async fn adopting_a_correction_sends_no_second_update_vgwu() {
+        let b = [500.0, 0.0, 0.0];
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
+        [gs.player_x, gs.player_y, gs.player_z] = b;
         nav.stream_position(&mut stream, &mut gs);
-        publish_step(&nav, b);
+        assert_eq!(drain_client_updates(&peer).await.len(), 1, "premise: the correction is sent");
+        tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
+        adopt_correction(&nav);
         nav.stream_position(&mut stream, &mut gs);
-        assert!(nav.pending_adopt.is_none(), "adoption clears the guard");
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+            publish_step(&nav, b);
+            nav.stream_position(&mut stream, &mut gs);
+        }
+        assert!(drain_client_updates(&peer).await.is_empty(),
+            "adopting a correction already sent owes the server no second update");
+    }
+
+    /// central-vgwu review: motion left unsent in one zone owes the next zone nothing.
+    ///
+    /// MUTATION CHECK: drop `self.stepped_since_send = false` from the reseed → RED.
+    #[tokio::test]
+    async fn motion_from_the_departed_zone_sends_no_rest_in_the_next_vgwu() {
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
+        tokio::time::sleep(Duration::from_millis(NET_TICK_MS)).await;
+        publish_step(&nav, [CPU_STEP_U, 0.0, 0.0]); // moving, under the 280 ms throttle
+        nav.stream_position(&mut stream, &mut gs);
+        assert!(drain_client_updates(&peer).await.is_empty(), "premise: the move was not sent");
+        nav.controller.controller_view.lock().unwrap().zone_epoch = Some(2);
+        gs.zone_epoch = 2; // the view's fence matches, so the streamer runs in the new zone
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+            publish_step(&nav, [CPU_STEP_U, 0.0, 0.0]);
+            nav.stream_position(&mut stream, &mut gs);
+        }
+        assert!(drain_client_updates(&peer).await.is_empty());
+        assert!(last_send(&nav).is_none(), "premise: nothing was sent in either zone");
+        // Reach: in the new zone the streamer is live and a real stop is still sent.
+        publish_step(&nav, [2.0 * CPU_STEP_U, 0.0, 0.0]);
+        nav.stream_position(&mut stream, &mut gs);
+        tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+        publish_step(&nav, [2.0 * CPU_STEP_U, 0.0, 0.0]);
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(drain_client_updates(&peer).await.len(), 1, "a stop in the new zone is sent");
+    }
+
+    /// central-vgwu review: a creep that alternates just above and below the rest threshold is
+    /// still a creep and keeps the moving throttle.
+    ///
+    /// MUTATION CHECK: count any non-rest step in `stepped_since_send` (`> REST_STEP_SQ`) → RED.
+    #[tokio::test]
+    async fn an_alternating_creep_keeps_the_moving_throttle_vgwu() {
+        let (mut stream, peer, mut nav, mut gs) = rest_fixture([0.0; 3]).await;
+        let mut x = 0.0f32;
+        let mut sent = 0;
+        for i in 0..10 {
+            tokio::time::sleep(Duration::from_millis(2 * NET_TICK_MS)).await;
+            x += if i % 2 == 0 { 0.011 } else { 0.009 };
+            publish_step(&nav, [x, 0.0, 0.0]);
+            nav.stream_position(&mut stream, &mut gs);
+            sent += drain_client_updates(&peer).await.len();
+        }
+        assert!(sent <= 1, "an alternating creep sent {sent} updates in 200 ms");
     }
 
     /// central-vgwu review: a slow slide under the per-step rest threshold must not send one rest

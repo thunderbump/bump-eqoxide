@@ -173,7 +173,14 @@ impl Host {
         let Some(body) = self.body.as_mut() else {
             return;
         };
-        if let Some(correction) = self.controller_slots.pos_correction.lock().unwrap().take() {
+        // Take the correction under the view lock, the same order the net streamer writes it in,
+        // so the issue count read here is the one that belongs to this correction.
+        let taken = {
+            let view = self.controller_slots.controller_view.lock().unwrap();
+            let correction = self.controller_slots.pos_correction.lock().unwrap().take();
+            correction.map(|pos| (pos, view.correction_issued))
+        };
+        if let Some((correction, _)) = taken {
             body.teleport(correction);
         }
         self.zone_in.on_frame(
@@ -209,6 +216,9 @@ impl Host {
         view.zone_epoch = Some(self.epoch);
         if stepped {
             view.step_seq = view.step_seq.wrapping_add(1);
+        }
+        if let Some((_, issued)) = taken {
+            view.correction_adopted = issued;
         }
         view.pos = body.pos;
         view.heading = self.heading;
@@ -983,6 +993,24 @@ mod tests {
         assert_eq!(host_step_seq(&host), 2);
         host.step(&gs, None, true, Instant::now(), 0.02);
         assert_eq!(host_step_seq(&host), 2, "an unstepped republish is not a step");
+    }
+    /// central-vgwu: the host reports which correction it applied, with the first position after
+    /// applying it, so the net streamer can tell an adopted correction from a stale view.
+    #[test]
+    fn host_publishes_the_correction_it_adopted() {
+        let mut host = host();
+        let col = floor();
+        let mut gs = GameState::new();
+        gs.zone_epoch = 1;
+        {
+            let mut view = host.controller_slots.controller_view.lock().unwrap();
+            view.correction_issued = 3;
+            *host.controller_slots.pos_correction.lock().unwrap() = Some([40.0, 0.0, 0.0]);
+        }
+        host.step(&gs, Some(&col), true, Instant::now(), 0.02);
+        let view = *host.controller_slots.controller_view.lock().unwrap();
+        assert_eq!(view.correction_adopted, 3);
+        assert!((view.pos[0] - 40.0).abs() < 0.01, "published with the corrected position");
     }
     #[test]
     fn state_publishes_the_last_position_send() {

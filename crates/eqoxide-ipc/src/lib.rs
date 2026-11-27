@@ -110,6 +110,14 @@ pub struct ControllerView {
     /// does not change the published snapshot, which the graphical render loop treats as
     /// activity.
     pub last_position_send: Option<eqoxide_core::game_state::PositionSend>,
+    /// Server corrections the net streamer has handed to `ControllerSlots::pos_correction`,
+    /// counted under this view's lock before the slot is written (net thread only).
+    pub correction_issued: u64,
+    /// The `correction_issued` value a publisher read, under this view's lock, when it took a
+    /// correction from the slot, republished with the first `pos` after it applied it. While the
+    /// two differ the view may still show the body the server moved away, so the streamer sends no
+    /// rest update. Only the CPU host writes it; a publisher without a step signal never needs to.
+    pub correction_adopted: u64,
     pub pos:     [f32; 3],
     pub heading: f32,
     /// False until the render thread has spawned and seeded the controller. The net streamer must
