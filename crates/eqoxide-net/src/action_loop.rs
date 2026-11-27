@@ -1498,8 +1498,8 @@ impl ActionLoop {
         // POST /loot: queue the requested corpse onto the existing auto-loot pipeline. The gameplay
         // loop drains pending_loot — sends OP_LootRequest, echoes each OP_LootItem to take it, then
         // OP_EndLootRequest. The 500ms delay (loot_queued_at) lets the server register the corpse.
-        if let Some(corpse_id) = self.command.take_loot() {
-            gs.pending_loot.push_back(corpse_id);
+        if let Some((corpse_id, command_id)) = self.command.take_loot_with_command() {
+            gs.pending_loot.push_back(eqoxide_core::game_state::LootRequest { corpse_id, command_id });
             self.command.actions().hold_drained(Action::InteractLoot, corpse_id as u64);
             if gs.loot_queued_at.is_none() {
                 gs.loot_queued_at = Some(Instant::now());

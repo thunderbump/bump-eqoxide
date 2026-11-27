@@ -85,4 +85,25 @@ pub mod testkit {
         gameplay::drain_camp(action_loop, stream, gs, &lifecycle.camp, &lifecycle.camp_until);
         action_loop.tick(stream, gs);
     }
+
+    #[derive(Default)]
+    pub struct LootFixture(crate::corpse_loot::CorpseLoot);
+
+    impl LootFixture {
+        pub fn tick(&mut self, stream: &mut EqStream, gs: &mut GameState) {
+            gameplay::drain_loot_packets(&mut self.0, stream, gs);
+        }
+
+        pub fn receive(&mut self, gs: &mut GameState, opcode: u16, payload: Vec<u8>) {
+            let packet = crate::AppPacket { opcode, payload };
+            crate::packet_handler::apply_packet(gs, &packet);
+            self.0.observe(gs, &packet, std::time::Instant::now());
+        }
+
+        pub fn receive_catalog_item(&mut self, gs: &mut GameState) {
+            let mut payload = 0x66u32.to_le_bytes().to_vec();
+            payload.extend(crate::item::test_fixtures::fixture());
+            self.receive(gs, crate::protocol::OP_ITEM_PACKET, payload);
+        }
+    }
 }

@@ -201,29 +201,42 @@ command ID from the command URL. Unknown query parameters return HTTP 400.
 
 Each row has `n`, `at_ms` on the state's `clock_ms` clock, `dir` (`in` or `out`),
 numeric `opcode`, `opcode_name`, `len` in bytes including the opcode, `reliable`,
-`wire_seq`, `command_id`, and `fields`. The outbound reliable sequence identifies the
-first fragment and the inbound sequence identifies the completing fragment.
-`wire_seq` is null for unreliable packets. Outbound `OP_CLIENT_UPDATE` fields include
-`position` and `delta` in wire x/y/z order, `animation`, and `heading` in wire units.
-`OP_TARGET_COMMAND` in either direction and outbound `OP_TARGET_MOUSE` carry `target_id`.
-Inbound `OP_DAMAGE` carries `source`, `target`, signed `damage`, and `spell`. Other rows
-have empty `fields`.
+`wire_seq`, `acked_at_ms`, `command_id`, and `fields`. The outbound reliable sequence
+identifies the first fragment and the inbound sequence identifies the completing fragment.
+`wire_seq` is null for unreliable packets. For an inbound reliable row, `acked_at_ms`
+records when the socket accepted the first cumulative ACK covering its sequence, on the
+host clock. A deferred ACK leaves the field null until it sends. Poll the same cursor
+range again when waiting for an existing row's ACK. Outbound and unreliable rows have a
+null `acked_at_ms`.
 
-The network owner tags packets sent directly from a tagged mailbox drain, including the
-awaited merchant open and buy sends. Inbound packets, periodic movement, and automatic
-follow-ups have a null `command_id`. Loot packets also have a null ID because the later
-loot pipeline sends them after the command drain queues the corpse. Outbound rows record send
-attempts. Reliable retransmits reuse the original wire bytes and increment transport
-counters without adding another application row.
+Decoded `fields` use raw wire values. Positions are in x/y/z order and keep wire-datum z.
+Headings use the raw protocol units.
 
-The response's `counters` cover login, world, and zone transport. `sent` counts successful
-UDP sends, including control traffic. `resent` counts successful repeat sends of datagrams
-that already reached the socket. `received` counts UDP datagrams before decoding.
-`dropped_unretried` combines `NetHealth.send_failures_unretried` with reliable datagrams
-abandoned at teardown that never reached the socket. The NetHealth sample is taken after
-the trace snapshot, so its component may include newer losses. `sequence_gaps` counts runs
-of missing incoming reliable sequences when they first appear. Contiguous future packets
-and later fills of an existing hole keep the same count.
+| Opcode | Direction | Fields |
+| --- | --- | --- |
+| `OP_ZONE_ENTRY` (0x5089) | Inbound | `entity`, `name`, `position`, `heading` |
+| `OP_CLIENT_UPDATE` (0x7dfc) | Inbound | `entity`, `position`, `heading` |
+| `OP_CLIENT_UPDATE` (0x7dfc) | Outbound | `position`, `delta`, `animation`, `heading` |
+| `OP_TARGET_COMMAND` (0x58e2) | Both | `target_id` |
+| `OP_TARGET_MOUSE` | Outbound | `target_id` |
+| `OP_DAMAGE` (0x6f15) | Inbound | `target`, `source`, `type`, `spell`, signed `damage` |
+| `OP_MOB_HEALTH` (0x37b1) | Inbound | `entity`, `percent` |
+
+Other rows have empty `fields`. The network owner tags outbound packets emitted by a
+command drain, including awaited merchant open and buy. The explicit loot command ID
+follows its corpse queue entry and tags the open, item takes, and close. Automatic loot,
+inbound packets, and periodic movement have a null `command_id`. Outbound rows record
+send attempts. Reliable retransmits reuse the original wire bytes and increment
+transport counters without adding another application row.
+
+The response's `counters` cover login, world, and zone transport. They come from one
+snapshot of the trace. `sent` counts successful UDP sends, including control traffic.
+`resent` counts successful repeat sends of datagrams that already reached the socket.
+`received` counts UDP datagrams before decoding. `dropped_unretried` counts terminal
+send failures, deferred control packets discarded by the queue or at teardown, and
+reliable datagrams abandoned at teardown that never reached the socket.
+`sequence_gaps` counts runs of missing incoming reliable sequences when they first
+appear. Contiguous future packets and later fills of an existing hole keep the same count.
 
 ### Loot evidence
 

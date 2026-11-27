@@ -774,7 +774,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
     let wiring = Wiring::new(profile.maps_dir.clone());
     let trace = eqoxide_net::packet_telemetry::SessionTrace::new(started);
     let control = Control::new(session, profile.control_token.clone(), 4096, 2048)?
-        .with_packet_trace(trace.clone(), wiring.health.clone());
+        .with_packet_trace(trace.clone());
     let router = control.router();
     let api = tokio::spawn(async move { axum::serve(listener, router).await });
     println!("API_PORT={}", profile.api_port);

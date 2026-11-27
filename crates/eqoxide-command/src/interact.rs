@@ -128,6 +128,10 @@ impl CommandState {
         self.dequeue(&self.interact.loot)
     }
 
+    pub fn take_loot_with_command(&self) -> Option<TracedRequest<u32>> {
+        self.dequeue_with_command(&self.interact.loot)
+    }
+
     /// Drain a pending give request as `(npc_id, from_slot)`.
     pub fn take_give(&self) -> Option<(u32, u32)> {
         self.dequeue(&self.interact.give)

@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-const CAPACITY: usize = 20_000;
+pub const SESSION_PACKET_CAPACITY: usize = 20_000;
 
 #[derive(Clone)]
 pub struct SessionTrace {
@@ -30,7 +30,7 @@ pub struct TransportCounts {
     pub resent: u64,
     pub received: u64,
     pub sequence_gaps: u64,
-    pub never_sent_reliable_abandoned: u64,
+    pub dropped_unretried: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -43,6 +43,7 @@ pub struct SessionPacket {
     len: usize,
     reliable: bool,
     wire_seq: Option<u16>,
+    pub acked_at_ms: Option<u64>,
     #[serde(serialize_with = "serialize_command_id")]
     command_id: Option<Arc<str>>,
     fields: Fields,
@@ -57,12 +58,29 @@ enum Fields {
         animation: u32,
         heading: u32,
     },
+    Spawn {
+        entity: u32,
+        name: String,
+        position: [f32; 3],
+        heading: u32,
+    },
+    InboundPosition {
+        entity: u16,
+        position: [f32; 3],
+        heading: u32,
+    },
+    Health {
+        entity: u16,
+        percent: u8,
+    },
     Target {
         target_id: u32,
     },
     Damage {
         source: u16,
         target: u16,
+        #[serde(rename = "type")]
+        damage_type: u8,
         damage: i32,
         spell: u32,
     },
@@ -93,10 +111,22 @@ impl SessionTrace {
         wire_seq: Option<u16>,
         command_id: Option<Arc<str>>,
     ) {
-        let at_ms = Instant::now().saturating_duration_since(self.started).as_millis() as u64;
+        self.capture_with_ack(dir, opcode, payload, wire_seq, command_id, None);
+    }
+
+    pub fn capture_with_ack(
+        &self,
+        dir: Dir,
+        opcode: u16,
+        payload: &[u8],
+        wire_seq: Option<u16>,
+        command_id: Option<Arc<str>>,
+        acked_at: Option<Instant>,
+    ) -> u64 {
+        let at_ms = self.clock_ms(Instant::now());
         let fields = decode_fields(dir, opcode, payload);
         let mut state = self.state.lock().unwrap();
-        if state.packets.len() == CAPACITY {
+        if state.packets.len() == SESSION_PACKET_CAPACITY {
             state.packets.pop_front();
         }
         state.last_n += 1;
@@ -110,9 +140,30 @@ impl SessionTrace {
             len: payload.len() + 2,
             reliable: wire_seq.is_some(),
             wire_seq,
+            acked_at_ms: acked_at.map(|at| self.clock_ms(at)),
             command_id,
             fields,
         }));
+        n
+    }
+
+    fn clock_ms(&self, at: Instant) -> u64 {
+        at.saturating_duration_since(self.started).as_millis() as u64
+    }
+
+    /// Resolve ACKs that were still queued when their application rows were captured. Replacing
+    /// shared rows preserves the snapshot an HTTP reader may already be serializing.
+    pub fn mark_acked(&self, rows: impl Iterator<Item = u64>, at: Instant) {
+        let at_ms = self.clock_ms(at);
+        let mut state = self.state.lock().unwrap();
+        let first = state.last_n - state.packets.len() as u64 + 1;
+        for n in rows {
+            if let Some(index) = n.checked_sub(first) {
+                if let Some(packet) = state.packets.get_mut(index as usize) {
+                    Arc::make_mut(packet).acked_at_ms.get_or_insert(at_ms);
+                }
+            }
+        }
     }
 
     pub fn record_send(&self, retry: bool) {
@@ -121,10 +172,10 @@ impl SessionTrace {
         state.counts.resent += u64::from(retry);
     }
 
-    pub fn record_unsent_abandonment(&self, count: u64) {
+    pub fn record_drop(&self, count: u64) {
         // Stream teardown also runs during unwinding.
         if let Ok(mut state) = self.state.lock() {
-            state.counts.never_sent_reliable_abandoned += count;
+            state.counts.dropped_unretried += count;
         }
     }
 
@@ -198,12 +249,40 @@ fn decode_fields(dir: Dir, opcode: u16, body: &[u8]) -> Fields {
             animation: u32_at(34) & 0x3ff,
             heading: u32_at(14) & 0xfff,
         },
+        (Dir::In, p::OP_ZONE_ENTRY) => {
+            if let Some((spawn, _, heading)) = p::parse_rof2_spawn_with_wire_heading(body) {
+                Fields::Spawn {
+                    entity: spawn.spawn_id,
+                    name: spawn.name,
+                    position: [spawn.x, spawn.y, spawn.z],
+                    heading,
+                }
+            } else {
+                Fields::Empty {}
+            }
+        }
+        (Dir::In, p::OP_CLIENT_UPDATE) => {
+            if let Some((position, heading)) = p::decode_position_update_with_wire_heading(body) {
+                Fields::InboundPosition {
+                    entity: position.spawn_id,
+                    position: [position.x, position.y, position.z],
+                    heading,
+                }
+            } else {
+                Fields::Empty {}
+            }
+        }
+        (Dir::In, p::OP_MOB_HEALTH) if body.len() >= p::SIZE_MOB_HEALTH => Fields::Health {
+            entity: u16_at(0),
+            percent: body[2],
+        },
         (_, p::OP_TARGET_COMMAND) | (Dir::Out, p::OP_TARGET_MOUSE) if body.len() >= 4 => {
             Fields::Target { target_id: u32_at(0) }
         }
         (Dir::In, p::OP_DAMAGE) if body.len() >= 13 => Fields::Damage {
             source: u16_at(2),
             target: u16_at(0),
+            damage_type: body[4],
             damage: u32_at(9) as i32,
             spell: u32_at(5),
         },

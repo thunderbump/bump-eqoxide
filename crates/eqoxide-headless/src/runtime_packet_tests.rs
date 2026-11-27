@@ -8,11 +8,11 @@ use eqoxide_net::{
     action_loop::ActionLoop,
     packet_telemetry::SessionTrace,
     protocol::*,
-    testkit::{drain_gameplay_commands, test_stream_with_peer},
+    testkit::{drain_gameplay_commands, test_stream_with_peer, LootFixture},
     transport::{with_packet_trace, EqStream},
 };
 use serde_json::{json, Value};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tower::ServiceExt;
 
@@ -44,7 +44,7 @@ impl Session {
         gs.upsert_entity(make_entity(8, "merchant", 0.0, 0.0, 0.0, true));
         host.update_knowledge(&gs);
         let trace = SessionTrace::new(Instant::now());
-        host.control = host.control.with_packet_trace(trace.clone(), wiring.health.clone());
+        host.control = host.control.with_packet_trace(trace.clone());
         host.control.publish_state(host.epoch, json!({"phase":"ready"})).unwrap();
         host.control.set_ready(true);
         let (stream, _, peer, _) = with_packet_trace(trace, test_stream_with_peer(wiring.health)).await;
@@ -193,4 +193,89 @@ async fn camp_owns_camp_appearance_and_attack_off_packets() {
     session.drain();
     session.assert_packets("camp", &[OP_CAMP, OP_SPAWN_APPEARANCE, OP_AUTO_ATTACK]).await;
     assert!(!session.gs.auto_attack);
+}
+
+
+/// A stand request must retain its dispatch ID through the shared sit slot.
+#[tokio::test]
+async fn stand_owns_appearance_packet() {
+    let mut session = Session::new().await;
+    session.gs.sitting = true;
+    session.dispatch("stand", json!({"kind":"stand"})).await;
+    session.drain();
+    session.assert_packets("stand", &[OP_SPAWN_APPEARANCE]).await;
+    assert!(!session.gs.sitting);
+}
+
+/// Removing the dispatch tag loses this tell's identity in the FIFO mailbox.
+#[tokio::test]
+async fn tell_owns_channel_message_packet() {
+    let mut session = Session::new().await;
+    session.dispatch("tell", json!({"kind":"tell","recipient":"Peer","text":"hello"})).await;
+    session.drain();
+    session.assert_packets("tell", &[OP_CHANNEL_MESSAGE]).await;
+}
+
+/// Dispatch must tag the merchant close even though it reuses the open packet opcode.
+#[tokio::test]
+async fn merchant_close_owns_shop_request_packet() {
+    let mut session = Session::new().await;
+    session.dispatch("close", json!({"kind":"merchant_close"})).await;
+    session.drain();
+    session.assert_packets("close", &[OP_SHOP_REQUEST]).await;
+    assert!(session.gs.merchant_open.is_none());
+}
+
+/// Passing None to the priority attack-off write loses the command's only trace row.
+#[tokio::test]
+async fn attack_off_owns_auto_attack_packet() {
+    let mut session = Session::new().await;
+    session.gs.auto_attack = true;
+    session.dispatch("off", json!({"kind":"attack_off"})).await;
+    session.drain();
+    session.assert_packets("off", &[OP_AUTO_ATTACK]).await;
+    assert!(!session.gs.auto_attack);
+}
+
+/// Removing the dispatch tag from inventory move loses the emitted move packet.
+#[tokio::test]
+async fn inventory_move_owns_move_item_packet() {
+    let mut session = Session::new().await;
+    session.dispatch("move", json!({"kind":"inventory_move","from_slot":23,"to_slot":24,"quantity":1})).await;
+    session.drain();
+    session.assert_packets("move", &[OP_MOVE_ITEM]).await;
+}
+
+/// Removing the ID at the dispatch, queue entry, open, or item send loses an expected row.
+#[tokio::test]
+async fn explicit_loot_owns_open_and_item_takes() {
+    let mut session = Session::new().await;
+    let mut corpse = make_entity(9, "a corpse", 0.0, 0.0, 0.0, true);
+    corpse.dead = true;
+    session.gs.upsert_entity(corpse);
+    session.gs.automatic_loot = false;
+    session.dispatch("loot-1", json!({"kind":"loot","entity_id":9})).await;
+    session.drain();
+    session.gs.loot_queued_at = Some(Instant::now() - Duration::from_secs(1));
+    let mut loot = LootFixture::default();
+    loot.tick(&mut session.stream, &mut session.gs);
+
+    let mut open = vec![0; 20];
+    open[0] = 1;
+    loot.receive(&mut session.gs, OP_MONEY_ON_CORPSE, open.clone());
+    loot.receive_catalog_item(&mut session.gs);
+    loot.tick(&mut session.stream, &mut session.gs);
+    session.assert_packets("loot-1", &[OP_LOOT_REQUEST, OP_LOOT_ITEM]).await;
+
+    // The next queue entry, even for the same corpse, cannot inherit the previous command's ID.
+    loot.receive(&mut session.gs, OP_LOOT_COMPLETE, vec![]);
+    session.gs.pending_loot.push_back(9.into());
+    session.gs.loot_queued_at = Some(Instant::now() - Duration::from_secs(1));
+    loot.tick(&mut session.stream, &mut session.gs);
+    loot.receive(&mut session.gs, OP_MONEY_ON_CORPSE, open);
+    loot.receive_catalog_item(&mut session.gs);
+    loot.tick(&mut session.stream, &mut session.gs);
+    session.assert_packets("loot-1", &[OP_LOOT_REQUEST, OP_LOOT_ITEM]).await;
+    assert!(session.gs.loot_session_active);
+    assert!(session.gs.loot_command_id.is_none());
 }

@@ -636,9 +636,7 @@ async fn packet_trace_orders_and_filters_decoded_packets() {
 
     let now = Instant::now();
     let trace = SessionTrace::new(now - Duration::from_millis(42));
-    let health = eqoxide_ipc::NetHealthShared::default();
-    health.lock().unwrap().send_failures_unretried = 3;
-    let control = control(10, 10).with_packet_trace(trace.clone(), health);
+    let control = control(10, 10).with_packet_trace(trace.clone());
 
     let position = encode_client_position_update(2, 12, [15.0, -20.0, 0.0], [1.0, 2.0, 3.0], 400, 17);
     trace.capture(Dir::Out, OP_CLIENT_UPDATE, &position, None, None);
@@ -656,7 +654,7 @@ async fn packet_trace_orders_and_filters_decoded_packets() {
     trace.record_send(true);
     trace.record_receive();
     trace.record_sequence_gap();
-    trace.record_unsent_abandonment(2);
+    trace.record_drop(5);
 
     let (status, first) = authorized(&control, "GET", "/v2/player/packets?limit=2", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -683,7 +681,7 @@ async fn packet_trace_orders_and_filters_decoded_packets() {
     assert_eq!(rest["next"], 6);
     assert_eq!(packets[2]["dir"], "in");
     assert_eq!(packets[2]["command_id"], Value::Null);
-    assert_eq!(packets[2]["fields"], json!({"source":42, "target":12, "damage":-5, "spell":21}));
+    assert_eq!(packets[2]["fields"], json!({"source":42, "target":12, "type":0, "damage":-5, "spell":21}));
     assert_eq!(packets[3]["fields"], json!({"target_id":0}));
     assert_eq!(rest["counters"], json!({
         "sent":2, "resent":1, "received":1, "dropped_unretried":5, "sequence_gaps":1,
@@ -698,7 +696,7 @@ async fn packet_trace_orders_and_filters_decoded_packets() {
     assert_eq!(packets[0], json!({
         "n":3, "at_ms":rest["packets"][0]["at_ms"], "dir":"out",
         "opcode":OP_TARGET_MOUSE, "opcode_name":"OP_TARGET_MOUSE", "len":6, "reliable":true,
-        "wire_seq":8, "command_id":"target-b", "fields":{"target_id":42},
+        "wire_seq":8, "acked_at_ms":null, "command_id":"target-b", "fields":{"target_id":42},
     }));
 }
 
@@ -738,4 +736,105 @@ async fn packet_trace_rejects_unknown_queries_and_out_of_range_limits() {
         let response = control.router().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
     }
+}
+
+// Payload bodies from the Qeynos2 stop-timing-v2 journey on 2026-11-27.
+
+#[tokio::test]
+async fn packet_trace_decodes_zone_entry_wire_payload() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_ZONE_ENTRY,
+        "OP_ZONE_ENTRY",
+        concat!(
+            "436c69656e7461620001000000010000a0400000000000000000000000000000010100000064",
+            "000000000000000000000000000000000000000000000000c040001f85eb3e3333333f010000",
+            "00008c010000ffffffff00000000070064000000000000000000000000000000000000000000",
+            "000000000000000000ffffffffffffffff000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000055020000000018e30700006400000000000000000000000000000030303030",
+            "3030303030303030303030300000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000",
+        ),
+        json!({"entity":1, "name":"Clientab", "position":[-925.0,1194.0,3.125], "heading":0}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_inbound_position_wire_payload() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_CLIENT_UPDATE,
+        "OP_CLIENT_UPDATE",
+        "010000000000550200000000e1e207300064000000000000",
+        json!({"entity":1, "position":[-931.875,1194.0,3.125], "heading":1536}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_target_command_wire_payload() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_TARGET_COMMAND,
+        "OP_TARGET_COMMAND",
+        "02000000",
+        json!({"target_id":2}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_damage_wire_payload() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_DAMAGE,
+        "OP_DAMAGE",
+        "0200010004ffff0000020000000000000000000000000000000000000000",
+        json!({"source":1,"target":2,"type":4,"spell":65535,"damage":2}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_mob_health_wire_payload() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_MOB_HEALTH,
+        "OP_MOB_HEALTH",
+        "020051",
+        json!({"entity":2,"percent":81}),
+    ).await;
+}
+
+async fn assert_inbound_wire_fields(opcode: u16, name: &str, hex: &str, expected: Value) {
+    use eqoxide_net::{testkit::test_stream_with_peer, transport::with_packet_trace};
+
+    let control = control(1, 1);
+    let (mut stream, mut rx, peer, addr) = with_packet_trace(
+        control.packet_trace.clone(),
+        test_stream_with_peer(Default::default()),
+    ).await;
+    // Place the captured app body in a plain OP_Packet frame with sequence zero.
+    let mut datagram = vec![0, 0x09, 0, 0];
+    datagram.extend_from_slice(&opcode.to_le_bytes());
+    datagram.extend(hex.as_bytes().chunks_exact(2)
+        .map(|byte| u8::from_str_radix(std::str::from_utf8(byte).unwrap(), 16).unwrap()));
+    peer.send_to(&datagram, addr).await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            assert!(stream.poll_recv());
+            if let Ok(packet) = rx.try_recv() {
+                break packet;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert_eq!(received.opcode, opcode);
+    let (status, result) = authorized(
+        &control, "GET", &format!("/v2/player/packets?opcode={name}"), None,
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = result["packets"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["opcode_name"], name);
+    assert_eq!(rows[0]["wire_seq"], 0);
+    assert!(rows[0]["acked_at_ms"].is_u64());
+    assert_eq!(rows[0]["fields"], expected);
 }

@@ -199,8 +199,8 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) mod test_fixtures {
     use super::*;
 
     /// Build a complete minimal RoF2-serialized item blob (all effect-name strings empty,
@@ -208,8 +208,7 @@ pub(crate) mod tests {
     ///   slot_type=0 (possessions), main_slot=23 (RoF2 general slot 1), price=100,
     ///   merchant_slot=1, charges=0, id=1001, icon=678, name="Cloth Cap", idfile="IT63".
     ///
-    /// Returns the blob and its expected total length so callers can assert consumed == len.
-    pub fn fixture() -> Vec<u8> {
+    pub(crate) fn fixture() -> Vec<u8> {
         let mut b = vec![0u8; HDR_LEN];
         // ItemSerializationHeader
         b[25] = 0;                                          // slot_type = possessions
@@ -253,6 +252,13 @@ pub(crate) mod tests {
         b.extend_from_slice(&[0u8; 4]);
         b
     }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) use super::test_fixtures::fixture;
 
     /// Second distinct item for multi-item tests (id=2002, icon=999, main_slot=24).
     /// Shares the same name/lore/idfile layout as fixture() so we can patch header+body offsets

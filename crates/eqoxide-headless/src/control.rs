@@ -217,7 +217,6 @@ struct Shared {
 pub struct Control {
     shared: Arc<Shared>,
     packet_trace: SessionTrace,
-    packet_health: eqoxide_ipc::NetHealthShared,
 }
 
 impl Control {
@@ -248,7 +247,6 @@ impl Control {
         let (changed, _) = watch::channel(0);
         Ok(Self {
             packet_trace: SessionTrace::new(Instant::now()),
-            packet_health: Default::default(),
             shared: Arc::new(Shared {
                 session,
                 authorization: format!("Bearer {credential}"),
@@ -273,13 +271,8 @@ impl Control {
         })
     }
 
-    pub(crate) fn with_packet_trace(
-        mut self,
-        trace: SessionTrace,
-        health: eqoxide_ipc::NetHealthShared,
-    ) -> Self {
+    pub(crate) fn with_packet_trace(mut self, trace: SessionTrace) -> Self {
         self.packet_trace = trace;
-        self.packet_health = health;
         self
     }
 
@@ -771,9 +764,6 @@ async fn get_packets(
         query.opcode.as_deref(),
         query.command.as_deref(),
     );
-    // NetHealth is sampled separately from the packet and transport snapshot.
-    let dropped = control.packet_health.lock().unwrap().send_failures_unretried
-        .saturating_add(page.counts.never_sent_reliable_abandoned);
     Ok(Json(json!({
         "packets": page.packets,
         "next": page.next,
@@ -785,8 +775,9 @@ async fn get_packets(
             "resent": page.counts.resent,
             // EqStream::on_raw_recv counts socket reads before decoding, including transport control.
             "received": page.counts.received,
-            // NetHealth::send_failures_unretried plus EqStream teardown losses that never reached the socket.
-            "dropped_unretried": dropped,
+            // EqStream's unretried send failures, control queue losses, and reliable sends
+            // abandoned at teardown that never reached the socket.
+            "dropped_unretried": page.counts.dropped_unretried,
             // EqStream::handle_ordered_decoded counts newly exposed holes in incoming sequences.
             "sequence_gaps": page.counts.sequence_gaps,
         }
