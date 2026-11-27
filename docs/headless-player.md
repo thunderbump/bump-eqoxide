@@ -112,6 +112,28 @@ within 500 units, sorted by spawn ID and capped at 256. `complete:false` disclos
 an authoritative world roster; truncation is separate. LOS is a local static native-map query.
 Unknown instance ID is null. Inventory includes local prediction and does not prove a save.
 
+### Self-position updates
+
+The client streams `OP_ClientUpdate` at most every 280 ms while moving and every 1300 ms
+otherwise. On the first physics step that shows the body at rest after it moved, it attempts one
+update with the resting position, zero delta and animation 0, outside that throttle. The attempt
+follows that step by one network tick (nominally 10 ms). A `stop` that arrives after the host has
+drained commands for a tick waits for the next 20 ms step, so it can take two steps to show.
+The rest decision is made per physics step, not per network tick. A step that covers at most
+0.01 units is at rest; one over 0.1 units is motion that makes the next stop immediate. Rest updates
+for a creep or a turn in place come no closer than 280 ms apart. While a server correction
+is waiting for the controller to apply it, no rest update is sent. The graphical client does not
+publish the step signal and keeps the plain cadence.
+
+`self.last_position_send` is the last update the client attempted, or null before the first:
+`sequence` (the wire sequence), `position` (feet datum; the wire z is 3.1 units higher),
+`delta` and `animation` exactly as sent, `heading` in the state's convention, `reason`
+(`moving`, `keepalive`, `rest` or `correction`), `sent_at_ms`, `age_ms`, and
+`delivery_confirmed:false`. The update is an unreliable datagram; this proves the attempt, not
+receipt. Top-level `clock_ms` is the host's monotonic clock, starting just after the control
+port is bound; every
+`*_at_ms` field uses it.
+
 `GET /v2/player/events?after=SESSION:CURSOR&wait=5` long-polls for at most 5 seconds. Use the
 state's `event_cursor` verbatim. Gaps are explicit; reread state and outstanding commands after one.
 Received chat (including NPC say) carries packet provenance; other game events are labeled client events.

@@ -95,6 +95,31 @@ pub struct MoveIntent {
 pub struct ControllerView {
     /// CPU host fence; graphical publishers retain the legacy unfenced mode.
     pub zone_epoch: Option<u64>,
+    /// Count of controller physics steps published into this view. A publisher increments it
+    /// only on a publish that followed a real `CharacterController::step`, never on a republish
+    /// of an unstepped body. The net streamer compares `pos` across two step counts to tell "the
+    /// body came to rest" from "this net tick fell between physics steps" (the net loop ticks
+    /// about twice as often as the CPU host's 20 ms physics clock), and then sends the resting
+    /// position at once instead of waiting out the keepalive (central-vgwu).
+    ///
+    /// Zero forever means "no step signal": the streamer then never sends a rest flush and keeps
+    /// the plain 280 ms / 1300 ms cadence. The graphical render loop does not publish it.
+    pub step_seq: u64,
+    /// The last self `OP_ClientUpdate` the net streamer attempted (central-vgwu). Written by the
+    /// net thread, never by a publisher. It lives here rather than in `GameState` so a keepalive
+    /// does not change the published snapshot, which the graphical render loop treats as
+    /// activity.
+    pub last_position_send: Option<eqoxide_core::game_state::PositionSend>,
+    /// Server corrections the net streamer has handed to `ControllerSlots::pos_correction`,
+    /// counted under this view's lock before the slot is written (net thread only).
+    pub correction_issued: u64,
+    /// The `correction_issued` value a publisher read, under this view's lock, when it took a
+    /// correction from the slot, republished with the first `pos` after it applied it. While the
+    /// two differ the view may still show the body the server moved away, so the streamer sends no
+    /// rest update. Written by the CPU host, which never lowers it, and by
+    /// `ControllerSlots::begin_zone_in`, which settles a correction it drops. A publisher without
+    /// a step signal never needs to write it.
+    pub correction_adopted: u64,
     pub pos:     [f32; 3],
     pub heading: f32,
     /// False until the render thread has spawned and seeded the controller. The net streamer must
@@ -493,7 +518,7 @@ pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_st
 ///
 /// The render thread is NOT this slot's only writer, and the rendered-frame republish above is not
 /// this slot's only cadence (#1044 review round 1, finding D — same undercount shape as
-/// #1022/#1037, found while checking whether this claim could be left alone). Two NET-thread
+/// #1022/#1037, found while checking whether this claim could be left alone). Three NET-thread
 /// writers also mutate the published view in production, both deliberately and both outside the
 /// frame cadence:
 ///
@@ -509,6 +534,9 @@ pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_st
 ///   every ~10 ms outer-loop pass once the view reads `initialized` — it returns early above that
 ///   line before then — consuming the render thread's one-shot fall signal so it can fire exactly
 ///   once.
+/// * `ActionLoop::stream_position` writes `last_position_send` after each self `OP_ClientUpdate`
+///   it attempts, and bumps `correction_issued` before handing over a correction (central-vgwu).
+///   `begin_zone_in` also raises `correction_adopted` when it drops a pending correction.
 ///
 /// So a consumer must not read "published by the render thread on every rendered frame" as a
 /// guarantee that every field it sees was authored by the render thread on the last frame.
@@ -2333,8 +2361,12 @@ impl ControllerSlots {
     pub fn begin_zone_in(&self, gs: &mut eqoxide_core::game_state::GameState) {
         gs.begin_zone_in();
         // The sole network writer clears departed-zone corrections before publishing new entry.
-        self.pos_correction.lock().unwrap().take();
+        // Under the view lock (view, then slot, the order every writer uses), and the dropped
+        // correction counts as settled: nothing is pending for the controller to adopt, and an
+        // issue count left ahead of the adopt count would keep the rest flush off for good.
         let mut view = self.controller_view.lock().unwrap();
+        self.pos_correction.lock().unwrap().take();
+        view.correction_adopted = view.correction_issued;
         if view.zone_epoch.is_some() { view.initialized = false; }
         view.invalidate_disclosures();
         // #925: the relocation really happened, so it still counts — but its destination named a
