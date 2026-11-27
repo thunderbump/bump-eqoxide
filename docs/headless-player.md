@@ -117,14 +117,16 @@ prediction and does not prove a save.
 
 Beside the prediction, `self` carries what the server said:
 - `server_position`: the last self position update from the server. Its fields are `position`
-  (feet datum), `heading`, `source` and `at_ms`. `source` is `server_update`, or
-  `server_correction` when the update moved the player more than 12 units. Cleared at zone entry.
+  (feet datum), `heading`, `source` and `at_ms`. `source` is `server_correction` when the update is
+  more than 12 units from the client's position in the horizontal plane, measured against the
+  client's mirrored position at the moment the packet arrives; otherwise it is `server_update`. This
+  is the same test that increments `corrections.count`. Cleared at zone entry.
 - `corrections`: `count` for the session, and `last` (`from`, `to`, `at_ms`), which is cleared at
   zone entry.
 - `level`.
-- `mana` and `endurance`, each `{value, max, known}`. `endurance.confirmed` is true once a server
+- `mana` and `endurance`, each `{value, max, known}`. `max` is as the server last reported it. `endurance.confirmed` is true once a server
   update has arrived.
-- `xp`: `{pct}`.
+- `xp`: `{pct}`, progress through the current level as the server reports it.
 - `buffs`: `{slot, spell_id, ticks_remaining}`. A negative `ticks_remaining` means permanent.
 - `skills`.
 - `dead`.
@@ -133,7 +135,7 @@ Beside the prediction, `self` carries what the server said:
 
 Each received `OP_Damage` is also published as a `combat` event: `source_id`, `target_id`,
 `source_name`, `target_name`, `amount` (the damage on a `hit`, else 0), `spell_id` (null for melee),
-`skill` and `result`. `result` is one of `hit`, `miss`, `block`, `parry`, `riposte`, `dodge`,
+`damage_type` (EQEmu's raw damage-type code, not a skill ID) and `result`. `result` is one of `hit`, `miss`, `block`, `parry`, `riposte`, `dodge`,
 `invulnerable`, `rune`, `landed` (a spell with no positive damage) or `other`. A death of self is
 published once as `died`, with the same `killer`.
 

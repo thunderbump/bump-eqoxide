@@ -2119,7 +2119,7 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
         target_id,
         amount: damage.max(0),
         spell_id: (spellid != 0 && spellid != SPELL_UNKNOWN).then_some(spellid),
-        skill: payload[4],
+        damage_type: payload[4],
         result: if spellid != 0 && spellid != SPELL_UNKNOWN && damage <= 0 {
             eqoxide_core::game_state::CombatResult::Landed
         } else {
@@ -4494,11 +4494,11 @@ mod tests {
     fn apply_combat_damage_keeps_a_structured_record_6ly1_8() {
         use super::apply_combat_damage;
         use eqoxide_core::game_state::CombatResult;
-        let dmg = |target: u16, source: u16, skill: u8, spell: u32, damage: i32| -> [u8; 13] {
+        let dmg = |target: u16, source: u16, damage_type: u8, spell: u32, damage: i32| -> [u8; 13] {
             let mut b = [0u8; 13];
             b[0..2].copy_from_slice(&target.to_le_bytes());
             b[2..4].copy_from_slice(&source.to_le_bytes());
-            b[4] = skill;
+            b[4] = damage_type;
             b[5..9].copy_from_slice(&spell.to_le_bytes());
             b[9..13].copy_from_slice(&damage.to_le_bytes());
             b
@@ -4509,7 +4509,7 @@ mod tests {
         apply_combat_damage(&mut gs, &dmg(7, 99, 2, 0, -4));
         apply_combat_damage(&mut gs, &dmg(99, 7, 0, 13, 0));
         let r: Vec<_> = gs.combat_records.iter()
-            .map(|r| (r.id, r.source_id, r.target_id, r.amount, r.spell_id, r.skill, r.result)).collect();
+            .map(|r| (r.id, r.source_id, r.target_id, r.amount, r.spell_id, r.damage_type, r.result)).collect();
         assert_eq!(r, vec![
             (1, 7, 99, 24, None, 1, CombatResult::Hit),
             (2, 99, 7, 0, None, 2, CombatResult::Dodge),

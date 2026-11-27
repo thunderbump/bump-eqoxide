@@ -1128,8 +1128,8 @@ pub struct CombatRecord {
     pub amount: i32,
     /// `None` for melee (wire 0 or `SPELL_UNKNOWN`).
     pub spell_id: Option<u32>,
-    /// The wire `type` byte (the skill used).
-    pub skill: u8,
+    /// The wire `type` byte: EQEmu's damage-type code for the swing or spell, not a skill ID.
+    pub damage_type: u8,
     pub result: CombatResult,
     pub at: std::time::Instant,
 }

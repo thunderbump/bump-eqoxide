@@ -276,7 +276,7 @@ impl Host {
             self.control.publish_event(json!({"kind":"combat","source":"received_packet",
                 "source_id":hit.source_id,"target_id":hit.target_id,"source_name":name_of(hit.source_id),
                 "target_name":name_of(hit.target_id),"amount":hit.amount,"spell_id":hit.spell_id,
-                "skill":hit.skill,"result":hit.result.as_str()}));
+                "damage_type":hit.damage_type,"result":hit.result.as_str()}));
         }
         if let Some(hit) = gs.combat_records.back() {
             self.last_combat = hit.id;
@@ -1163,7 +1163,7 @@ mod tests {
         gs.player_name = "Me".into();
         gs.world.entities.insert(7, rat(7, 5.0));
         let swing = |id| CombatRecord { id, source_id: 1, target_id: 7, amount: 3, spell_id: None,
-            skill: 1, result: CombatResult::Hit, at: Instant::now() };
+            damage_type: 1, result: CombatResult::Hit, at: Instant::now() };
         gs.combat_records.push_back(swing(1));
         gs.combat_records.push_back(swing(2));
         host.update_knowledge(&gs);
@@ -1177,7 +1177,7 @@ mod tests {
         let kinds: Vec<_> = batch.iter().map(|e| e["kind"].as_str().unwrap().to_owned()).collect();
         assert_eq!(kinds, vec!["combat", "combat", "died"]);
         assert_eq!(batch[0], json!({"kind":"combat","source":"received_packet","source_id":1,"target_id":7,
-            "source_name":"Me","target_name":"a_rat","amount":3,"spell_id":null,"skill":1,"result":"hit"}));
+            "source_name":"Me","target_name":"a_rat","amount":3,"spell_id":null,"damage_type":1,"result":"hit"}));
         assert_eq!(batch[2]["killer"], json!({"id":7,"name":"a_rat"}));
     }
     #[test]
