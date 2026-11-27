@@ -396,3 +396,38 @@ async fn position_window_with_two_commands_is_unattributed() {
     assert_eq!(trace["packets"].as_array().unwrap().len(), 1);
     assert_eq!(trace["packets"][0]["command_id"], Value::Null);
 }
+
+
+/// Removing the adoption reset makes the first post-correction send look like mixed provenance.
+#[tokio::test]
+async fn correction_adoption_discards_late_pre_correction_provenance() {
+    let mut session = Session::new().await;
+    let floor = floor();
+    session.gs.world.zone_name = "synthetic".into();
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.02);
+    session.drain();
+
+    session.dispatch("before", json!({"kind":"move_for","east":1,"north":0,"duration_ms":2000})).await;
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.05);
+    let slots = session.host.controller_slots.clone();
+    let late_publication = std::mem::take(&mut slots.controller_view.lock().unwrap().position_commands);
+    assert_eq!(late_publication.command_id().map(|id| id.as_ref()), Some("before"));
+
+    // Replay the race deterministically. The network snapshot missed A's publication, but it
+    // is in the shared view by the time B takes the correction.
+    session.gs.player_x = 30.0;
+    session.drain();
+    assert!(slots.pos_correction.lock().unwrap().is_some());
+    slots.controller_view.lock().unwrap().position_commands = late_publication;
+    session.dispatch("after", json!({"kind":"move_for","east":0,"north":1,"duration_ms":2000})).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.05);
+    session.drain();
+
+    session.assert_packets("before", &[]).await;
+    session.assert_packets("after", &[OP_CLIENT_UPDATE]).await;
+    let trace = session.packets("opcode=OP_CLIENT_UPDATE").await;
+    let rows = trace["packets"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["command_id"], Value::Null);
+}

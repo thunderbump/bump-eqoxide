@@ -208,13 +208,17 @@ outbound fragment or the completing inbound fragment.
 Inbound rows carry `arrived_at_ms` on the host clock and a session-wide `arrival_n`
 assigned when the client reads the datagram from the socket, before reordering. Rows
 from the same combined datagram share these values. Fragmented rows use the arrival of
-the completing fragment. Socket reads that produce no zone row consume indices too.
-Outbound rows have null arrival fields. Page and filter by `n` as usual, then read
-`arrival_n` to recover datagram arrival order.
+the completing fragment. A retransmit or duplicate of an inbound reliable packet
+does not create a second row. A datagram carrying a duplicate still consumes an
+arrival index. If the sequence is still buffered, the delivered row retains the first copy's
+`arrival_n` and `arrived_at_ms`. Socket reads that produce no zone row also consume
+indices. Outbound rows have null arrival fields. Page by `n` and read `arrival_n`
+to recover datagram arrival order.
 
-For an inbound reliable row, `acked_at_ms` records when the socket accepted the first
-cumulative ACK covering its sequence. `ack_seq` is the actual sequence on that ACK,
-and `ack_exact` is true if it equals `wire_seq`. An immediate ACK is sent before the row
+For an inbound reliable row, `acked_at_ms` records when the socket accepts the first
+cumulative ACK datagram covering its sequence. For a row awaiting ACK, queuing a
+deferred datagram leaves the timestamp null until a successful socket send.
+`ack_seq` is the actual sequence on that ACK, and `ack_exact` is true if it equals `wire_seq`. An immediate ACK is sent before the row
 is captured, so `acked_at_ms` can be at or before `at_ms`. A missing ACK leaves
 `acked_at_ms` and `ack_seq` null and `ack_exact` false. Poll the same cursor range to
 check for an ACK on an existing row. Stop waiting if the stream ends before a covering
@@ -234,15 +238,18 @@ Headings use the raw protocol units.
 | --- | --- | --- |
 | `OP_ZONE_ENTRY` (0x5089) | Inbound | `entity`, `name`, `position`, `heading` |
 | `OP_CLIENT_UPDATE` (0x7dfc) | Inbound | `entity`, `position`, `heading` |
-| `OP_CLIENT_UPDATE` (0x7dfc) | Outbound | `position`, `delta`, `animation`, `heading` |
+| `OP_CLIENT_UPDATE` (0x7dfc) | Outbound | `sequence`, `position`, `delta`, `animation`, `heading` |
 | `OP_TARGET_COMMAND` (0x58e2) | Both | `target_id` |
 | `OP_TARGET_MOUSE` | Outbound | `target_id` |
 | `OP_DAMAGE` (0x6f15) | Inbound | `target`, `source`, `type`, `spell`, signed `damage` |
 | `OP_MOB_HEALTH` (0x37b1) | Inbound | `entity`, `percent` |
 | `OP_DELETE_SPAWN` (0x7280) | Inbound | `entity` |
 
-Other rows have empty `fields`. The network owner tags outbound packets emitted by a
-command drain, including awaited merchant open and buy. The explicit loot command ID
+Outbound `OP_CLIENT_UPDATE` uses the payload's own 16-bit `sequence` counter.
+Its unreliable transport `wire_seq` is null. Other opcodes have empty `fields`.
+
+The network owner tags outbound packets emitted by a command drain, including
+awaited merchant open and buy. The explicit loot command ID
 follows its corpse queue entry and tags the open, item takes, and close. A movement
 command tags the position updates it drives, including keepalives while it is active
 and the rest update at its end. Correction re-streams and position windows influenced

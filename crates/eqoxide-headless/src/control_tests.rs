@@ -638,7 +638,7 @@ async fn packet_trace_orders_and_filters_decoded_packets() {
     let trace = SessionTrace::new(now - Duration::from_millis(42));
     let control = control(10, 10).with_packet_trace(trace.clone());
 
-    let position = encode_client_position_update(2, 12, [15.0, -20.0, 0.0], [1.0, 2.0, 3.0], 400, 17);
+    let position = encode_client_position_update(0x9a02, 12, [15.0, -20.0, 0.0], [1.0, 2.0, 3.0], 400, 17);
     trace.capture(Dir::Out, OP_CLIENT_UPDATE, &position, None, None);
     trace.capture(Dir::Out, OP_TARGET_MOUSE, &41u32.to_le_bytes(), Some(7), Some("target-a".into()));
     trace.capture(Dir::Out, OP_TARGET_MOUSE, &42u32.to_le_bytes(), Some(8), Some("target-b".into()));
@@ -670,6 +670,7 @@ async fn packet_trace_orders_and_filters_decoded_packets() {
     assert_eq!(pos["wire_seq"], Value::Null);
     assert_eq!(pos["command_id"], Value::Null);
     assert_eq!(pos["fields"], json!({
+        "sequence": 0x9a02,
         "position": [15.0, -20.0, eqoxide_core::coord::WIRE_Z_OFFSET],
         "delta": [1.0, 2.0, 3.0], "animation": 17, "heading": 400,
     }));

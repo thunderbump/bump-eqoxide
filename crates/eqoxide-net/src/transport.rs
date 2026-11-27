@@ -8,7 +8,7 @@ use super::packet_telemetry::{
 use super::protocol::*;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use eqoxide_ipc::SessionDropCause;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -1615,7 +1615,17 @@ impl EqStream {
                         self.incoming_high_water = Some(seq);
                     }
                 }
-                self.recv_buf.insert(seq, packet);
+                match self.recv_buf.entry(seq) {
+                    Entry::Occupied(mut entry) => {
+                        // Keep the first socket arrival while preserving the existing payload
+                        // replacement and ACK behavior for a buffered retransmission.
+                        let arrival = entry.get().arrival;
+                        entry.insert(OrderedDatagram { arrival, ..packet });
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(packet);
+                    }
+                }
                 // Mirror the server's own receive path (EQEmu `eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:715`,
                 // `SendOutOfOrderAck(stream_id, sequence)`): on a gap, immediately OutOfOrderAck the
                 // out-of-order packet we just BUFFERED. The server's `OutOfOrderAck` handler drops that
@@ -2390,6 +2400,39 @@ mod tests {
         assert_eq!(page.packets[1].arrival_n, Some(1));
         assert_eq!(page.packets[0].arrived_at_ms, Some(19));
         assert_eq!(page.packets[1].arrived_at_ms, Some(11));
+    }
+
+    /// A buffered retry can replace the bytes, but must not move the first arrival past another row.
+    #[tokio::test]
+    async fn packet_trace_keeps_first_arrival_for_buffered_duplicate() {
+        use std::time::Duration;
+
+        let started = Instant::now() - Duration::from_secs(1);
+        let trace = SessionTrace::new(started);
+        let (mut stream, mut rx, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+        for (seq, value, at_ms) in [(2, 20, 10), (1, 10, 20), (2, 21, 30), (0, 0, 40)] {
+            stream.on_raw_recv_at(
+                &[0, OP_PACKET, 0, seq, 0x34, 0x12, value],
+                started + Duration::from_millis(at_ms),
+            );
+        }
+
+        let page = trace.page(0, 10, None, None);
+        assert_eq!(page.packets.len(), 3);
+        for (row, first_n, first_ms, value) in [
+            (&page.packets[0], 4, 40, 0),
+            (&page.packets[1], 2, 20, 10),
+            (&page.packets[2], 1, 10, 21),
+        ] {
+            assert_eq!(row.arrival_n, Some(first_n));
+            assert_eq!(row.arrived_at_ms, Some(first_ms));
+            assert_eq!(rx.try_recv().unwrap().payload, [value]);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(page.counts.received, 4);
+        assert_eq!(page.counts.sent, 6, "three out-of-order ACKs and three cumulative ACKs");
     }
 
     /// Omitting the high-water reset masks the next hole once the previous buffer has drained.

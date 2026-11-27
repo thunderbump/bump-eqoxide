@@ -225,17 +225,20 @@ impl Host {
             return;
         }
         view.zone_epoch = Some(self.epoch);
+        if let Some((_, issued)) = taken {
+            // An old physics step can publish after the net owner's snapshot and before it
+            // issues this correction. Replace that provenance before recording the adopted step.
+            view.position_commands = ipc::PositionCommands::None;
+            self.ending_motion = None;
+            // Zone entry can settle a later correction while this step runs.
+            view.correction_adopted = view.correction_adopted.max(issued);
+        }
         let active_command = self.motion.as_ref().map(|motion| &motion.id);
         view.active_motion_command = active_command.cloned();
         if stepped {
             view.step_seq = view.step_seq.wrapping_add(1);
             view.position_commands.include(active_command);
             view.position_commands.include(self.ending_motion.take().as_ref());
-        }
-        if let Some((_, issued)) = taken {
-            // Monotonic: zone entry may have settled a later correction while this step ran, and
-            // publishing this one's older count would roll that back.
-            view.correction_adopted = view.correction_adopted.max(issued);
         }
         view.pos = body.pos;
         view.heading = self.heading;

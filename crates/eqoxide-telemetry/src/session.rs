@@ -95,6 +95,7 @@ impl SessionPacket {
 #[serde(untagged)]
 enum Fields {
     Position {
+        sequence: u16,
         position: [f32; 3],
         delta: [f32; 3],
         animation: u32,
@@ -300,6 +301,7 @@ fn decode_fields(dir: Dir, opcode: u16, body: &[u8]) -> Fields {
     let f32_at = |i| f32::from_bits(u32_at(i));
     match (dir, opcode) {
         (Dir::Out, p::OP_CLIENT_UPDATE) if body.len() >= 46 => Fields::Position {
+            sequence: u16_at(0),
             position: [f32_at(18), f32_at(30), f32_at(26)],
             delta: [f32_at(10), f32_at(38), f32_at(22)],
             animation: u32_at(34) & 0x3ff,
