@@ -2821,9 +2821,9 @@ impl ActionLoop {
         let dist_sq = |a: [f32; 3], b: [f32; 3]| {
             (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
         };
-        // A new zone, an unadopted correction and the step that adopts one give no rest evidence:
-        // reseed and wait for the next step. Motion from the departed zone, or the teleport onto a
-        // correction already sent, owes the server nothing.
+        // A new zone and an unadopted correction give no rest evidence: reseed and wait for the
+        // next step, since motion from the departed zone owes the server nothing. The step that
+        // adopts a correction is measured from the correction already sent (below).
         let unadopted = view.correction_adopted != view.correction_issued;
         let adopting = view.correction_adopted != self.seen_adopted;
         self.seen_adopted = view.correction_adopted;
