@@ -119,8 +119,9 @@ otherwise. On the first physics step that shows the body at rest after it moved,
 update with the resting position, zero delta and animation 0, outside that throttle. The attempt
 follows that step by one network tick (nominally 10 ms). A `stop` that arrives after the host has
 drained commands for a tick waits for the next 20 ms step, so it can take two steps to show.
-The rest decision is made per physics step, not per network tick. A creep under 0.1 units per
-step and a turn in place send rest updates no closer than 280 ms apart. While a server correction
+The rest decision is made per physics step, not per network tick. A step that covers at most
+0.01 units is at rest; one over 0.1 units is motion that makes the next stop immediate. Rest updates
+for a creep or a turn in place come no closer than 280 ms apart. While a server correction
 is waiting for the controller to apply it, no rest update is sent. The graphical client does not
 publish the step signal and keeps the plain cadence.
 
