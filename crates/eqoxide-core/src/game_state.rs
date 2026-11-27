@@ -1880,6 +1880,13 @@ impl GameState {
         }
     }
 
+    /// Record a position the server asserted for the player, in the feet datum (central-6ly1.8).
+    pub fn record_server_position(&mut self, pos: [f32; 3], heading: f32, source: ServerPositionSource) {
+        self.server_self_position = Some(ServerSelfPosition {
+            pos, heading, source, at: std::time::Instant::now(),
+        });
+    }
+
     /// Start a zone-server session (login zone handoff, or an in-game zone change): purge the
     /// previous zone's spawns and doors and re-arm the once-per-zone-in OP_NewZone apply. Called at
     /// the top of each zone-entry handshake, before OP_ReqClientSpawn asks for the spawn stream, so
@@ -1897,13 +1904,6 @@ impl GameState {
     /// survive exactly one tick before the departed zone's hold came back — which is the opposite of
     /// what the comments on those two lines claim to achieve. This function cannot reach the view
     /// itself (`eqoxide-core` sits below `eqoxide-ipc`), so the pairing lives there.
-    /// Record a position the server asserted for the player, in the feet datum (central-6ly1.8).
-    pub fn record_server_position(&mut self, pos: [f32; 3], heading: f32, source: ServerPositionSource) {
-        self.server_self_position = Some(ServerSelfPosition {
-            pos, heading, source, at: std::time::Instant::now(),
-        });
-    }
-
     pub fn begin_zone_in(&mut self) {
         self.zone_epoch = self.zone_epoch.checked_add(1).expect("zone epoch exhausted");
         self.world.entities.clear();

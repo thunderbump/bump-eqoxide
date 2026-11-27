@@ -2000,9 +2000,6 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
             .unwrap_or_else(|| "something".to_string());
         gs.killer_id = (killer_id != 0).then_some(killer_id);
         gs.death_count = gs.death_count.wrapping_add(1);
-        if killer_id == gs.player_id && !gs.player_name.is_empty() {
-            gs.killed_by = gs.player_name.clone();
-        }
         gs.died_at   = Some(std::time::Instant::now());
         gs.hp_pct    = 0.0;
         gs.player_dead = true; // dead pose (eqoxide#61)
@@ -3216,16 +3213,28 @@ fn apply_move_door(gs: &mut GameState, p: &[u8]) {
     gs.push_ack(ServerAck::DoorMoved { door_id });
 }
 
+/// A float heading in EQ units (0–512, the server's `m_Position.w`), as `ZonePlayerToBind_Struct`
+/// and `RequestClientZoneChange_Struct` carry it, in the client's CCW degrees.
+pub(crate) fn server_heading_to_ccw(eq_units: f32) -> f32 {
+    crate::protocol::cw_to_ccw((eq_units * 360.0 / 512.0).rem_euclid(360.0))
+}
+
 fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 20 { return; }
     let mut r = WireReader::new(payload, "OP_Respawn");
-    r.skip(4); // spawn_id / zone_id header (unused here)
+    let bind_zone = r.u16() as u32; // ZonePlayerToBind_Struct: bind_zone_id, then instance
+    r.skip(2);
     gs.player_x = r.f32();
     gs.player_y = r.f32();
     gs.player_z = r.f32() - eqoxide_core::coord::WIRE_Z_OFFSET; // wire→foot datum (#522)
     gs.player_pos_known = true; // server-authoritative respawn point (#513)
-    gs.record_server_position([gs.player_x, gs.player_y, gs.player_z], gs.player_heading,
-        eqoxide_core::game_state::ServerPositionSource::Relocation);
+    // central-6ly1.8: only a bind in this zone is a position here. A bind in another zone names
+    // coordinates there; the self spawn of that zone records them on entry.
+    if payload.len() >= 20 && (bind_zone == gs.world.zone_id as u32 || gs.world.zone_id == 0) {
+        let heading = server_heading_to_ccw(f32::from_le_bytes(payload[16..20].try_into().unwrap()));
+        gs.record_server_position([gs.player_x, gs.player_y, gs.player_z], heading,
+            eqoxide_core::game_state::ServerPositionSource::Relocation);
+    }
     // #660 B2: the SERVER has now told us where we are, so the position is no longer the
     // client's crossing guess. This is the ONLY kind of event that clears it — the zone echo
     // settles which ZONE, not where in it.
@@ -3738,6 +3747,16 @@ mod tests {
         gs2.player_id = 7; gs2.max_hp = 100; gs2.cur_hp = 100;
         super::apply_death(&mut gs2, &self_death_payload(7));
         assert_eq!(gs2.killed_by, "something");
+        // central-6ly1.8: the killer's ID and a session death count, without changing the
+        // graphical `killed_by` wording for a self-inflicted death.
+        assert_eq!((gs.killer_id, gs.death_count), (Some(42), 1));
+        let mut gs3 = GameState::new();
+        gs3.player_id = 7; gs3.player_name = "Me".into();
+        let mut p = vec![0u8; SIZE_DEATH];
+        p[0..4].copy_from_slice(&7u32.to_le_bytes());
+        p[4..8].copy_from_slice(&7u32.to_le_bytes()); // our own spawn killed us
+        super::apply_death(&mut gs3, &p);
+        assert_eq!((gs3.killer_id, gs3.killed_by.as_str()), (Some(7), "something"));
     }
 
     #[test]
@@ -3754,6 +3773,7 @@ mod tests {
 
         apply_death(&mut gs, &self_death_payload(42)); // duplicate
         assert_eq!(gs.player_dead_since, first, "duplicate must not restart the timer");
+        assert_eq!(gs.death_count, 1, "a duplicate death packet is not a second death");
         let slain_count = gs.messages.iter().filter(|m| m.text.contains("slain")).count();
         assert_eq!(slain_count, 1, "duplicate death must not log a second slain message");
     }
@@ -4520,6 +4540,7 @@ mod tests {
         };
         let mut gs = GameState::new();
         gs.player_id = 7;
+        gs.zone_epoch = 3;
         gs.player_name = "Me".into();
         gs.world.entities.insert(99, eqoxide_core::game_state::make_entity(99, "a_rat", 0.0, 0.0, 0.0, true));
         const MELEE: u32 = 0xFFFF; // SPELL_UNKNOWN: what EQEmu sends for a melee swing
@@ -4537,6 +4558,7 @@ mod tests {
         ]);
         assert_eq!((gs.combat_records[0].source_name.as_deref(), gs.combat_records[0].target_name.as_deref()),
             (Some("Me"), Some("a_rat")), "names resolved when the packet arrives");
+        assert_eq!(gs.combat_records[0].zone_epoch, 3, "the epoch the packet arrived in");
         for (wire, result) in [(-1, CombatResult::Block), (-2, CombatResult::Parry), (-3, CombatResult::Riposte),
                                (-5, CombatResult::Invulnerable), (-6, CombatResult::Rune), (-9, CombatResult::Other)] {
             apply_combat_damage(&mut gs, &dmg(7, 99, 1, MELEE, wire));
@@ -6051,14 +6073,39 @@ mod tests {
     #[test]
     fn a_bind_respawn_records_a_server_relocation_6ly1_8() {
         use eqoxide_core::game_state::ServerPositionSource;
+        let bind = |zone: u16| {
+            let mut p = vec![0u8; 20];
+            p[0..2].copy_from_slice(&zone.to_le_bytes());
+            p[4..8].copy_from_slice(&55.0f32.to_le_bytes());
+            p[8..12].copy_from_slice(&(-3.0f32).to_le_bytes());
+            p[12..16].copy_from_slice(&(7.0 + eqoxide_core::coord::WIRE_Z_OFFSET).to_le_bytes());
+            p[16..20].copy_from_slice(&128.0f32.to_le_bytes()); // 128 of 512 units: 90° clockwise, east
+            p
+        };
         let mut gs = GameState::new();
-        let mut p = vec![0u8; 20];
-        p[4..8].copy_from_slice(&55.0f32.to_le_bytes());
-        p[8..12].copy_from_slice(&(-3.0f32).to_le_bytes());
-        p[12..16].copy_from_slice(&(7.0 + eqoxide_core::coord::WIRE_Z_OFFSET).to_le_bytes());
-        super::apply_bind_respawn(&mut gs, &p);
-        let pos = gs.server_self_position.expect("a bind respawn is a server-asserted position");
+        gs.world.zone_id = 2;
+        super::apply_bind_respawn(&mut gs, &bind(2));
+        let pos = gs.server_self_position.expect("a bind in this zone is a server-asserted position");
         assert_eq!((pos.pos, pos.source), ([55.0, -3.0, 7.0], ServerPositionSource::Relocation));
+        assert!((pos.heading - 270.0).abs() < 0.01, "east is 270 counter-clockwise: {}", pos.heading);
+        let mut gs = GameState::new();
+        gs.world.zone_id = 2;
+        super::apply_bind_respawn(&mut gs, &bind(9));
+        assert!(gs.server_self_position.is_none(), "a bind in another zone names no position here");
+    }
+
+    #[test]
+    fn the_self_spawn_records_a_server_spawn_position_6ly1_8() {
+        use eqoxide_core::game_state::ServerPositionSource;
+        let mut gs = GameState::new();
+        gs.player_name = "Me".into();
+        super::register_spawn(&mut gs, crate::protocol::SpawnInfo {
+            spawn_id: 7, name: "Me".into(), npc: 0, race: 1, x: 1.0, y: 2.0,
+            z: 3.0 + eqoxide_core::coord::WIRE_Z_OFFSET, heading: 45.0,
+            ..crate::protocol::SpawnInfo::for_test()
+        });
+        let pos = gs.server_self_position.expect("the self spawn is a server-asserted position");
+        assert_eq!((pos.pos, pos.heading, pos.source), ([1.0, 2.0, 3.0], 45.0, ServerPositionSource::Spawn));
     }
 
     #[test]

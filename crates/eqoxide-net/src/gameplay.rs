@@ -430,7 +430,13 @@ pub async fn run_gameplay_phase(
                         gs.player_y = y;
                         gs.player_z = z;
                         gs.player_pos_known = true; // server-driven teleport destination (#513)
-                        gs.record_server_position([x, y, z], gs.player_heading,
+                        // RequestClientZoneChange_Struct: heading float at 20; z is the wire datum,
+                        // like every other server position, so the record converts it to feet.
+                        let heading = f32::from_le_bytes([packet.payload[20], packet.payload[21],
+                            packet.payload[22], packet.payload[23]]);
+                        gs.record_server_position(
+                            [x, y, z - eqoxide_core::coord::WIRE_Z_OFFSET],
+                            crate::packet_handler::server_heading_to_ccw(heading),
                             eqoxide_core::game_state::ServerPositionSource::Relocation);
                         // #660 B2: the SERVER has now told us where we are, so the position is no longer the
                         // client's crossing guess. This is the ONLY kind of event that clears it — the zone echo

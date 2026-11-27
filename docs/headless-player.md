@@ -110,7 +110,10 @@ State contains one published revision, native geometry digest, network tick/inbo
 predicted feet position, vitals, inventory and catalog revisions. The roster is received knowledge
 within 500 units of the predicted position, nearest first (ties by spawn ID) and capped at 256.
 Each entity carries `distance` from that position, `heading` and the nine `equipment` material IDs
-as received. Every range check on a command uses the same predicted position and distance.
+as received. Every range check on a command measures from the self position in the last published
+state, so a script reads the origin the host decides with. The entity's position is its current one,
+which can have moved since that publication. Ordinary commands are not admitted until a publication
+has shown a self position.
 `complete:false` discloses that it is not an authoritative world roster; truncation is separate.
 LOS is a local static native-map query. Unknown instance ID is null. Inventory includes local
 prediction and does not prove a save.
@@ -119,7 +122,8 @@ Beside the prediction, `self` carries what the server said:
 - `server_position`: the last position the server asserted for self, or null. Its fields are
   `position` (feet datum), `heading`, `source` and `at_ms`. `source` is one of:
   - `server_spawn`: the self spawn at zone entry;
-  - `server_relocation`: a bind respawn or same-zone teleport;
+  - `server_relocation`: a bind respawn in this zone, or a same-zone teleport, with the heading the
+    packet carried. A bind into another zone is recorded by that zone's self spawn;
   - `server_correction`: a self position update more than 12 units from the client's mirrored
     position in the horizontal plane, the test that increments `corrections.count`;
   - `server_update`: any other self position update.
@@ -139,7 +143,7 @@ Beside the prediction, `self` carries what the server said:
 - `skills`.
 - `dead`.
 - `killer`: `{id, name}` after a death. `id` comes from the death packet and is kept even when
-  `name` is unknown, in which case `name` is null.
+  `name` is unknown, in which case `name` is null. A self-inflicted death names the player.
 
 Each received `OP_Damage` is also published as a `combat` event: `record_id` (monotonic),
 `zone_epoch`, `source_id`, `target_id`, `source_name` and `target_name` (resolved when the packet

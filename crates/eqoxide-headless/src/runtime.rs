@@ -293,7 +293,7 @@ impl Host {
             }
             self.last_death_count = gs.death_count;
             self.control.publish_event(json!({"kind":"died","source":"received_packet","death_count":gs.death_count,
-                "killer":{"id":gs.killer_id,"name":known_killer_name(&gs.killed_by)}}));
+                "killer":{"id":gs.killer_id,"name":known_killer_name(gs)}}));
         }
         for event in self.command.actions().take_events() {
             if let Some((id, transaction)) = self.action_ids.remove(&event.id) {
@@ -644,16 +644,22 @@ fn server_self_fields(gs: &GameState, started: Instant) -> serde_json::Map<Strin
             "ticks_remaining":b.duration_ticks})).collect::<Vec<_>>(),
         "skills": gs.player_skills,
         "dead": gs.player_dead_since.is_some(),
-        "killer": gs.died_at.map(|_| json!({"id":gs.killer_id,"name":known_killer_name(&gs.killed_by)})),
+        "killer": gs.died_at.map(|_| json!({"id":gs.killer_id,"name":known_killer_name(gs)})),
     });
     match value {
         Value::Object(map) => map,
         _ => unreachable!("built as an object"),
     }
 }
-/// `GameState::killed_by` falls back to "something" when the death packet named no known spawn.
-fn known_killer_name(name: &str) -> Option<&str> {
-    (!name.is_empty() && name != "something").then_some(name)
+/// The killer's name, or null when unknown. `GameState::killed_by` falls back to "something" when
+/// the death packet named no known spawn; a self-inflicted death names the player, resolved here
+/// so the graphical overlay's wording is unchanged.
+fn known_killer_name(gs: &GameState) -> Option<String> {
+    if gs.killer_id.is_some_and(|id| id == gs.player_id && id != 0) && !gs.player_name.is_empty() {
+        return Some(gs.player_name.clone());
+    }
+    let name = gs.killed_by.as_str();
+    (!name.is_empty() && name != "something").then(|| name.to_owned())
 }
 /// Distance from the published self position, the one value every range check and the roster
 /// use (central-6ly1.8). `None` while there is no body to measure from.
@@ -842,6 +848,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             control.set_ready(false);
             host.body = None;
             host.epoch = gs.zone_epoch;
+            host.published_position = None;
             host.zone_in = ZoneIn::default();
             col = None;
             loaded_zone.clear();
@@ -895,6 +902,8 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             && link_age < 15000
             && !dropped
             && gs.player_dead_since.is_none()
+            // Range checks measure from the last published position, so none can run before one.
+            && host.published_position.is_some()
             && !(gs.max_hp > 0 && gs.cur_hp <= 0);
         host.step(&gs, col.as_deref(), ready, now, dt);
         host.update_knowledge(&gs);
@@ -1197,6 +1206,10 @@ mod tests {
         assert_eq!(f["mana"], json!({"value":10,"max":20,"known":true}));
         assert_eq!(f["dead"], true);
         assert_eq!(f["killer"], json!({"id":55,"name":null}), "the id survives an unknown name");
+        gs.player_id = 55;
+        gs.player_name = "Me".into();
+        assert_eq!(server_self_fields(&gs, started)["killer"], json!({"id":55,"name":"Me"}),
+            "a self-inflicted death names the player without changing killed_by");
     }
     /// central-6ly1.8: each received swing becomes one structured event, and a death one `died`.
     #[test]
@@ -1229,6 +1242,7 @@ mod tests {
             "source_id":1,"target_id":7,"source_name":"Me","target_name":"a_rat","amount":3,"spell_id":null,
             "damage_type":1,"result":"hit"}));
         assert_eq!(batch[2]["killer"], json!({"id":7,"name":"a_rat"}));
+        assert_eq!(batch[2]["death_count"], 1);
 
         // Records evicted before the host saw them, and two deaths between reads, are reported.
         gs.combat_records.clear();
