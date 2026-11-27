@@ -1,6 +1,7 @@
 # Headless player API additions (central-6ly1)
 
-Status: revision 3.1, 2026-11-27. This is the last document-only round; see "Deferred to code
+Status: revision 3.2, 2026-11-27. Revision 3.2 adds only the script-visible findings of the
+claude-opus-5-5 review of revision 3. This is the last document-only round; see "Deferred to code
 review" at the end. Revisions 1 and 2 were each reviewed by gpt-6.2-sol and
 claude-opus-5-5. Most findings against revision 2 concerned per-operation server evidence that a
 design document cannot settle without a server. Coordination approved restructuring the document
@@ -42,7 +43,7 @@ revision 2, which is withdrawn: `target` keeps sending `OP_TargetMouse`.
 | 18 | Movement and attack-lease deadlines | Wall clock | Accumulated physics time for movement; the attack lease stays on the network owner's monotonic clock (A7) |
 | 19 | Readiness on stdout | `API_PORT=` before login | Also `EQOXIDE_READY` and `EQOXIDE_EXIT` lines (A6) |
 | 20 | `session_ended` event | Published when the network task ends | Kept. The EXIT line carries the typed cause |
-| 21 | Reason codes | `busy`, `session_or_zone_not_ready`, `precondition_failed_or_network_mailbox_busy`, `queued_without_server_receipt`, `superseded_by_safety_command` | Replaced by the A2 codes. Admission: `not_ready`, `dead`, `busy_merchant`, `busy_inventory`, `busy_same_kind`, `lifecycle_pending`. Claim (A2.3): `cancelled`, `network_mailbox_busy`, `dispatch_timeout`. Evidence: `no_server_evidence_within_window`, `no_server_receipt_in_protocol`. `superseded_by_safety_command` remains for a `move_for`, `goto` or `attack` cancelled by `stop` or `attack_off` |
+| 21 | Reason codes | `busy`, `session_or_zone_not_ready`, `precondition_failed_or_network_mailbox_busy`, `queued_without_server_receipt`, `superseded_by_safety_command` | Replaced by the A2 codes. Admission: `not_ready`, `dead`, `busy_merchant`, `busy_inventory`, `busy_same_kind`, `lifecycle_pending`. Claim (A2.3): `cancelled`, `network_mailbox_busy`, `dispatch_timeout`. Evidence: `no_server_evidence_within_window`, `no_server_receipt_in_protocol`. `superseded_by_safety_command` remains for a request cancelled by a safety command or an overwrite. The complete list is in A2.7 |
 | 22 | Death and readiness | Death makes the host not Ready, which fences every pending command | Death is not a readiness drop. A2.5 |
 | 23 | `sit`, `stand`, `say`, `tell`, `sell`, `merchant_close`, `inventory_move` receipts | `unknown` straight after dispatch | `sent`, then `unknown`, until the registry promotes the operation |
 | 24 | Attack renewal | A new `attack` is refused `busy` while the previous one is non-terminal; otherwise it re-sends | An admitted `lease_extended` (A2.4) |
@@ -52,6 +53,9 @@ revision 2, which is withdrawn: `target` keeps sending `OP_TargetMouse`.
 | 28 | Bind failure and logout-deadline exits | Exit 1 | `bind_failed` 3, `logout_incomplete` 6 |
 | 29 | Malformed command body | 422 `invalid_command_payload` | Unchanged (A3) |
 | 30 | `busy` scope (correction to row 12) | Another **non-priority** command `accepted` or `sent` | A2.4 |
+| 31 | Repeated `attack` | Admitted, and resets the lease | Admitted as `lease_extended` (A2.4) |
+| 32 | Retarget while a `target` is non-terminal | Refused `busy` | Refused `busy_same_kind` (A2.4). With the default window of 0, `target` is terminal almost at once |
+| 33 | `say "/camp"` while a lifecycle command is pending | A local camp toggle that can cancel a camp | Still a toggle. It is admitted while its own camp is pending, so it can cancel that camp |
 
 The `motion_expired` and `motion_stopped` events stay alongside `completion`. `say "/camp"` stays
 a local camp toggle and is routed through the `camp` lifecycle rules (A2.5).
@@ -81,6 +85,13 @@ in `_at_ms`, on this clock.
 have been caused by this command. Anything weaker is `unknown`. When two outstanding commands could
 explain the same reply, both become `unknown`.
 
+**Default window.** An operation whose registry row is not promoted goes from `sent` to `unknown`
+with `no_server_receipt_in_protocol` once all of its packets have reached the transport, with a
+window of 0. A promotion PR sets its own window.
+
+**Refusal after the claim.** A claimed request may still end `refused`, provided none of its packets
+reached the transport. Examples: a target that left the roster, or an item no longer in its slot.
+
 Receipt fields: `id`, `status`, `terminal`, `reason`, `detail`, `evidence`, `accepted_at_ms`,
 `updated_at_ms` and `completion`.
 
@@ -94,9 +105,12 @@ a sequence gap.
   The only later write is `completion`, which goes from absent to present once (A2.6).
 - **Fences** (`not_ready`, `zone_epoch_changed`) act only on non-terminal receipts. An `accepted`
   receipt that was not yet claimed becomes `refused`; a claimed one becomes `unknown`.
-- **Fence-spanning operations.** `respawn`, `cross_zone` and `camp` are not fenced by the readiness
-  drop or epoch change they cause. They settle by their registry rows, or end `unknown` at their
-  deadline.
+- **Fence-spanning operations.** `respawn`, `cross_zone` and `camp` are exempt from every readiness
+  and epoch fence until their deadline, whatever caused the fence. They settle by their registry
+  rows, or end `unknown` at their deadline.
+- Any write that overwrites a pending request in a last-wins slot cancels that request atomically
+  with `superseded_by_safety_command`. Examples: `attack_off`, `sit` and `camp` overwriting a pending
+  attack, or a halt.
 
 ### A2.3 The network claim and exactly-once
 
@@ -152,21 +166,23 @@ a sequence gap.
 | --- | --- | --- |
 | Merchant context | `merchant_open`, `merchant_close`, `buy`, `sell` | One non-terminal at a time per session (`busy_merchant`) |
 | Inventory-changing | `buy`, `sell`, `inventory_move`, `give`, `loot` | One execution at a time (`busy_inventory`), including a loot pipeline that is still taking items after its receipt is terminal. Any `unknown` in this class blocks further members until relog, as the shared transaction block does today |
-| Same-reply kinds | `target`, `consider`, `hail`, `door`, `memorize`, `cast`, and each chat channel (`say`, `tell`, `group`, ...) | One non-terminal per kind (`busy_same_kind`). Replies are matched by a quarantine key of kind plus entity, door or gem. A reply matching the key of a now-terminal command is never evidence for a newer one. If attribution stays ambiguous, the receipt is `unknown` |
-| Attack | `attack` | A new `attack` while auto-attack is on is an admitted lease renewal. It becomes `applied_local` with `evidence.kind: "lease_extended"` and `extends`, the ID of the attack that turned auto-attack on. Only that originating attack can be confirmed by a swing. The lease and its target are bound at the network owner when auto-attack turns on. `attack_off` or a retarget ends the lease |
+| Same-reply kinds | `target` and `consider` as one kind (the target drain requests a consider), `hail`, `door`, `memorize`, `cast`, and each chat channel (`say`, `tell`, `group`, ...) | One non-terminal per kind (`busy_same_kind`). Replies are matched by a quarantine key of kind plus entity, door or gem. A reply matching the key of a now-terminal command is never evidence for a newer one. If attribution stays ambiguous, the receipt is `unknown` |
+| Attack | `attack` | A new `attack` while auto-attack is on is an admitted lease renewal. It becomes `applied_local` with `evidence.kind: "lease_extended"` and `extends`, the ID of the attack that turned auto-attack on. Only that originating attack can be confirmed by a swing. Its evidence names `target_entity` and `target_command`, which is how amended .7 proves the target. The lease and its target are bound at the network owner when auto-attack turns on. `attack_off` or a retarget ends the lease |
 | Lifecycle | `camp`, `respawn`, `cross_zone` | While one is non-terminal, ordinary commands are refused with `lifecycle_pending`. When one starts, every unclaimed ordinary command is cancelled with `lifecycle_pending`; claimed ones run on. `stop` and `attack_off` are still admitted |
 | Everything else | `move_for`, `goto`, `face`, `jump`, `stop`, `attack_off`, `sit`, `stand` | No conflict |
 
 A command belongs to every class it is listed in. For example, `buy` must pass both the merchant
-and the inventory checks.
+and the inventory checks. A pending money-moving or inventory-changing command blocks every other
+member with `busy_inventory`, never with a later dispatch-time code.
 
 The internal self-consider liveness probe stays reserved: a consider reply naming self never
 confirms a user `consider`.
 
 ### A2.5 Admission while dead
 
-- Death is not a readiness drop. Readiness no longer includes `player_dead_since`, so a character
-  that logs in dead still reaches Ready and prints `EQOXIDE_READY`.
+- Death is not a readiness drop. Readiness drops both of its death terms, `player_dead_since` and
+  the `cur_hp <= 0` check (native holds a dead player at -100 HP), so a character that logs in dead
+  still reaches Ready and prints `EQOXIDE_READY`.
 - At death, every non-terminal command other than `stop`, `attack_off`, `camp` and `respawn` is
   fenced with reason `dead`: `refused` if not yet claimed, `unknown` if claimed.
 - While dead, the host admits `stop`, `attack_off`, `camp` and `respawn`. Everything else is
@@ -182,6 +198,23 @@ confirms a user `consider`.
   `stop` and `attack_off` skip checks 4 to 6. Checks 1 to 3 still apply to them.
 - `respawn` while alive is refused with `not_dead`.
 - `say "/camp"` follows `camp`'s rules.
+
+### A2.7 Reason codes
+
+This is the complete list. A PR that adds a code adds it here.
+
+| Group | Codes |
+| --- | --- |
+| Admission | `stale_session`, `stale_zone_epoch`, `invalid_operation`, `not_ready`, `dead`, `not_dead`, `moving`, `busy_merchant`, `busy_inventory`, `busy_same_kind`, `lifecycle_pending` |
+| Claim | `cancelled`, `superseded_by_safety_command`, `stale_zone_epoch_before_dispatch`, `network_mailbox_busy`, `dispatch_timeout` |
+| Precondition at dispatch or claim | `entity_not_received`, `entity_out_of_range`, `no_live_npc_target_in_range`, `item_not_in_slot`, `catalog_slot_not_received`, `merchant_closed`, `inventory_revision_required_or_stale`, `merchant_revision_required_or_stale`, `transaction_outcome_unknown_relog_required`, `stand_before_moving`, `not_grounded`, `in_water`, `not_in_zone_line`, `region_data_unavailable` |
+| After the claim | `partial_send`, `no_server_receipt_in_protocol`, `no_server_evidence_within_window`, `tracking_lost` |
+| Fences | `not_ready`, `zone_epoch_changed`, `dead` |
+| Server rejections, per registry row | `sell_vetoed`, `zone_change_rejected` (`SendZoneError`) |
+
+These replace `outcome_timeout`, `no_correlated_server_receipt_relog_before_another_transaction`,
+`precondition_failed_or_network_mailbox_busy`, `queued_without_server_receipt` and
+`session_or_zone_not_ready`.
 
 ### A2.6 Completion
 
@@ -387,8 +420,9 @@ A handled SIGTERM exits 0, so supervisors need no special case. The EXIT line di
   for the current epoch finishes, and a result for an older epoch is discarded.
 - `move_for` and `goto` deadlines count accumulated physics time, with each step clamped to 50 ms,
   so a stall cannot shorten movement.
-- The attack lease stays on the network owner's monotonic clock, so a host stall cannot leave the
-  server swinging.
+- The attack lease moves from the host (`Host::attack_until` today) into the network owner, on its
+  monotonic clock, so a host stall cannot leave the server swinging. This is named work for .7 and
+  .11.
 - State gains `freshness.host_stall_ms`: the longest gap between host steps in the last 10 s.
 
 ## A8. Packet trace (central-6ly1.2)
@@ -474,13 +508,13 @@ native-server run, requested through coordination.
 | `move_for` | – | `applied_local` | Local | `expired`, `stopped`, `superseded`, `interrupted` | Shipped. Completion is new |
 | `stop` | – | `applied_local` | Local | – | Shipped |
 | `goto` | .4 | `applied_local` | Local | `arrived`, `blocked`, `timeout`, `stopped`, `superseded`, `interrupted` | Semantics in B3 |
-| `face` | .4 | `applied_local` | Local; the heading update is an owned deferred send | `heading_sent` with sequence and `n`, or `interrupted` | Native rebroadcasts a heading-only change to other clients, so the live test checks it from a second headless client's `nearby[].heading`. Proposed in place of the server-log wording of the .4 AC |
+| `face` | .4 | `applied_local` | Local; the heading update is an owned deferred send | `heading_sent` with sequence and `n`, `superseded` or `interrupted` | Native rebroadcasts a heading-only change to other clients, so the live test checks it from a second headless client's `nearby[].heading`. Proposed in place of the server-log wording of the .4 AC |
 | `jump` | .4 | `applied_local` | Local | – | Needs `on_ground`, not `in_water`, not sitting. Allowed while moving |
 | `attack_off` | – | `applied_local` | Local; owns its `OP_AutoAttack` packet | – | Row 14 |
-| `target` | .7 | `sent` → `unknown` | None direct. Native `OP_TargetMouse` gets no reply (`eqemu:zone/client_packet.cpp@cd66dd0a6:15125`). The server-side target is proven by an attributed swing | – | Amended .7 AC. Row 15 of revision 2 is withdrawn. The `OP_Consider` reply the target drain requests is evidence only for that auxiliary consider; native answers it even if `OP_TargetMouse` set nothing (`eqemu:zone/client_packet.cpp@cd66dd0a6:5109`) |
+| `target` | .7 | `sent` → `unknown` | None direct. Native `OP_TargetMouse` gets no reply (`eqemu:zone/client_packet.cpp@cd66dd0a6:15125`). The server-side target is proven by an attributed swing | – | Amended .7 AC. Row 15 of revision 2 is withdrawn. The `OP_Consider` reply the target drain requests is evidence only for that auxiliary consider; native answers it even if `OP_TargetMouse` set nothing (`eqemu:zone/client_packet.cpp@cd66dd0a6:5109`). `OP_TargetHoTT`, queued by `SetHoTT` on every `Handle_OP_TargetMouse` branch, shows the request was processed but is also sent unprompted, so it is an observation only |
 | `attack` | .7 | `sent` → `unknown` | Candidate: the first `OP_Damage` with source = self, target = the target at claim, melee, sent after the claim and within the lease | – | Native sends no toggle reply (`@cd66dd0a6:3517`). Riposte and in-flight swings need defining before promotion |
 | `sit`, `stand` | – | `sent` → `unknown` | None. Native `Handle_OP_SpawnAppearance` excludes the sender (`@cd66dd0a6:14771`) | – | `self.sitting` is the client's own state |
-| `say`, `tell`, `chat` | .9 | `sent` → `unknown` | Candidates: `tell` on `ChatChannel_TellEcho` (`eqemu:zone/worldserver.cpp@cd66dd0a6:237`), which shows the receiving zone queued the message, not that the recipient's client received it; queued, queue-full and offline replies take separate paths. For other channels, the self-echo, which depends on chat filters (`eqemu:zone/entity.cpp@cd66dd0a6:2275`) | – | Text can be redacted or garbled; `#` and `^` commands give no echo |
+| `say`, `tell`, `chat` | .9 | `sent` → `unknown` | Candidates: `tell` on `ChatChannel_TellEcho` (`eqemu:zone/worldserver.cpp@cd66dd0a6:237`), where only `queued == 0` shows the receiving zone delivered it, while 1 (`QUEUED_TELL`) and 2 (`QUEUE_TELL_FULL`) arrive on the same path. It still does not prove the recipient's client received it. For other channels, the self-echo, which depends on chat filters (`eqemu:zone/entity.cpp@cd66dd0a6:2275`) | – | Text can be redacted or garbled; `#` and `^` commands give no echo |
 | `hail` | .9 | `sent` → `unknown` | NPC speech is an observation, not evidence | – | – |
 | `consider` | .9 | `sent` → `unknown` | Candidate: an `OP_Consider` reply naming the entity, with the self-probe excluded | – | Sends a consider only; no retarget |
 | `cast` | .9 | `sent` → `unknown` | Candidate: the awaited path's `CastEnd`: `completed`, `fizzled`, `interrupted`, plus `cast_failed` as `refused` | – | `gem` 0–8. The target is in the payload; no retarget. The window must match `CAST_PENDING_REAP` (14 s) and the 30 s echo quarantine |
@@ -493,8 +527,8 @@ native-server run, requested through coordination.
 | `inventory_move` | – | `sent` → `unknown` | None. Native applies the move silently | – | The transaction lock remains |
 | `give` | .9 | `sent` → `unknown` | `returned` needs a received matching item; `accepted` evidence is to be defined | – | Inventory serialisation; ambiguous results lock transactions |
 | `respawn` | .5 | `sent` → `unknown` at 330 s, the native 300 s hover default plus margin | Candidate: recovery after this death's hover window, either Ready after re-entry or in-zone recovery | – | Needs a native run. The bind selection is sent once; the reliable transport retransmits |
-| `cross_zone` | .6 | `sent` → `unknown` at 60 s | Candidate: `zoned` whose zone equals the standing line's destination. A `SendZoneCancel` (`success = 1` with the current zone, `eqemu:zone/zoning.cpp@cd66dd0a6:382`) rewinds the server's position, so it is recorded as an observation under `unknown`, not `refused` | – | Needs a native run. Semantics in B3 |
-| `camp` | .3 | EXIT line | `camp_timer_completed_logout_sent` | – | A6 |
+| `cross_zone` | .6 | `sent` → `unknown` at 60 s | Candidate: `zoned` whose zone equals the standing line's destination. A `SendZoneCancel` (`success = 1` with the current zone, `eqemu:zone/zoning.cpp@cd66dd0a6:382`) rewinds the server's position, so it is recorded as an observation under `unknown`, not `refused`. `SendZoneError` (`eqemu:zone/zoning.cpp@cd66dd0a6:446`) is the real refusal, `zone_change_rejected`. An unsolicited request trips `CheatDetected(MQZone)`, which is why B3 requires being at rest | – | Needs a native run. Semantics in B3 |
+| `camp` | .3 | EXIT line | `camp_timer_completed_logout_sent` | – | A6. Native sends `OP_CancelTrade` before disconnecting (`eqemu:zone/client.cpp@cd66dd0a6:884`), which is an observation only |
 
 ## B3. Semantics that do not depend on evidence
 
@@ -517,8 +551,8 @@ Behaviour:
   1. `arrived`: the 2-D distance is at most `tolerance`, and, when `z` was given, `|dz|` is at most
      `z_tolerance`.
   2. `blocked`: over the last 1000 ms of physics time, the distance to the goal fell by less than
-     0.5. This is first evaluated 1000 ms after start. Arrival in 2-D with `|dz|` out of tolerance
-     is reported as `blocked`.
+     0.5, measured in 2-D. This is first evaluated 1000 ms after start. Arrival in 2-D with `|dz|`
+     out of tolerance is reported as `blocked` at that first evaluation.
   3. `timeout`.
 - `stopped`, `superseded` and `interrupted` (with `reason` `sit`, `dead`, `zone_entry`,
   `not_ready` or `camp`) end it.
@@ -552,7 +586,8 @@ Behaviour:
 ### `respawn`
 
 - It is bound to the current death: `self.dead` and the held hover window.
-- The bind selection is sent once. Native uses the same recovery path for an explicit and an
+- The bind selection is sent once: native `HandleRespawnFromHover` has no dead check, so a repeat
+  teleports to bind again. The existing `RESPAWN_RETRY_INTERVAL` retry in `gameplay.rs` is removed. Native uses the same recovery path for an explicit and an
   automatic bind selection, so a recovery after the request is an observation whose cause is
   unknown. It is recorded under `unknown` unless the registry row promotes a distinguishable case.
 
@@ -612,3 +647,5 @@ them.
    test that checks continued admission and an uninterrupted receipt-event cursor (.1 AC).
 7. The shutdown state machine (A6): a panic while holding a shared lock, a map load stalled past a
    host tick (.11 AC), and silence becoming `session_lost`.
+8. `source_events_dropped` also covers the 32-entry `received_self_echoes` queue (A4).
+9. The A7 `lock().unwrap()` rule covers the eqoxide-net code on the panic-then-logout path.
