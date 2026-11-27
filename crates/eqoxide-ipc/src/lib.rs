@@ -116,7 +116,9 @@ pub struct ControllerView {
     /// The `correction_issued` value a publisher read, under this view's lock, when it took a
     /// correction from the slot, republished with the first `pos` after it applied it. While the
     /// two differ the view may still show the body the server moved away, so the streamer sends no
-    /// rest update. Only the CPU host writes it; a publisher without a step signal never needs to.
+    /// rest update. Written by the CPU host, which never lowers it, and by
+    /// `ControllerSlots::begin_zone_in`, which settles a correction it drops. A publisher without
+    /// a step signal never needs to write it.
     pub correction_adopted: u64,
     pub pos:     [f32; 3],
     pub heading: f32,
@@ -533,7 +535,8 @@ pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_st
 ///   line before then — consuming the render thread's one-shot fall signal so it can fire exactly
 ///   once.
 /// * `ActionLoop::stream_position` writes `last_position_send` after each self `OP_ClientUpdate`
-///   it attempts (central-vgwu). No publisher writes that field.
+///   it attempts, and bumps `correction_issued` before handing over a correction (central-vgwu).
+///   `begin_zone_in` also raises `correction_adopted` when it drops a pending correction.
 ///
 /// So a consumer must not read "published by the render thread on every rendered frame" as a
 /// guarantee that every field it sees was authored by the render thread on the last frame.

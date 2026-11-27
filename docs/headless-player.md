@@ -118,10 +118,11 @@ The client streams `OP_ClientUpdate` at most every 280 ms while moving and every
 otherwise. On the first physics step that shows the body at rest after it moved, it attempts one
 update with the resting position, zero delta and animation 0, outside that throttle. The attempt
 follows that step by one network tick (nominally 10 ms). A `stop` that arrives after the host has
-drained commands for a tick waits for the next 20 ms step, so it can take two steps to show. The rest decision is made per physics step, not per network tick.
-Later rest updates (a slow creep, a turn in place) keep the 280 ms spacing. No rest update is
-sent until the controller has adopted a server correction. The graphical client does not publish
-the step signal and keeps the plain cadence.
+drained commands for a tick waits for the next 20 ms step, so it can take two steps to show.
+The rest decision is made per physics step, not per network tick. A creep under 0.1 units per
+step and a turn in place send rest updates no closer than 280 ms apart. While a server correction
+is waiting for the controller to apply it, no rest update is sent. The graphical client does not
+publish the step signal and keeps the plain cadence.
 
 `self.last_position_send` is the last update the client attempted, or null before the first:
 `sequence` (the wire sequence), `position` (feet datum; the wire z is 3.1 units higher),
