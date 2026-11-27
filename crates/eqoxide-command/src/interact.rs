@@ -81,6 +81,13 @@ impl CommandState {
         self.enqueue(&self.interact.sit, sit, false, Action::InteractSit)
     }
 
+    /// Publish attack-off before the sit request can drain, once the sit slot is reserved.
+    pub fn request_sit_with_attack_off(&self, command: &str) -> bool {
+        self.enqueue_after(&self.interact.sit, true, false, Action::InteractSit, || {
+            self.overwrite_attack_off(Some(command));
+        })
+    }
+
     /// Run/walk toggle (#625): `Some(true)` = run, `Some(false)` = walk (POST /v1/interact/{run,walk},
     /// the Actions window's Run/Walk button). The drain sends `OP_SetRunMode` (0x009f) and switches
     /// the local movement speed to match.

@@ -1267,11 +1267,12 @@ impl ActionLoop {
     /// (`sync_doors` from `run_gameplay_phase`, and `run_zone_entry_handshake`) that go through here.
     pub fn doors_shared(&self) -> &eqoxide_ipc::DoorsShared { &self.interact.doors_shared }
 
-    pub(crate) fn take_camp(
+    pub(crate) fn drain_camp_request(
         &self,
         camp: &eqoxide_ipc::CampReq,
-    ) -> Option<(CampCmd, Option<std::sync::Arc<str>>)> {
-        self.command.take_camp_with_command(camp)
+        apply: impl FnOnce(CampCmd, Option<std::sync::Arc<str>>),
+    ) {
+        self.command.drain_camp_with_command(camp, apply);
     }
 
     /// The published NPC-dialogue choices, for the zone-entry handshake to CLEAR (#941).

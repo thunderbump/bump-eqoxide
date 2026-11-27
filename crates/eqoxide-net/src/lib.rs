@@ -67,3 +67,22 @@ pub(crate) mod test_afloat {
              None the fixtures below go blind on the afloat axis again, which is #846 review F1")
     }
 }
+
+#[cfg(feature = "test-fixtures")]
+pub mod testkit {
+    use crate::{action_loop::ActionLoop, gameplay, transport::EqStream};
+    use eqoxide_core::game_state::GameState;
+
+    pub use crate::transport::test_stream_with_peer;
+
+    /// Run the normal command drains in gameplay order without a server handshake.
+    pub fn drain_gameplay_commands(
+        action_loop: &mut ActionLoop,
+        stream: &mut EqStream,
+        gs: &mut GameState,
+        lifecycle: &gameplay::GameplayLifecycle,
+    ) {
+        gameplay::drain_camp(action_loop, stream, gs, &lifecycle.camp, &lifecycle.camp_until);
+        action_loop.tick(stream, gs);
+    }
+}

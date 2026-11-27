@@ -256,8 +256,20 @@ impl crate::CommandState {
         for id in self.actions.take_drained(command) { self.actions.finish(id, "refused", reason); }
     }
     pub(crate) fn enqueue<T>(&self, slot: &Mutex<Option<T>>, msg: T, awaited: bool, name: Action) -> bool {
+        self.enqueue_after(slot, msg, awaited, name, || {})
+    }
+
+    pub(crate) fn enqueue_after<T>(
+        &self,
+        slot: &Mutex<Option<T>>,
+        msg: T,
+        awaited: bool,
+        name: Action,
+        before_publish: impl FnOnce(),
+    ) -> bool {
         let mut value = slot.lock().unwrap();
         if value.is_some() { return false; }
+        before_publish();
         *value = Some(msg);
         self.actions.accept(slot as *const _ as usize, awaited, name);
         true

@@ -27,10 +27,17 @@ impl CommandState {
         self.actions.set_packet_command(Arc::as_ptr(&self.lifecycle.camp) as usize, command);
     }
 
-    pub fn take_camp_with_command(&self, camp: &CampReq) -> Option<(CampCmd, Option<Arc<str>>)> {
+    pub fn drain_camp_with_command(
+        &self,
+        camp: &CampReq,
+        apply: impl FnOnce(CampCmd, Option<Arc<str>>),
+    ) {
         let mut slot = camp.lock().unwrap();
-        let command = self.actions.take_packet_command(Arc::as_ptr(camp) as usize);
-        slot.take().map(|cmd| (cmd, command))
+        if let Some(cmd) = slot.take() {
+            let command = self.actions.take_packet_command(Arc::as_ptr(camp) as usize);
+            // Keep the lock through application so the next writer sees the updated camp timer.
+            apply(cmd, command);
+        }
     }
 
     /// Release a held-dead character back to its bind point (POST /v1/lifecycle/respawn, the HUD

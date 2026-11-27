@@ -140,14 +140,14 @@ impl Host {
             .control
             .publish_outcome(id, status, reason.map(str::to_owned), evidence);
     }
-    fn halt(&mut self, reason: &str) {
+    fn halt(&mut self, reason: &str, command: Option<&str>) {
         if let Some(motion) = self.motion.take() {
             self.control
                 .publish_event(json!({"kind":"motion_stopped","id":motion.id,"reason":reason}));
         }
         self.attack_until = None;
         // LAST-WINS: safety off must replace an attack still waiting in the net mailbox.
-        self.command.overwrite_attack_off(None);
+        self.command.overwrite_attack_off(command);
     }
     fn step(
         &mut self,
@@ -158,7 +158,7 @@ impl Host {
         dt: f32,
     ) {
         if !ready {
-            self.halt("not_ready");
+            self.halt("not_ready", None);
             return;
         }
         if self.motion.as_ref().is_some_and(|m| now >= m.until) {
@@ -512,10 +512,12 @@ impl Host {
                                 }
                             }
                             Operation::Sit => {
-                                self.motion = None;
-                                self.attack_until = None;
-                                self.command.overwrite_attack_off(Some(&id));
-                                self.command.request_sit(true)
+                                let accepted = self.command.request_sit_with_attack_off(&id);
+                                if accepted {
+                                    self.motion = None;
+                                    self.attack_until = None;
+                                }
+                                accepted
                             }
                             Operation::Stand => self.command.request_sit(false),
                             Operation::Say { text } => self.command.request_say(text),
@@ -557,7 +559,7 @@ impl Host {
                                     && self.command.request_inventory_move(from_slot, to_slot)
                             }
                             Operation::Camp => {
-                                self.halt("camp");
+                                self.halt("camp", Some(&id));
                                 self.command.request_camp_with_command(
                                     ipc::CampCmd::StartInZone(self.epoch), Some(&id),
                                 );
@@ -863,14 +865,14 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
             if terminal.is_some() {
-                host.halt("network_ended");
+                host.halt("network_ended", None);
                 control.set_ready(false);
                 control.publish_event(json!({"kind":"session_ended","reason":terminal}));
             }
         }
         let gs = wiring.snapshot.load_full();
         if gs.zone_epoch != host.epoch {
-            host.halt("zone_entry");
+            host.halt("zone_entry", None);
             control.set_ready(false);
             host.body = None;
             host.epoch = gs.zone_epoch;
@@ -894,7 +896,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             && loaded_zone != gs.world.zone_name
         {
             control.set_ready(false);
-            host.halt("loading_geometry");
+            host.halt("loading_geometry", None);
             loaded_zone = gs.world.zone_name.clone();
             match load_collision(&profile.maps_dir, &loaded_zone) {
                 Ok((collision, metadata)) => {
@@ -975,7 +977,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             }
         }
         if api.is_finished() {
-            host.halt("http_server_ended");
+            host.halt("http_server_ended", None);
             wiring.shutdown.store(true, Ordering::Release);
             return Err("control HTTP server ended".into());
         }
@@ -989,11 +991,14 @@ mod tests {
     use super::*;
     use eqoxide_zone_geometry::collision::ServerTriangle;
     pub(super) fn host() -> Host {
-        let wiring = Wiring::new(std::path::PathBuf::from("/unused"));
+        host_with_wiring(&Wiring::new("/unused".into()))
+    }
+
+    pub(super) fn host_with_wiring(wiring: &Wiring) -> Host {
         Host {
             control: Control::new("test-session".into(), "test-credential".into(), 16, 32).unwrap(),
-            command: wiring.command,
-            controller_slots: wiring.controller,
+            command: wiring.command.clone(),
+            controller_slots: wiring.controller.clone(),
             body: Some(CharacterController::new([0.0, 0.0, 0.0])),
             zone_in: Default::default(),
             epoch: 1,
@@ -1524,3 +1529,7 @@ mod execution_claim_tests {
         assert_eq!(host.control.command("buy").unwrap().status, Status::Refused);
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_packet_tests.rs"]
+mod packet_tests;

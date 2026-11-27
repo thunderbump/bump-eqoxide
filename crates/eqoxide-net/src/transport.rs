@@ -402,6 +402,7 @@ struct Sent {
     datagram: Vec<u8>,
     sent_at: Instant,
     retries: u32,
+    transmitted: bool,
 }
 
 /// Is this send error transient — i.e. would the very same datagram plausibly go out if we simply
@@ -525,6 +526,8 @@ pub struct EqStream {
     /// link. Whoever receives the datagram owns the clock — a future loop gets this for free.
     net_health: eqoxide_ipc::NetHealthShared,
     packet_trace: Option<SessionTrace>,
+    capture_zone_packets: bool,
+    incoming_high_water: Option<u16>,
 }
 
 impl EqStream {
@@ -533,6 +536,25 @@ impl EqStream {
         port: u16,
         app_tx: mpsc::UnboundedSender<AppPacket>,
         net_health: eqoxide_ipc::NetHealthShared,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::connect_stream(host, port, app_tx, net_health, false).await
+    }
+
+    pub(crate) async fn connect_zone(
+        host: &str,
+        port: u16,
+        app_tx: mpsc::UnboundedSender<AppPacket>,
+        net_health: eqoxide_ipc::NetHealthShared,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::connect_stream(host, port, app_tx, net_health, true).await
+    }
+
+    async fn connect_stream(
+        host: &str,
+        port: u16,
+        app_tx: mpsc::UnboundedSender<AppPacket>,
+        net_health: eqoxide_ipc::NetHealthShared,
+        capture_zone_packets: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let peer: SocketAddr = format!("{}:{}", host, port).parse()?;
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -552,6 +574,8 @@ impl EqStream {
             frags: FragmentBuffer::new(),
             net_health,
             packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
+            capture_zone_packets,
+            incoming_high_water: None,
             app_tx,
         };
 
@@ -759,7 +783,8 @@ impl EqStream {
         command: Option<&Arc<str>>,
     ) {
         packet_telemetry::capture(dir, opcode, payload, wire_seq.is_some(), wire_seq);
-        if let Some(trace) = &self.packet_trace {
+        // Opcode names and field layouts on this route are for the zone protocol.
+        if let Some(trace) = self.packet_trace.as_ref().filter(|_| self.capture_zone_packets) {
             trace.capture(dir, opcode, payload, wire_seq, command.cloned());
         }
     }
@@ -856,9 +881,13 @@ impl EqStream {
             // The entry stays in `self.sent` with its backoff advanced, so the very next due pass
             // re-sends this same datagram — the recovery is this loop itself, and there is no caller
             // above it to hand an error to. Not silent: `transmit` stamps `NetHealth` + WARNs.
-            if let Err(e) = self.transmit(&self.sent[i].datagram, SendRetry::Retransmitted, true) {
-                tracing::debug!("NET: retransmit of seq {} failed ({:?}); will retry on the next \
-                                 backoff pass (#612)", self.sent[i].seq, e.kind());
+            let packet = &self.sent[i];
+            match self.transmit(&packet.datagram, SendRetry::Retransmitted, packet.transmitted) {
+                Ok(()) => self.sent[i].transmitted = true,
+                Err(e) => tracing::debug!(
+                    "NET: retransmit of seq {} failed ({:?}); will retry on the next backoff pass (#612)",
+                    packet.seq, e.kind(),
+                ),
             }
             self.sent[i].sent_at = now;
             self.sent[i].retries = self.sent[i].retries.saturating_add(1);
@@ -1065,7 +1094,7 @@ impl EqStream {
     /// the same discipline `poll_resend` relies on — and again before any new control send.
     fn flush_pending_control(&mut self) {
         while let Some(front) = self.pending_control.front() {
-            match self.transmit(front, SendRetry::Deferred, true) {
+            match self.transmit(front, SendRetry::Deferred, false) {
                 Ok(()) => {}
                 // Still refused. It must stay at the FRONT — popping and re-pushing would reorder it
                 // behind anything queued in between — and we stop, so nothing overtakes it.
@@ -1259,7 +1288,9 @@ impl EqStream {
         // reliable path can honestly report a failed send without it meaning "lost" (#612): a
         // datagram that never reached the socket is in exactly the same position as one lost in
         // flight, and `poll_resend`'s go-back-N re-sends it verbatim until the server ACKs it.
-        self.sent.push_back(Sent { seq, datagram, sent_at: Instant::now(), retries: 0 });
+        self.sent.push_back(Sent {
+            seq, datagram, sent_at: Instant::now(), retries: 0, transmitted: outcome.is_ok(),
+        });
         outcome
     }
 
@@ -1488,12 +1519,26 @@ impl EqStream {
                     self.next_recv_seq = self.next_recv_seq.wrapping_add(1);
                     self.deliver_seq(nseq, ndata, nfrag);
                 }
+                if self.recv_buf.is_empty() {
+                    self.incoming_high_water = None;
+                }
             }
             SeqClass::Future => {
-                let first_arrival = self.recv_buf.insert(seq, (data, is_fragment)).is_none();
-                if let Some(trace) = self.packet_trace.as_ref().filter(|_| first_arrival) {
-                    trace.record_sequence_gap();
+                if let Some(trace) = &self.packet_trace {
+                    let distance = seq.wrapping_sub(self.next_recv_seq);
+                    let high_water = self.incoming_high_water
+                        .map(|high| high.wrapping_sub(self.next_recv_seq));
+                    if high_water.is_none_or(|high| distance > high) {
+                        // A forward jump exposes a new run of missing sequences. A contiguous
+                        // future packet extends the same buffered run, and fills behind it
+                        // cannot cause a new hole.
+                        if high_water.is_none_or(|high| distance.saturating_sub(high) > 1) {
+                            trace.record_sequence_gap();
+                        }
+                        self.incoming_high_water = Some(seq);
+                    }
                 }
+                self.recv_buf.insert(seq, (data, is_fragment));
                 // Mirror the server's own receive path (EQEmu `eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:715`,
                 // `SendOutOfOrderAck(stream_id, sequence)`): on a gap, immediately OutOfOrderAck the
                 // out-of-order packet we just BUFFERED. The server's `OutOfOrderAck` handler drops that
@@ -1682,6 +1727,10 @@ impl EqStream {
         }
         let abandoned = self.sent.len() as u64;
         let oldest = self.sent[0].seq;
+        if let Some(trace) = &self.packet_trace {
+            let never_sent = self.sent.iter().filter(|packet| !packet.transmitted).count() as u64;
+            trace.record_unsent_abandonment(never_sent);
+        }
         self.sent.clear();
         // `Drop` can run while a panic is unwinding, and a poisoned mutex must not turn a bad
         // situation into a double panic — so this is the one place that tolerates a failed lock.
@@ -1762,6 +1811,8 @@ pub(crate) async fn test_stream_with_health(
         frags: FragmentBuffer::new(),
         net_health,
         packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
+        capture_zone_packets: true,
+        incoming_high_water: None,
         app_tx: tx,
     };
     (stream, rx)
@@ -1770,8 +1821,8 @@ pub(crate) async fn test_stream_with_health(
 /// An `EqStream` wired to a REAL local peer socket, so a test can actually deliver a datagram to it
 /// and drive `poll_recv`'s receive path end-to-end. Returns the stream, its app-packet receiver, the
 /// peer socket, and the address to send to. (#343)
-#[cfg(test)]
-pub(crate) async fn test_stream_with_peer(
+#[cfg(any(test, feature = "test-fixtures"))]
+pub async fn test_stream_with_peer(
     net_health: eqoxide_ipc::NetHealthShared,
 ) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>, UdpSocket, SocketAddr) {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -1789,10 +1840,13 @@ pub(crate) async fn test_stream_with_peer(
         recv_buf: HashMap::new(),
         sent: VecDeque::new(),
         pending_control: VecDeque::new(),
+        #[cfg(test)]
         force_send_refusals: std::cell::Cell::new(0),
         frags: FragmentBuffer::new(),
         net_health,
         packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
+        capture_zone_packets: true,
+        incoming_high_water: None,
         app_tx: tx,
     };
     (stream, rx, peer_sock, stream_addr)
@@ -1826,6 +1880,8 @@ pub(crate) async fn test_stream_with_peer_encoded(
         frags: FragmentBuffer::new(),
         net_health,
         packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
+        capture_zone_packets: true,
+        incoming_high_water: None,
         app_tx: tx,
     };
     (stream, rx, peer_sock, stream_addr)
@@ -2154,19 +2210,74 @@ mod tests {
         assert_eq!(target_page.counts.sent, 2);
         assert_eq!(target_page.counts.resent, 1);
 
-        let future = [0, OP_PACKET, 0, 1, 0x34, 0x12];
-        stream.on_raw_recv(&future);
-        stream.on_raw_recv(&future);
-        stream.on_raw_recv(&[0, OP_PACKET, 0, 0, 0x34, 0x12]);
-        assert_eq!(rx.try_recv().unwrap().opcode, 0x1234);
-        assert_eq!(rx.try_recv().unwrap().opcode, 0x1234);
+        let datagram = |seq| [0, OP_PACKET, 0, seq, 0x34, 0x12];
+        // Receiving a long contiguous run behind a lost sequence opens only one hole.
+        for seq in 1..=30 {
+            stream.on_raw_recv(&datagram(seq));
+        }
+        stream.on_raw_recv(&datagram(30));
+        assert_eq!(trace.page(0, 10, None, None).counts.sequence_gaps, 1);
+        stream.on_raw_recv(&datagram(32));
+        stream.on_raw_recv(&datagram(31));
+        assert_eq!(trace.page(0, 10, None, None).counts.sequence_gaps, 2);
+        stream.on_raw_recv(&datagram(0));
+        for _ in 0..=32 {
+            assert_eq!(rx.try_recv().unwrap().opcode, 0x1234);
+        }
         assert!(rx.try_recv().is_err());
 
-        let page = trace.page(0, 10, None, None);
-        assert_eq!(page.packets.len(), 3);
-        assert_eq!(page.counts.received, 3);
-        assert_eq!(page.counts.sequence_gaps, 1);
+        let page = trace.page(0, 50, None, None);
+        assert_eq!(page.packets.len(), 34);
+        assert_eq!(page.counts.received, 34);
+        assert_eq!(page.counts.sequence_gaps, 2);
         assert_eq!(page.counts.resent, 1);
+    }
+
+    /// Deferred control and a failed first reliable send each reach the socket only once.
+    #[tokio::test]
+    async fn packet_trace_excludes_first_successful_sends_from_resent() {
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, _, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+
+        stream.force_send_refusals.set(1);
+        stream.send_keepalive().unwrap();
+        assert_eq!(stream.pending_control.len(), 1);
+        stream.flush_pending_control();
+
+        stream.force_send_refusals.set(1);
+        stream.send_app_packet(0x1234, &[]);
+        stream.sent[0].sent_at = Instant::now() - std::time::Duration::from_secs(2);
+        stream.poll_resend();
+
+        let counts = trace.page(0, 10, None, None).counts;
+        assert_eq!(counts.sent, 2);
+        assert_eq!(counts.resent, 0);
+
+        // Leave one first-send failure and one successfully sent reliable unacked.
+        stream.force_send_refusals.set(1);
+        stream.send_app_packet(0x1234, &[]);
+        stream.abandon_outstanding();
+        drop(stream);
+        let counts = trace.page(0, 10, None, None).counts;
+        assert_eq!(counts.never_sent_reliable_abandoned, 1);
+    }
+
+    #[tokio::test]
+    async fn packet_trace_keeps_zone_rows_only_but_counts_all_streams() {
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, _, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+
+        stream.capture_zone_packets = false;
+        stream.send_app_packet(0x1234, &[]);
+        stream.on_raw_recv(&[0x34, 0x12]);
+        let page = trace.page(0, 10, None, None);
+        assert!(page.packets.is_empty());
+        assert_eq!(page.counts.sent, 1);
+        assert_eq!(page.counts.received, 1);
     }
 
     #[tokio::test]

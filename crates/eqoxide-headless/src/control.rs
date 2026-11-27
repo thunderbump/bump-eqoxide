@@ -771,7 +771,9 @@ async fn get_packets(
         query.opcode.as_deref(),
         query.command.as_deref(),
     );
-    let dropped = control.packet_health.lock().unwrap().send_failures_unretried;
+    // NetHealth is sampled separately from the packet and transport snapshot.
+    let dropped = control.packet_health.lock().unwrap().send_failures_unretried
+        .saturating_add(page.counts.never_sent_reliable_abandoned);
     Ok(Json(json!({
         "packets": page.packets,
         "next": page.next,
@@ -779,13 +781,13 @@ async fn get_packets(
         "counters": {
             // Successful EqStream::transmit calls, including retries.
             "sent": page.counts.sent,
-            // Successful EqStream::poll_resend and flush_pending_control transmissions, a subset of sent.
+            // Successful EqStream::poll_resend transmissions of already-sent datagrams.
             "resent": page.counts.resent,
             // EqStream::on_raw_recv counts socket reads before decoding, including transport control.
             "received": page.counts.received,
-            // NetHealth::send_failures_unretried, including abandoned deferred control datagrams.
+            // NetHealth::send_failures_unretried plus EqStream teardown losses that never reached the socket.
             "dropped_unretried": dropped,
-            // EqStream::handle_ordered_decoded counts distinct future sequences buffered across a gap.
+            // EqStream::handle_ordered_decoded counts newly exposed holes in incoming sequences.
             "sequence_gaps": page.counts.sequence_gaps,
         }
     })))

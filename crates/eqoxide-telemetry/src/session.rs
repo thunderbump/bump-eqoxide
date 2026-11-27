@@ -19,7 +19,7 @@ pub struct SessionTrace {
 
 #[derive(Default)]
 struct TraceState {
-    packets: VecDeque<SessionPacket>,
+    packets: VecDeque<Arc<SessionPacket>>,
     last_n: u64,
     counts: TransportCounts,
 }
@@ -30,6 +30,7 @@ pub struct TransportCounts {
     pub resent: u64,
     pub received: u64,
     pub sequence_gaps: u64,
+    pub never_sent_reliable_abandoned: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -100,7 +101,7 @@ impl SessionTrace {
         }
         state.last_n += 1;
         let n = state.last_n;
-        state.packets.push_back(SessionPacket {
+        state.packets.push_back(Arc::new(SessionPacket {
             n,
             at_ms,
             dir,
@@ -111,13 +112,20 @@ impl SessionTrace {
             wire_seq,
             command_id,
             fields,
-        });
+        }));
     }
 
     pub fn record_send(&self, retry: bool) {
         let mut state = self.state.lock().unwrap();
         state.counts.sent += 1;
         state.counts.resent += u64::from(retry);
+    }
+
+    pub fn record_unsent_abandonment(&self, count: u64) {
+        // Stream teardown also runs during unwinding.
+        if let Ok(mut state) = self.state.lock() {
+            state.counts.never_sent_reliable_abandoned += count;
+        }
     }
 
     pub fn record_receive(&self) {
@@ -135,27 +143,37 @@ impl SessionTrace {
         opcode: Option<&str>,
         command: Option<&str>,
     ) -> PacketPage {
-        let state = self.state.lock().unwrap();
-        let evicted_through = state.last_n - state.packets.len() as u64;
-        let skip = (after.min(state.last_n).saturating_sub(evicted_through)) as usize;
-        let packets: Vec<_> = state.packets.iter()
-            .skip(skip)
+        let (tail, last_n, gap, counts) = {
+            let state = self.state.lock().unwrap();
+            let evicted_through = state.last_n - state.packets.len() as u64;
+            let start = (after.min(state.last_n).saturating_sub(evicted_through)) as usize;
+            let end = if opcode.is_none() && command.is_none() {
+                start.saturating_add(limit).min(state.packets.len())
+            } else {
+                state.packets.len()
+            };
+            // Copy record handles and counters together. Filtering and packet copies run
+            // after releasing the lock so a sparse match cannot block the network owner.
+            let tail: Vec<_> = state.packets.range(start..end).cloned().collect();
+            (tail, state.last_n, after < evicted_through, state.counts)
+        };
+        let packets: Vec<_> = tail.into_iter()
             .filter(|packet| opcode.is_none_or(|name| packet.opcode_name == name))
             .filter(|packet| command.is_none_or(|id| packet.command_id.as_deref() == Some(id)))
             .take(limit)
-            .cloned()
+            .map(|packet| (*packet).clone())
             .collect();
         // A short page scanned the whole tail, even if every record was filtered out.
         let next = if packets.len() == limit {
             packets.last().map_or(after, |packet| packet.n)
         } else {
-            after.max(state.last_n)
+            after.max(last_n)
         };
         PacketPage {
             packets,
             next,
-            gap: after < evicted_through,
-            counts: state.counts,
+            gap,
+            counts,
         }
     }
 }
@@ -180,7 +198,7 @@ fn decode_fields(dir: Dir, opcode: u16, body: &[u8]) -> Fields {
             animation: u32_at(34) & 0x3ff,
             heading: u32_at(14) & 0xfff,
         },
-        (Dir::Out, p::OP_TARGET_COMMAND | p::OP_TARGET_MOUSE) if body.len() >= 4 => {
+        (_, p::OP_TARGET_COMMAND) | (Dir::Out, p::OP_TARGET_MOUSE) if body.len() >= 4 => {
             Fields::Target { target_id: u32_at(0) }
         }
         (Dir::In, p::OP_DAMAGE) if body.len() >= 13 => Fields::Damage {

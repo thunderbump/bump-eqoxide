@@ -651,10 +651,12 @@ async fn packet_trace_orders_and_filters_decoded_packets() {
     damage[5..9].copy_from_slice(&21u32.to_le_bytes());
     damage[9..13].copy_from_slice(&(-5i32).to_le_bytes());
     trace.capture(Dir::In, OP_DAMAGE, &damage, Some(4), None);
+    trace.capture(Dir::In, OP_TARGET_COMMAND, &0u32.to_le_bytes(), Some(5), None);
     trace.record_send(false);
     trace.record_send(true);
     trace.record_receive();
     trace.record_sequence_gap();
+    trace.record_unsent_abandonment(2);
 
     let (status, first) = authorized(&control, "GET", "/v2/player/packets?limit=2", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -677,19 +679,20 @@ async fn packet_trace_orders_and_filters_decoded_packets() {
 
     let (_, rest) = authorized(&control, "GET", "/v2/player/packets?after=2", None).await;
     let packets = rest["packets"].as_array().unwrap();
-    assert_eq!(packets.iter().map(|p| p["n"].as_u64().unwrap()).collect::<Vec<_>>(), [3, 4, 5]);
-    assert_eq!(rest["next"], 5);
+    assert_eq!(packets.iter().map(|p| p["n"].as_u64().unwrap()).collect::<Vec<_>>(), [3, 4, 5, 6]);
+    assert_eq!(rest["next"], 6);
     assert_eq!(packets[2]["dir"], "in");
     assert_eq!(packets[2]["command_id"], Value::Null);
     assert_eq!(packets[2]["fields"], json!({"source":42, "target":12, "damage":-5, "spell":21}));
+    assert_eq!(packets[3]["fields"], json!({"target_id":0}));
     assert_eq!(rest["counters"], json!({
-        "sent":2, "resent":1, "received":1, "dropped_unretried":3, "sequence_gaps":1,
+        "sent":2, "resent":1, "received":1, "dropped_unretried":5, "sequence_gaps":1,
     }));
 
     let (_, selected) = authorized(
         &control, "GET", "/v2/player/packets?opcode=OP_TARGET_MOUSE&command=target-b", None,
     ).await;
-    assert_eq!(selected["next"], 5);
+    assert_eq!(selected["next"], 6);
     let packets = selected["packets"].as_array().unwrap();
     assert_eq!(packets.len(), 1);
     assert_eq!(packets[0], json!({

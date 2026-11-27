@@ -154,6 +154,45 @@ pub struct GameplayLifecycle {
     pub net_health:          eqoxide_ipc::NetHealthShared,
 }
 
+pub(crate) fn drain_camp(
+    action_loop: &ActionLoop,
+    s: &mut EqStream,
+    gs: &mut GameState,
+    camp: &eqoxide_ipc::CampReq,
+    camp_until: &eqoxide_ipc::CampUntil,
+) {
+    action_loop.drain_camp_request(camp, |cmd, command_id| {
+        let Some(cmd) = cmd.for_epoch(gs.zone_epoch) else { return; };
+        let now = std::time::Instant::now();
+        let current = *camp_until.lock().unwrap();
+        let (next, action) = camp_apply(cmd, current, now, CAMP_DURATION);
+        *camp_until.lock().unwrap() = next;
+        use crate::protocol::build_spawn_appearance_packet;
+        match action {
+            CampAction::Started => {
+                s.send_app_packet_with_command(OP_CAMP, &[], command_id.as_ref());
+                // Sit, like the real client — camping is a seated action and standing cancels it.
+                s.send_app_packet_with_command(OP_SPAWN_APPEARANCE,
+                    &build_spawn_appearance_packet(gs.player_id as u16, 14, 110),
+                    command_id.as_ref());
+                gs.sitting = true;
+                gs.log_msg("system", "Camping to desktop...");
+                tracing::info!("EQ: camp started — clean shutdown in {}s", CAMP_DURATION.as_secs());
+            }
+            CampAction::Cancelled => {
+                // Standing both cancels the server camp timer and stands the character back up.
+                s.send_app_packet_with_command(OP_SPAWN_APPEARANCE,
+                    &build_spawn_appearance_packet(gs.player_id as u16, 14, 100),
+                    command_id.as_ref());
+                gs.sitting = false;
+                gs.log_msg("system", "Camp cancelled.");
+                tracing::info!("EQ: camp cancelled");
+            }
+            CampAction::NoOp => {}
+        }
+    });
+}
+
 /// Consume the zone stream and run the gameplay loop indefinitely.
 pub async fn run_gameplay_phase(
     stream_init:   EqStream,
@@ -221,37 +260,7 @@ pub async fn run_gameplay_phase(
         // alive (keepalives below still fire) until CAMP_DURATION elapses, then set `shutdown` so
         // the disconnect is clean (the server has set `instalog`, so no linkdead). Cancelling sends
         // a Standing `OP_SpawnAppearance`, which disables the server-side camp timer.
-        let camp_request = action_loop.take_camp(&camp)
-            .and_then(|(cmd, id)| cmd.for_epoch(gs.zone_epoch).map(|cmd| (cmd, id)));
-        if let Some((cmd, command_id)) = camp_request {
-            let now      = std::time::Instant::now();
-            let current  = *camp_until.lock().unwrap();
-            let (next, action) = camp_apply(cmd, current, now, CAMP_DURATION);
-            *camp_until.lock().unwrap() = next;
-            use crate::protocol::build_spawn_appearance_packet;
-            match action {
-                CampAction::Started => {
-                    s.send_app_packet_with_command(OP_CAMP, &[], command_id.as_ref());
-                    // Sit, like the real client — camping is a seated action and standing cancels it.
-                    s.send_app_packet_with_command(OP_SPAWN_APPEARANCE,
-                        &build_spawn_appearance_packet(gs.player_id as u16, 14, 110),
-                        command_id.as_ref());
-                    gs.sitting = true;
-                    gs.log_msg("system", "Camping to desktop...");
-                    tracing::info!("EQ: camp started — clean shutdown in {}s", CAMP_DURATION.as_secs());
-                }
-                CampAction::Cancelled => {
-                    // Standing both cancels the server camp timer and stands the character back up.
-                    s.send_app_packet_with_command(OP_SPAWN_APPEARANCE,
-                        &build_spawn_appearance_packet(gs.player_id as u16, 14, 100),
-                        command_id.as_ref());
-                    gs.sitting = false;
-                    gs.log_msg("system", "Camp cancelled.");
-                    tracing::info!("EQ: camp cancelled");
-                }
-                CampAction::NoOp => {}
-            }
-        }
+        drain_camp(&action_loop, s, &mut gs, &camp, &camp_until);
         // Camp deadline reached → request a clean shutdown (handled at the top of the next loop).
         if camp_expired(*camp_until.lock().unwrap(), std::time::Instant::now()) {
             tracing::info!("EQ: camp complete — disconnecting cleanly (no linkdead)");
@@ -674,7 +683,7 @@ pub async fn run_gameplay_phase(
             // NOT papered over with a second OP_ZoneEntry (that would self-kick an admitted-but-slow
             // session). See ~/git/eq_kb/zone-entry-{handshake-race,
             // duplicate-on-admitted-client}.md.
-            match EqStream::connect(&zone_ip, zone_port, new_tx, net_health.clone()).await {
+            match EqStream::connect_zone(&zone_ip, zone_port, new_tx, net_health.clone()).await {
                 Ok(new_stream) => {
                     stream = Some(new_stream);
                     net_rx = Some(new_rx);
@@ -941,7 +950,7 @@ async fn reconnect_via_world(
     // single send lives in run_zone_entry_handshake, on the stream we return here.
     tracing::info!("EQ: zone change: connecting to new zone {}:{}", zone_ip, zone_port);
     let (zone_tx, zone_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
-    let zone_stream = match EqStream::connect(&zone_ip, zone_port, zone_tx, net_health.clone()).await {
+    let zone_stream = match EqStream::connect_zone(&zone_ip, zone_port, zone_tx, net_health.clone()).await {
         Ok(s) => s,
         Err(e) => { tracing::warn!("EQ: zone change: zone connect failed: {e}"); return false; }
     };
