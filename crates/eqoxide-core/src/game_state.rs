@@ -1839,6 +1839,9 @@ pub struct GameState {
     pub killer_id: Option<u32>,
     /// Self deaths this session, so a consumer can tell two deaths from one (central-6ly1.8).
     pub death_count: u32,
+    /// The last death was self-inflicted, decided at death time, so a later spawn-ID change
+    /// cannot relabel the killer.
+    pub killer_is_self: bool,
     pub died_at: Option<std::time::Instant>,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
@@ -4592,7 +4595,7 @@ pub(crate) mod tests {
             xp_pct: _,
             coin: _, coin_confirmed: _, unverified_buys: _,
             // Death record: `last_cast`-shaped — a true record of something that already happened.
-            player_dead: _, player_dead_since: _, killed_by: _, killer_id: _, death_count: _, died_at: _, last_cast: _,
+            player_dead: _, player_dead_since: _, killed_by: _, killer_id: _, death_count: _, killer_is_self: _, died_at: _, last_cast: _,
             // Group/guild/social: keyed by NAME, and a group follows the player across a zone line.
             group_members: _, group_leader: _, pending_invite: _,
             guild_names: _, guild_members: _, pending_guild_invite: _, who_roster: _,

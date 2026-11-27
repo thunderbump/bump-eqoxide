@@ -607,6 +607,22 @@ fn position_send_json(
             "age_ms":now.saturating_duration_since(sent.at).as_millis() as u64,"delivery_confirmed":false})
     })
 }
+/// Whether the session may run ordinary commands, apart from process shutdown and a terminal
+/// network outcome, which the run loop checks itself.
+fn host_ready(gs: &GameState, host: &Host, col_loaded: bool, tick_age: u64, link_age: u64, dropped: bool) -> bool {
+    gs.player_id != 0
+        && gs.player_pos_known
+        && !gs.world.zone_in_failed
+        && host.body.is_some()
+        && col_loaded
+        && tick_age < 500
+        && link_age < 15000
+        && !dropped
+        && gs.player_dead_since.is_none()
+        // Range checks measure from the last published position, so none can run before one.
+        && host.published_position.is_some()
+        && !(gs.max_hp > 0 && gs.cur_hp <= 0)
+}
 /// The received roster within 500 units of the published position, nearest first, ties by spawn
 /// ID, capped at 256 (central-6ly1.8). Empty while there is no body to measure from.
 fn roster(
@@ -631,7 +647,9 @@ fn roster(
 /// Self fields received from the server (central-6ly1.8), beside the local prediction.
 fn server_self_fields(gs: &GameState, started: Instant) -> serde_json::Map<String, Value> {
     let value = json!({
-        "server_position": gs.server_self_position.map(|p| json!({"position":p.pos,"heading":p.heading,
+        // Null until OP_NewZone: the self spawn arrives first and would pair the destination's
+        // position with the departing zone's name.
+        "server_position": gs.server_self_position.filter(|_| gs.world.new_zone_applied).map(|p| json!({"position":p.pos,"heading":p.heading,
             "source":p.source.as_str(),"at_ms":clock_ms(started,p.at)})),
         "corrections": {"count":gs.server_corrections,"last":gs.last_server_correction.map(|c|
             json!({"from":c.from,"to":c.to,"at_ms":clock_ms(started,c.at)}))},
@@ -655,7 +673,7 @@ fn server_self_fields(gs: &GameState, started: Instant) -> serde_json::Map<Strin
 /// the death packet named no known spawn; a self-inflicted death names the player, resolved here
 /// so the graphical overlay's wording is unchanged.
 fn known_killer_name(gs: &GameState) -> Option<String> {
-    if gs.killer_id.is_some_and(|id| id == gs.player_id && id != 0) && !gs.player_name.is_empty() {
+    if gs.killer_is_self && !gs.player_name.is_empty() {
         return Some(gs.player_name.clone());
     }
     let name = gs.killed_by.as_str();
@@ -859,8 +877,11 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             view.landed_fall_height = None;
             view.relocated = None;
         }
+        // Native sends the destination's self spawn before OP_NewZone, so the position can be
+        // known while `zone_name` still names the zone being left. Wait for the new zone itself.
         if gs.player_id != 0
             && gs.player_pos_known
+            && gs.world.new_zone_applied
             && !gs.world.zone_name.is_empty()
             && loaded_zone != gs.world.zone_name
         {
@@ -878,7 +899,12 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 }
             }
         }
-        if host.body.is_none() && gs.player_id != 0 && gs.player_pos_known && col.is_some() {
+        if host.body.is_none()
+            && gs.player_id != 0
+            && gs.player_pos_known
+            && gs.world.new_zone_applied
+            && col.is_some()
+        {
             let pos = [gs.player_x, gs.player_y, gs.player_z];
             if pos.iter().all(|v| v.is_finite()) {
                 host.body = Some(CharacterController::new(pos));
@@ -893,18 +919,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         drop(health);
         let ready = terminal.is_none()
             && !wiring.shutdown.load(Ordering::Acquire)
-            && gs.player_id != 0
-            && gs.player_pos_known
-            && !gs.world.zone_in_failed
-            && host.body.is_some()
-            && col.is_some()
-            && tick_age < 500
-            && link_age < 15000
-            && !dropped
-            && gs.player_dead_since.is_none()
-            // Range checks measure from the last published position, so none can run before one.
-            && host.published_position.is_some()
-            && !(gs.max_hp > 0 && gs.cur_hp <= 0);
+            && host_ready(&gs, &host, col.is_some(), tick_age, link_age, dropped);
         host.step(&gs, col.as_deref(), ready, now, dt);
         host.update_knowledge(&gs);
         if now >= publish_at {
@@ -1181,6 +1196,20 @@ mod tests {
         assert_ne!(receipt.status, Status::Refused,
             "25 units from the published position is in range: {receipt:?}");
     }
+    /// central-6ly1.8: no ordinary command runs before a publication has shown the position its
+    /// range checks measure from.
+    ///
+    /// MUTATION CHECK: drop `host.published_position.is_some()` from `host_ready` → RED.
+    #[test]
+    fn readiness_waits_for_a_published_position() {
+        let mut host = host();
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        gs.player_pos_known = true;
+        assert!(!host_ready(&gs, &host, true, 0, 0, false));
+        host.published_position = Some([0.0; 3]);
+        assert!(host_ready(&gs, &host, true, 0, 0, false));
+    }
     /// central-6ly1.8: the server's view of self beside the prediction, and the vitals.
     #[test]
     fn state_publishes_server_position_corrections_and_vitals() {
@@ -1188,6 +1217,7 @@ mod tests {
         let started = Instant::now();
         let at = started + Duration::from_millis(250);
         let mut gs = GameState::new();
+        gs.world.new_zone_applied = true;
         gs.server_self_position = Some(ServerSelfPosition {
             pos: [1.0, 2.0, 3.0], heading: 90.0, source: ServerPositionSource::Correction, at });
         gs.server_corrections = 2;
@@ -1206,10 +1236,15 @@ mod tests {
         assert_eq!(f["mana"], json!({"value":10,"max":20,"known":true}));
         assert_eq!(f["dead"], true);
         assert_eq!(f["killer"], json!({"id":55,"name":null}), "the id survives an unknown name");
-        gs.player_id = 55;
+        gs.killer_is_self = true;
+        gs.player_id = 56; // re-entered under a new spawn ID: still a self-inflicted death
         gs.player_name = "Me".into();
         assert_eq!(server_self_fields(&gs, started)["killer"], json!({"id":55,"name":"Me"}),
             "a self-inflicted death names the player without changing killed_by");
+        assert_eq!(f["server_position"]["source"], "server_correction");
+        gs.world.new_zone_applied = false;
+        assert_eq!(server_self_fields(&gs, started)["server_position"], Value::Null,
+            "a self spawn that arrived before OP_NewZone is not paired with the old zone");
     }
     /// central-6ly1.8: each received swing becomes one structured event, and a death one `died`.
     #[test]
@@ -1220,7 +1255,7 @@ mod tests {
         gs.player_id = 1;
         gs.player_name = "Me".into();
         gs.world.entities.insert(7, rat(7, 5.0));
-        let swing = |id| CombatRecord { id, source_id: 1, target_id: 7, amount: 3, spell_id: None,
+        let swing = |id| CombatRecord { id, source_id: 1, target_id: 7, amount: 3, spell_id: (id == 2).then_some(13),
             damage_type: 1, result: CombatResult::Hit, source_name: Some("Me".into()),
             target_name: Some("a_rat".into()), zone_epoch: 1, at: Instant::now() };
         gs.combat_records.push_back(swing(1));
@@ -1242,6 +1277,7 @@ mod tests {
             "source_id":1,"target_id":7,"source_name":"Me","target_name":"a_rat","amount":3,"spell_id":null,
             "damage_type":1,"result":"hit"}));
         assert_eq!(batch[2]["killer"], json!({"id":7,"name":"a_rat"}));
+        assert_eq!(batch[1]["spell_id"], 13, "the spell ID is published");
         assert_eq!(batch[2]["death_count"], 1);
 
         // Records evicted before the host saw them, and two deaths between reads, are reported.

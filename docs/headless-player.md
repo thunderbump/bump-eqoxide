@@ -129,7 +129,9 @@ Beside the prediction, `self` carries what the server said:
   - `server_update`: any other self position update.
 
   The server does not echo a client's ordinary movement back to it, so in normal play this field
-  holds the last server-originated placement, not the latest step. Cleared at zone entry.
+  holds the last server-originated placement, not the latest step. Cleared at zone entry, and null
+  until the server's `OP_NewZone` for that zone arrives (the self spawn comes first). The host also
+  waits for it before loading geometry and placing the body.
 - `corrections`: `count` for the session, and `last` (`from`, `to`, `at_ms`), which is cleared at
   zone entry.
 - `level`.

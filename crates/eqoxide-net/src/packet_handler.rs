@@ -2000,6 +2000,7 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
             .unwrap_or_else(|| "something".to_string());
         gs.killer_id = (killer_id != 0).then_some(killer_id);
         gs.death_count = gs.death_count.wrapping_add(1);
+        gs.killer_is_self = killer_id != 0 && killer_id == gs.player_id;
         gs.died_at   = Some(std::time::Instant::now());
         gs.hp_pct    = 0.0;
         gs.player_dead = true; // dead pose (eqoxide#61)
@@ -3213,6 +3214,16 @@ fn apply_move_door(gs: &mut GameState, p: &[u8]) {
     gs.push_ack(ServerAck::DoorMoved { door_id });
 }
 
+/// Record a same-zone teleport's destination from its `RequestClientZoneChange_Struct` payload:
+/// y at 8, x at 12, wire z at 16, heading at 20 (central-6ly1.8).
+pub(crate) fn record_same_zone_teleport(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 24 { return; }
+    let f = |at: usize| f32::from_le_bytes(payload[at..at + 4].try_into().unwrap());
+    let (y, x, z) = (f(8), f(12), f(16));
+    gs.record_server_position([x, y, z - eqoxide_core::coord::WIRE_Z_OFFSET],
+        server_heading_to_ccw(f(20)), eqoxide_core::game_state::ServerPositionSource::Relocation);
+}
+
 /// A float heading in EQ units (0–512, the server's `m_Position.w`), as `ZonePlayerToBind_Struct`
 /// and `RequestClientZoneChange_Struct` carry it, in the client's CCW degrees.
 pub(crate) fn server_heading_to_ccw(eq_units: f32) -> f32 {
@@ -3230,7 +3241,9 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     gs.player_pos_known = true; // server-authoritative respawn point (#513)
     // central-6ly1.8: only a bind in this zone is a position here. A bind in another zone names
     // coordinates there; the self spawn of that zone records them on entry.
-    if payload.len() >= 20 && (bind_zone == gs.world.zone_id as u32 || gs.world.zone_id == 0) {
+    // Native sends bind_zone_id 0 for a same-zone bind to SoF-and-later clients
+    // (eqemu:zone/zoning.cpp@cd66dd0a6:955), as `gameplay.rs` already reads it.
+    if bind_zone == 0 || bind_zone == gs.world.zone_id as u32 || gs.world.zone_id == 0 {
         let heading = server_heading_to_ccw(f32::from_le_bytes(payload[16..20].try_into().unwrap()));
         gs.record_server_position([gs.player_x, gs.player_y, gs.player_z], heading,
             eqoxide_core::game_state::ServerPositionSource::Relocation);
@@ -6092,6 +6105,25 @@ mod tests {
         gs.world.zone_id = 2;
         super::apply_bind_respawn(&mut gs, &bind(9));
         assert!(gs.server_self_position.is_none(), "a bind in another zone names no position here");
+        let mut gs = GameState::new();
+        gs.world.zone_id = 2;
+        super::apply_bind_respawn(&mut gs, &bind(0));
+        assert!(gs.server_self_position.is_some(), "native sends zone 0 for a same-zone bind");
+    }
+
+    #[test]
+    fn a_same_zone_teleport_records_a_server_relocation_6ly1_8() {
+        use eqoxide_core::game_state::ServerPositionSource;
+        let mut p = vec![0u8; 24];
+        p[8..12].copy_from_slice(&20.0f32.to_le_bytes()); // y
+        p[12..16].copy_from_slice(&10.0f32.to_le_bytes()); // x
+        p[16..20].copy_from_slice(&(5.0 + eqoxide_core::coord::WIRE_Z_OFFSET).to_le_bytes());
+        p[20..24].copy_from_slice(&384.0f32.to_le_bytes()); // 270° clockwise: west
+        let mut gs = GameState::new();
+        super::record_same_zone_teleport(&mut gs, &p);
+        let pos = gs.server_self_position.expect("recorded");
+        assert_eq!((pos.pos, pos.source), ([10.0, 20.0, 5.0], ServerPositionSource::Relocation));
+        assert!((pos.heading - 90.0).abs() < 0.01, "west is 90 counter-clockwise: {}", pos.heading);
     }
 
     #[test]
