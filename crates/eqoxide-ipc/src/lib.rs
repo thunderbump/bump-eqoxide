@@ -76,6 +76,39 @@ pub struct MoveIntent {
     pub hop:         bool,
 }
 
+/// Command identities that contributed to one unsent position window.
+#[derive(Clone, Debug, Default)]
+pub enum PositionCommands {
+    #[default]
+    None,
+    One(Arc<str>),
+    Mixed,
+}
+
+impl PositionCommands {
+    pub fn include(&mut self, id: Option<&Arc<str>>) {
+        if let Some(id) = id {
+            self.merge(Self::One(id.clone()));
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        match (&*self, other) {
+            (Self::None, other) => *self = other,
+            (Self::One(a), Self::One(b)) if a != &b => *self = Self::Mixed,
+            (_, Self::Mixed) => *self = Self::Mixed,
+            _ => {}
+        }
+    }
+
+    pub fn command_id(&self) -> Option<&Arc<str>> {
+        match self {
+            Self::One(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
 /// A snapshot of the controller the render thread republishes for the net thread to stream to the
 /// server (design §2 "Threading"). `heading` is EQ-CCW degrees.
 ///
@@ -91,7 +124,7 @@ pub struct MoveIntent {
 /// net-thread writers also mutate it, off the frame cadence entirely. Both are named on
 /// [`ControllerShared`] — read that before treating a value read from this struct as render-thread
 /// output (#1044 review round 1, finding D).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ControllerView {
     /// CPU host fence; graphical publishers retain the legacy unfenced mode.
     pub zone_epoch: Option<u64>,
@@ -105,6 +138,11 @@ pub struct ControllerView {
     /// Zero forever means "no step signal": the streamer then never sends a rest flush and keeps
     /// the plain 280 ms / 1300 ms cadence. The graphical render loop does not publish it.
     pub step_seq: u64,
+    /// Active headless command, also used for a keepalive between physics steps.
+    pub active_motion_command: Option<Arc<str>>,
+    /// Steps published since the network owner last read this view, including the step at expiry.
+    /// Accumulating under the position lock preserves ambiguity even if a net tick skips a sample.
+    pub position_commands: PositionCommands,
     /// The last self `OP_ClientUpdate` the net streamer attempted (central-vgwu). Written by the
     /// net thread, never by a publisher. It lives here rather than in `GameState` so a keepalive
     /// does not change the published snapshot, which the graphical render loop treats as
@@ -2367,6 +2405,8 @@ impl ControllerSlots {
         let mut view = self.controller_view.lock().unwrap();
         self.pos_correction.lock().unwrap().take();
         view.correction_adopted = view.correction_issued;
+        view.active_motion_command = None;
+        view.position_commands = PositionCommands::None;
         if view.zone_epoch.is_some() { view.initialized = false; }
         view.invalidate_disclosures();
         // #925: the relocation really happened, so it still counts — but its destination named a

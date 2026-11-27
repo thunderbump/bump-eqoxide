@@ -189,7 +189,7 @@ delivery to another player. Legacy self-echo filtering remains unchanged. Receiv
 
 ### Packet trace
 
-`GET /v2/player/packets?after=N&limit=L&opcode=NAME&command=ID` uses the same bearer
+`GET /v2/player/packets?after=N&limit=L&opcode=NAME&command=ID&raw=1` uses the same bearer
 token as state, commands, and events. Each session automatically keeps its newest 20,000
 application packets from zone connections, including zone entry. Start with `after=0`, then
 pass the response's `next` as `after` on the next request with the same filters. The cursor
@@ -199,15 +199,33 @@ The response pages in increasing `n` order. `limit` defaults to 500 and accepts 
 command ID from the command URL. Unknown query parameters return HTTP 400.
 `gap:true` means some indices after `after` were evicted, regardless of filters.
 
-Each row has `n`, `at_ms` on the state's `clock_ms` clock, `dir` (`in` or `out`),
-numeric `opcode`, `opcode_name`, `len` in bytes including the opcode, `reliable`,
-`wire_seq`, `acked_at_ms`, `command_id`, and `fields`. The outbound reliable sequence
-identifies the first fragment and the inbound sequence identifies the completing fragment.
-`wire_seq` is null for unreliable packets. For an inbound reliable row, `acked_at_ms`
-records when the socket accepted the first cumulative ACK covering its sequence, on the
-host clock. A deferred ACK leaves the field null until it sends. Poll the same cursor
-range again when waiting for an existing row's ACK. Outbound and unreliable rows have a
-null `acked_at_ms`.
+Each row has a delivery index `n`, capture time `at_ms` on the state's `clock_ms`
+clock, direction `dir` (`in` or `out`), numeric `opcode`, `opcode_name`, `len` in bytes
+including the opcode, `reliable`, `wire_seq`, `command_id`, and decoded `fields`.
+`wire_seq` is null for unreliable packets. For fragmented packets it identifies the first
+outbound fragment or the completing inbound fragment.
+
+Inbound rows carry `arrived_at_ms` on the host clock and a session-wide `arrival_n`
+assigned when the client reads the datagram from the socket, before reordering. Rows
+from the same combined datagram share these values. Fragmented rows use the arrival of
+the completing fragment. Socket reads that produce no zone row consume indices too.
+Outbound rows have null arrival fields. Page and filter by `n` as usual, then read
+`arrival_n` to recover datagram arrival order.
+
+For an inbound reliable row, `acked_at_ms` records when the socket accepted the first
+cumulative ACK covering its sequence. `ack_seq` is the actual sequence on that ACK,
+and `ack_exact` is true if it equals `wire_seq`. An immediate ACK is sent before the row
+is captured, so `acked_at_ms` can be at or before `at_ms`. A missing ACK leaves
+`acked_at_ms` and `ack_seq` null and `ack_exact` false. Poll the same cursor range to
+check for an ACK on an existing row. Stop waiting if the stream ends before a covering
+ACK is sent, since the fields can stay null forever. Outbound and unreliable rows have
+the same null ACK fields and false `ack_exact`.
+
+Use `raw=1` to include `payload_hex`, the lowercase hex of the decoded application body
+without the opcode. `payload_truncated` is true whenever the body exceeded the retained
+512-byte prefix. The 20,000-row ring retains at most 10,240,000 raw payload bytes
+(about 9.77 MiB), plus record metadata and allocation overhead. A 2,000-row response
+contains at most 2,048,000 hex characters.
 
 Decoded `fields` use raw wire values. Positions are in x/y/z order and keep wire-datum z.
 Headings use the raw protocol units.
@@ -221,12 +239,15 @@ Headings use the raw protocol units.
 | `OP_TARGET_MOUSE` | Outbound | `target_id` |
 | `OP_DAMAGE` (0x6f15) | Inbound | `target`, `source`, `type`, `spell`, signed `damage` |
 | `OP_MOB_HEALTH` (0x37b1) | Inbound | `entity`, `percent` |
+| `OP_DELETE_SPAWN` (0x7280) | Inbound | `entity` |
 
 Other rows have empty `fields`. The network owner tags outbound packets emitted by a
 command drain, including awaited merchant open and buy. The explicit loot command ID
-follows its corpse queue entry and tags the open, item takes, and close. Automatic loot,
-inbound packets, and periodic movement have a null `command_id`. Outbound rows record
-send attempts. Reliable retransmits reuse the original wire bytes and increment
+follows its corpse queue entry and tags the open, item takes, and close. A movement
+command tags the position updates it drives, including keepalives while it is active
+and the rest update at its end. Correction re-streams and position windows influenced
+by multiple motion commands have a null `command_id`, as do unowned position updates,
+automatic loot, and inbound packets. Outbound rows record send attempts. Reliable retransmits reuse the original wire bytes and increment
 transport counters without adding another application row.
 
 The response's `counters` cover login, world, and zone transport. They come from one

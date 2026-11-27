@@ -745,6 +745,7 @@ struct PacketQuery {
     limit: Option<usize>,
     opcode: Option<String>,
     command: Option<String>,
+    raw: Option<u8>,
 }
 
 async fn get_packets(
@@ -758,12 +759,22 @@ async fn get_packets(
             "limit_must_be_between_1_and_2000".into(),
         ));
     }
-    let page = control.packet_trace.page(
+    let raw = match query.raw {
+        None | Some(0) => false,
+        Some(1) => true,
+        Some(_) => return Err(ApiError(StatusCode::BAD_REQUEST, "raw_must_be_0_or_1".into())),
+    };
+    let mut page = control.packet_trace.page(
         query.after.unwrap_or(0),
         limit,
         query.opcode.as_deref(),
         query.command.as_deref(),
     );
+    if raw {
+        for packet in &mut page.packets {
+            packet.include_raw_payload();
+        }
+    }
     Ok(Json(json!({
         "packets": page.packets,
         "next": page.next,

@@ -1,4 +1,4 @@
-use super::{tests::host_with_wiring, GameplayLifecycle, Host, Status, Wiring};
+use super::{tests::{floor, host_with_wiring}, GameplayLifecycle, Host, Status, Wiring};
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -86,16 +86,20 @@ impl Session {
         );
     }
 
-    async fn assert_packets(&self, id: &str, expected: &[u16]) {
+    async fn packets(&self, query: &str) -> Value {
         let response = self.host.control.router().oneshot(
-            Request::get(format!("/v2/player/packets?command={id}"))
+            Request::get(format!("/v2/player/packets?{query}"))
                 .header("authorization", "Bearer test-credential")
                 .body(Body::empty())
                 .unwrap(),
         ).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 65_536).await.unwrap();
-        let trace: Value = serde_json::from_slice(&bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn assert_packets(&self, id: &str, expected: &[u16]) {
+        let trace = self.packets(&format!("command={id}")).await;
         let opcodes: Vec<_> = trace["packets"].as_array().unwrap().iter().map(|packet| {
             assert_eq!(packet["dir"], "out");
             assert_eq!(packet["command_id"], id);
@@ -246,9 +250,10 @@ async fn inventory_move_owns_move_item_packet() {
     session.assert_packets("move", &[OP_MOVE_ITEM]).await;
 }
 
-/// Removing the ID at the dispatch, queue entry, open, or item send loses an expected row.
+/// Dropping the ID at normal close loses the third row. A real close ACK must release the
+/// command before the next, automatic entry opens the same corpse.
 #[tokio::test]
-async fn explicit_loot_owns_open_and_item_takes() {
+async fn explicit_loot_owns_open_take_and_close() {
     let mut session = Session::new().await;
     let mut corpse = make_entity(9, "a corpse", 0.0, 0.0, 0.0, true);
     corpse.dead = true;
@@ -265,17 +270,129 @@ async fn explicit_loot_owns_open_and_item_takes() {
     loot.receive(&mut session.gs, OP_MONEY_ON_CORPSE, open.clone());
     loot.receive_catalog_item(&mut session.gs);
     loot.tick(&mut session.stream, &mut session.gs);
-    session.assert_packets("loot-1", &[OP_LOOT_REQUEST, OP_LOOT_ITEM]).await;
+    let mut item_ack = vec![0; 20];
+    item_ack[..4].copy_from_slice(&9u32.to_le_bytes());
+    item_ack[4..8].copy_from_slice(&session.gs.player_id.to_le_bytes());
+    item_ack[8..10].copy_from_slice(&23u16.to_le_bytes());
+    item_ack[12..16].copy_from_slice(&1i32.to_le_bytes());
+    loot.receive(&mut session.gs, OP_LOOT_ITEM, item_ack);
+    session.gs.loot_last_activity = Some(Instant::now() - Duration::from_secs(3));
+    loot.tick(&mut session.stream, &mut session.gs);
+    assert!(session.gs.loot_end_requested_at.is_some());
+    let expected = [OP_LOOT_REQUEST, OP_LOOT_ITEM, OP_END_LOOT_REQUEST];
+    session.assert_packets("loot-1", &expected).await;
 
-    // The next queue entry, even for the same corpse, cannot inherit the previous command's ID.
+    // Exercise the genuine close path. The next queue entry opens the same corpse automatically.
     loot.receive(&mut session.gs, OP_LOOT_COMPLETE, vec![]);
+    assert!(!session.gs.loot_session_active);
+    assert!(session.gs.loot_end_requested_at.is_none());
     session.gs.pending_loot.push_back(9.into());
     session.gs.loot_queued_at = Some(Instant::now() - Duration::from_secs(1));
     loot.tick(&mut session.stream, &mut session.gs);
     loot.receive(&mut session.gs, OP_MONEY_ON_CORPSE, open);
     loot.receive_catalog_item(&mut session.gs);
     loot.tick(&mut session.stream, &mut session.gs);
-    session.assert_packets("loot-1", &[OP_LOOT_REQUEST, OP_LOOT_ITEM]).await;
+    session.assert_packets("loot-1", &expected).await;
+    let trace = session.packets("opcode=OP_LOOT_REQUEST").await;
+    let rows = trace["packets"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["command_id"], Value::Null);
     assert!(session.gs.loot_session_active);
     assert!(session.gs.loot_command_id.is_none());
+}
+
+/// Dropping the ID on the defensive close loses the packet triggered by the open timeout.
+#[tokio::test]
+async fn explicit_loot_owns_defensive_close_after_open_timeout() {
+    let mut session = Session::new().await;
+    let mut corpse = make_entity(9, "a corpse", 0.0, 0.0, 0.0, true);
+    corpse.dead = true;
+    session.gs.upsert_entity(corpse);
+    session.dispatch("loot-timeout", json!({"kind":"loot","entity_id":9})).await;
+    session.drain();
+    session.gs.loot_queued_at = Some(Instant::now() - Duration::from_secs(1));
+    let mut loot = LootFixture::default();
+    loot.tick(&mut session.stream, &mut session.gs);
+    assert!(session.gs.loot_session_active);
+    assert!(!session.gs.loot_confirmed);
+
+    session.gs.loot_last_activity = Some(Instant::now() - Duration::from_secs(6));
+    loot.tick(&mut session.stream, &mut session.gs);
+    assert!(session.gs.loot_defensive_close_at.is_some());
+    session.assert_packets("loot-timeout", &[OP_LOOT_REQUEST, OP_END_LOOT_REQUEST]).await;
+}
+
+/// The physics publication, moving sender, and expiry/rest path all carry the move ID.
+#[tokio::test]
+async fn move_for_owns_moving_and_rest_updates() {
+    use eqoxide_core::game_state::PositionSendReason;
+
+    let mut session = Session::new().await;
+    let floor = floor();
+    session.gs.world.zone_name = "synthetic".into();
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.02);
+    session.drain();
+
+    session.dispatch("move", json!({"kind":"move_for","east":1,"north":0,"duration_ms":2000})).await;
+    let until = session.host.motion.as_ref().unwrap().until;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.05);
+    session.drain();
+    let last_send = || session.host.controller_slots.controller_view.lock().unwrap().last_position_send.unwrap();
+    assert_eq!(last_send().reason, PositionSendReason::Moving);
+
+    session.host.step(&session.gs, Some(&floor), true, until, 0.02);
+    session.drain();
+    assert_eq!(
+        session.host.controller_slots.controller_view.lock().unwrap().last_position_send.unwrap().reason,
+        PositionSendReason::Rest,
+    );
+    session.assert_packets("move", &[OP_CLIENT_UPDATE, OP_CLIENT_UPDATE]).await;
+}
+
+/// A stationary active command owns a keepalive, while a correction re-stream stays untagged.
+#[tokio::test]
+async fn active_motion_owns_keepalive_but_not_correction() {
+    use eqoxide_core::game_state::PositionSendReason;
+
+    let mut session = Session::new().await;
+    let floor = floor();
+    session.gs.world.zone_name = "synthetic".into();
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.02);
+    session.drain();
+    session.dispatch("wait-move", json!({"kind":"move_for","east":0,"north":0,"duration_ms":2000})).await;
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.02);
+    session.drain();
+    tokio::time::sleep(Duration::from_millis(1320)).await;
+    session.drain();
+    assert_eq!(
+        session.host.controller_slots.controller_view.lock().unwrap().last_position_send.unwrap().reason,
+        PositionSendReason::Keepalive,
+    );
+    session.gs.player_x += 30.0;
+    session.drain();
+    let trace = session.packets("opcode=OP_CLIENT_UPDATE").await;
+    assert_eq!(trace["packets"].as_array().unwrap().len(), 2);
+    assert_eq!(trace["packets"][1]["command_id"], Value::Null);
+    session.assert_packets("wait-move", &[OP_CLIENT_UPDATE]).await;
+}
+
+/// If the network skips steps from two move commands, their joint update has no single owner.
+#[tokio::test]
+async fn position_window_with_two_commands_is_unattributed() {
+    let mut session = Session::new().await;
+    let floor = floor();
+    session.gs.world.zone_name = "synthetic".into();
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.02);
+    session.drain();
+
+    for (id, east, north) in [("east", 1, 0), ("north", 0, 1)] {
+        session.dispatch(id, json!({"kind":"move_for","east":east,"north":north,"duration_ms":2000})).await;
+        session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.05);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    session.drain();
+    let trace = session.packets("opcode=OP_CLIENT_UPDATE").await;
+    assert_eq!(trace["packets"].as_array().unwrap().len(), 1);
+    assert_eq!(trace["packets"][0]["command_id"], Value::Null);
 }

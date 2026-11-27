@@ -591,6 +591,8 @@ pub struct ActionLoop {
     /// heading it carried. Together with `last_sent_pos` these decide whether a rest flush is
     /// owed (central-vgwu).
     last_sent_moving: bool,
+    position_commands: eqoxide_ipc::PositionCommands,
+    last_position_commands: eqoxide_ipc::PositionCommands,
     last_sent_heading: f32,
     /// `ControllerView::step_seq` and `pos` as of the last physics step this streamer observed.
     seen_step_seq:    u64,
@@ -710,6 +712,8 @@ impl ActionLoop {
             last_pos_send: Instant::now(),
             last_sent_pos: [0.0, 0.0, 0.0],
             last_sent_moving: false,
+            position_commands: Default::default(),
+            last_position_commands: Default::default(),
             last_sent_heading: 0.0,
             seen_step_seq: 0,
             step_pos: [0.0, 0.0, 0.0],
@@ -2647,9 +2651,13 @@ impl ActionLoop {
     /// server corrections (>12u jumps the server pushed) and forwards them to the controller, and
     /// sends OP_ClientUpdate at ≤280 ms while moving with a forced 1300 ms keepalive when idle.
     fn stream_position(&mut self, stream: &mut EqStream, gs: &mut GameState) {
-        let view = *self.controller.controller_view.lock().unwrap();
-        // Don't stream/mirror until the render controller has spawned (else we'd push origin).
-        if !view.initialized || view.zone_epoch.is_some_and(|epoch| epoch != gs.zone_epoch) { return; }
+        let (view, commands) = {
+            let mut view = self.controller.controller_view.lock().unwrap();
+            // Don't stream/mirror until the render controller has spawned (else we'd push origin).
+            if !view.initialized || view.zone_epoch.is_some_and(|epoch| epoch != gs.zone_epoch) { return; }
+            let commands = std::mem::take(&mut view.position_commands);
+            (view.clone(), commands)
+        };
         // #724 review B1: mirror the controller's "I have stopped the body and cannot resume" state
         // alongside its position, on the same tick and under the same init gate, so `player.hold` on
         // `GET /v1/observe` is exactly as fresh as the `pos` beside it. Level-triggered — the view is
@@ -2813,7 +2821,8 @@ impl ActionLoop {
             // `last_sent_pos` happened to be before the jump (#624 review — the reviewer confirmed
             // this path does not spike; keep it that way explicitly rather than by accident).
             self.send_position_update(stream, gs, gp, gp, gs.player_heading,
-                                      eqoxide_core::game_state::PositionSendReason::Correction);
+                                      eqoxide_core::game_state::PositionSendReason::Correction, Default::default());
+            self.position_commands = Default::default();
             self.last_streamed = gp;
             self.last_pos_send = Instant::now();
             self.last_sent_pos = gp;
@@ -2844,6 +2853,7 @@ impl ActionLoop {
         if view.zone_epoch != self.rest_epoch || unadopted {
             if view.zone_epoch != self.rest_epoch {
                 self.rest_epoch = view.zone_epoch;
+                self.position_commands = Default::default();
                 self.last_sent_moving = false;
                 self.stepped_since_send = false;
             }
@@ -2854,6 +2864,11 @@ impl ActionLoop {
             // view: the teleport itself is not motion, but any travel past the correction is.
             self.step_pos = self.last_sent_pos;
             self.stepped_since_send = false;
+        }
+        if unadopted {
+            self.position_commands = Default::default();
+        } else {
+            self.position_commands.merge(commands);
         }
         let mut at_rest = false;
         if view.step_seq != self.seen_step_seq {
@@ -2873,7 +2888,12 @@ impl ActionLoop {
         if at_rest && rest_owed {
             // `from == to`: zero delta and animation 0, the native "standing here" update.
             use eqoxide_core::game_state::PositionSendReason::Rest;
-            self.send_position_update(stream, gs, pos, pos, view.heading, Rest);
+            let mut commands = std::mem::take(&mut self.position_commands);
+            commands.include(view.active_motion_command.as_ref());
+            if self.last_sent_moving {
+                commands.merge(self.last_position_commands.clone());
+            }
+            self.send_position_update(stream, gs, pos, pos, view.heading, Rest, commands);
             self.last_pos_send = Instant::now();
             self.last_sent_pos = pos;
         } else if (moved && since >= POS_SEND_MOVING_MS) || since >= POS_SEND_KEEPALIVE_MS {
@@ -2885,7 +2905,15 @@ impl ActionLoop {
             // flooring every sustained run's reported speed back down near the walking constant.
             use eqoxide_core::game_state::PositionSendReason::{Keepalive, Moving};
             let reason = if moved && since >= POS_SEND_MOVING_MS { Moving } else { Keepalive };
-            self.send_position_update(stream, gs, self.last_sent_pos, pos, view.heading, reason);
+            let mut commands = std::mem::take(&mut self.position_commands);
+            if !unadopted {
+                // An idle keepalive has no residual motion to attribute once rest was sent.
+                if !rest_drift && !self.last_sent_moving && !self.stepped_since_send {
+                    commands = Default::default();
+                }
+                commands.include(view.active_motion_command.as_ref());
+            }
+            self.send_position_update(stream, gs, self.last_sent_pos, pos, view.heading, reason, commands);
             self.last_pos_send = Instant::now();
             self.last_sent_pos = pos;
         }
@@ -2927,6 +2955,7 @@ impl ActionLoop {
         to: [f32; 3],
         heading: f32,
         reason: eqoxide_core::game_state::PositionSendReason,
+        commands: eqoxide_ipc::PositionCommands,
     ) {
         let dx = to[0] - from[0]; // east  delta (server_x)
         let dy = to[1] - from[1]; // north delta (server_y)
@@ -2974,11 +3003,14 @@ impl ActionLoop {
         // server's idea of where we are has stopped tracking ours. Not escalated further here — the
         // next update ~50ms later supersedes this one, and aborting the loop on a transient
         // WouldBlock would be worse than the drop.
-        if let Err(e) = stream.send_app_packet_unreliable(OP_CLIENT_UPDATE, &buf) {
+        if let Err(e) = stream.send_app_packet_unreliable_with_command(
+            OP_CLIENT_UPDATE, &buf, commands.command_id(),
+        ) {
             tracing::debug!("NET: position update seq {} did not reach the wire ({:?}) — no \
                              retransmit; the next update supersedes it (#612)",
                             self.position_seq.wrapping_sub(1), e.kind());
         }
+        self.last_position_commands = commands;
         // Recorded after the transport call, so state never reports an attempt not yet made.
         self.controller.controller_view.lock().unwrap().last_position_send = Some(record);
     }
@@ -3595,7 +3627,7 @@ mod tests {
                         //    correction is publish it into `pos_correction` and wait to be asked.
                         //    Note the withdrawal above is a write to `gs`, NOT to the view: the
                         //    render thread's published answer is left exactly as it published it.
-                        let view = *nav.controller.controller_view.lock().unwrap();
+                        let view = nav.controller.controller_view.lock().unwrap().clone();
                         assert_eq!(view.pos, FROZEN_POS,
                             "the net thread must not write the controller's position — freeing the \
                              body is the render thread's move to make: {ctx}");

@@ -2,7 +2,9 @@
 //!
 //! Ported from the Python reference at eq_client/connection/stream.py.
 
-use super::packet_telemetry::{self, Dir, SessionTrace, SESSION_PACKET_CAPACITY};
+use super::packet_telemetry::{
+    self, Dir, PacketArrival, ReceiveEvidence, SessionTrace, SESSION_PACKET_CAPACITY,
+};
 use super::protocol::*;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use eqoxide_ipc::SessionDropCause;
@@ -405,6 +407,12 @@ struct Sent {
     transmitted: bool,
 }
 
+struct OrderedDatagram {
+    bytes: Vec<u8>,
+    is_fragment: bool,
+    arrival: Option<PacketArrival>,
+}
+
 struct ControlDatagram {
     bytes: Vec<u8>,
     ack_seq: Option<u16>,
@@ -485,7 +493,7 @@ pub struct EqStream {
     peer: SocketAddr,
     send_seq: u16,
     next_recv_seq: u16,
-    recv_buf: HashMap<u16, (Vec<u8>, bool)>, // seq → (data, is_fragment)
+    recv_buf: HashMap<u16, OrderedDatagram>,
     /// Sent-but-unACKed reliable datagrams, in send order, retransmitted on OP_OutOfOrder / timeout
     /// until the server ACKs their sequence (#254). Cumulative OP_ACK pops from the front.
     sent: VecDeque<Sent>,
@@ -680,12 +688,12 @@ impl EqStream {
                     // an asterisk on it is how it rots back into #343 (review). `last_tick` is bumped
                     // alongside it (#477): a datagram arriving mid-handshake is proof the net thread
                     // is alive and progressing, so the liveness clock must not be allowed to go stale.
+                    let now = Instant::now();
                     let mut h = stream.net_health.lock().unwrap();
-                    let now = std::time::Instant::now();
                     h.last_datagram = now;
                     h.last_tick = now;
                     drop(h);
-                    stream.on_raw_recv(&recv_buf[..n]);
+                    stream.on_raw_recv_at(&recv_buf[..n], now);
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => {} // recv timeout, keep waiting
@@ -722,7 +730,7 @@ impl EqStream {
     ) {
         // Telemetry boundary (#525): record BEFORE send_reliable assigns the sequence, so `send_seq`
         // is the sequence this packet's first datagram will carry. Zero cost when disabled.
-        self.capture_app(Dir::Out, opcode, payload, Some(self.send_seq), command, None);
+        self.capture_app(Dir::Out, opcode, payload, Some(self.send_seq), command, ReceiveEvidence::default());
         let mut app_data = Vec::with_capacity(2 + payload.len());
         app_data.write_u16::<byteorder::LittleEndian>(opcode).unwrap();
         app_data.extend_from_slice(payload);
@@ -765,8 +773,17 @@ impl EqStream {
     /// more a client moves, the more reliable position packets it sends and the sooner one is lost
     /// (eqoxide#127). Only valid for opcodes whose low byte is non-zero (the raw-app-packet marker).
     pub fn send_app_packet_unreliable(&mut self, opcode: u16, payload: &[u8]) -> std::io::Result<()> {
-        // Telemetry boundary (#525): unreliable — no sequence number. Zero cost when disabled.
-        self.capture_app(Dir::Out, opcode, payload, None, None, None);
+        self.send_app_packet_unreliable_with_command(opcode, payload, None)
+    }
+
+    pub(crate) fn send_app_packet_unreliable_with_command(
+        &mut self,
+        opcode: u16,
+        payload: &[u8],
+        command: Option<&Arc<str>>,
+    ) -> std::io::Result<()> {
+        // Telemetry boundary (#525): unreliable — no sequence number.
+        self.capture_app(Dir::Out, opcode, payload, None, command, ReceiveEvidence::default());
         debug_assert!(opcode & 0xFF != 0, "raw app packets need a non-zero low opcode byte");
         let body = encode_raw_app(
             opcode, payload,
@@ -788,13 +805,14 @@ impl EqStream {
         payload: &[u8],
         wire_seq: Option<u16>,
         command: Option<&Arc<str>>,
-        acked_at: Option<Instant>,
+        receive: ReceiveEvidence,
     ) {
         packet_telemetry::capture(dir, opcode, payload, wire_seq.is_some(), wire_seq);
         // Opcode names and field layouts on this route are for the zone protocol.
         if let Some(trace) = self.packet_trace.as_ref().filter(|_| self.capture_zone_packets) {
-            let n = trace.capture_with_ack(dir, opcode, payload, wire_seq, command.cloned(), acked_at);
-            if let (Dir::In, Some(seq), None) = (dir, wire_seq, acked_at) {
+            let awaiting_ack = receive.acked_at.is_none();
+            let n = trace.capture_with_receive(dir, opcode, payload, wire_seq, command.cloned(), receive);
+            if let (Dir::In, Some(seq), true) = (dir, wire_seq, awaiting_ack) {
                 if self.pending_packet_acks.len() == SESSION_PACKET_CAPACITY {
                     self.pending_packet_acks.pop_front();
                 }
@@ -826,8 +844,9 @@ impl EqStream {
                 Ok(n) => {
                     // Link liveness (#343): ANY datagram, stamped BEFORE decode so session-layer
                     // ACKs/keepalives — which never become application packets — still count.
-                    self.net_health.lock().unwrap().last_datagram = std::time::Instant::now();
-                    self.on_raw_recv(&buf[..n]);
+                    let now = Instant::now();
+                    self.net_health.lock().unwrap().last_datagram = now;
+                    self.on_raw_recv_at(&buf[..n], now);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
                 // #642: a non-WouldBlock recv error on a CONNECTED UDP socket is the documented
@@ -1220,7 +1239,7 @@ impl EqStream {
             .take_while(|&&(seq, _)| seq_leq(seq, ack_seq))
             .count();
         if covered > 0 {
-            trace.mark_acked(self.pending_packet_acks.drain(..covered).map(|(_, n)| n), at);
+            trace.mark_acked(self.pending_packet_acks.drain(..covered).map(|(_, n)| n), ack_seq, at);
         }
         Some(at)
     }
@@ -1413,10 +1432,13 @@ impl EqStream {
 
     // ── Receive dispatch ──────────────────────────────────────────────────────
 
+    #[cfg(test)]
     fn on_raw_recv(&mut self, data: &[u8]) {
-        if let Some(trace) = &self.packet_trace {
-            trace.record_receive();
-        }
+        self.on_raw_recv_at(data, Instant::now());
+    }
+
+    fn on_raw_recv_at(&mut self, data: &[u8], at: Instant) {
+        let arrival = self.packet_trace.as_ref().map(|trace| trace.record_receive(at));
         // Strip the outer CRC that trails every datagram.
         let body_end = data.len().saturating_sub(self.session.crc_bytes as usize);
         let body = &data[..body_end];
@@ -1440,16 +1462,18 @@ impl EqStream {
             ) {
                 // Telemetry boundary (#525): raw unreliable app packet (e.g. NPC position
                 // broadcasts) — no reliable sequence. Zero cost when disabled.
-                self.capture_app(Dir::In, opcode, &payload, None, None, None);
+                self.capture_app(Dir::In, opcode, &payload, None, None, ReceiveEvidence {
+                    arrival, acked_at: None,
+                });
                 let _ = self.app_tx.send(AppPacket { opcode, payload });
             }
             return;
         }
 
-        self.dispatch_transport(body[1], &body[2..]);
+        self.dispatch_transport(body[1], &body[2..], arrival);
     }
 
-    fn dispatch_transport(&mut self, opcode: u8, payload: &[u8]) {
+    fn dispatch_transport(&mut self, opcode: u8, payload: &[u8], arrival: Option<PacketArrival>) {
         match opcode {
             OP_SESSION_RESPONSE => self.handle_session_response(payload),
             // DELIBERATE (#612): session-layer replies to the server's own probes. Counted +
@@ -1457,12 +1481,12 @@ impl EqStream {
             // server re-probes on its own cadence.
             OP_KEEPALIVE => { let _ = self.send_raw(OP_KEEPALIVE, &[]); }
             OP_STAT_REQUEST => { let _ = self.send_raw(OP_STAT_RESPONSE, payload); }
-            OP_COMBINED => self.handle_transport_combined(payload),
-            OP_PACKET => self.handle_packet(payload),
+            OP_COMBINED => self.handle_transport_combined(payload, arrival),
+            OP_PACKET => self.handle_packet(payload, arrival),
             OP_FRAGMENT | OP_FRAGMENT_CONT | OP_FRAGMENT_CONT2 | OP_FRAGMENT_CONT3 => {
-                self.handle_fragment(payload);
+                self.handle_fragment(payload, arrival);
             }
-            OP_APP_COMBINED => self.handle_combined(payload),
+            OP_APP_COMBINED => self.handle_combined(payload, arrival),
             // Inbound reliability control (#254). Both carry an encoded BE u16 sequence, framed like a
             // reliable packet's seq — decode the same way ordered packets are decoded.
             OP_ACK => {
@@ -1495,11 +1519,11 @@ impl EqStream {
     /// decode their body must be handled here WITHOUT decoding, since the combined body was decoded
     /// once already. Everything else (session-response/keepalive/stat/nested-combined) does not decode
     /// its body, so it can share `dispatch_transport` unchanged. (#302)
-    fn handle_predecoded_transport(&mut self, opcode: u8, payload: &[u8]) {
+    fn handle_predecoded_transport(&mut self, opcode: u8, payload: &[u8], arrival: Option<PacketArrival>) {
         match opcode {
-            OP_PACKET => self.handle_ordered_decoded(payload, false),
+            OP_PACKET => self.handle_ordered_decoded(payload, false, arrival),
             OP_FRAGMENT | OP_FRAGMENT_CONT | OP_FRAGMENT_CONT2 | OP_FRAGMENT_CONT3 => {
-                self.handle_ordered_decoded(payload, true);
+                self.handle_ordered_decoded(payload, true, arrival);
             }
             OP_ACK => {
                 if payload.len() >= 2 { self.ack_up_to(u16::from_be_bytes([payload[0], payload[1]])); }
@@ -1508,7 +1532,7 @@ impl EqStream {
                 if payload.len() >= 2 { self.on_out_of_order(u16::from_be_bytes([payload[0], payload[1]])); }
             }
             // Non-decoding transport opcodes are safe to route through the standard dispatch.
-            _ => self.dispatch_transport(opcode, payload),
+            _ => self.dispatch_transport(opcode, payload, arrival),
         }
     }
 
@@ -1541,7 +1565,7 @@ impl EqStream {
     /// still encoded, so decode once then process. (A reliable arriving as an OP_Combined SUB is
     /// already plaintext — see `handle_ordered_decoded`, called directly from the combined handler,
     /// to avoid decoding it a second time. #302.)
-    fn handle_ordered(&mut self, payload: &[u8], is_fragment: bool) {
+    fn handle_ordered(&mut self, payload: &[u8], is_fragment: bool, arrival: Option<PacketArrival>) {
         if payload.len() < 2 {
             return;
         }
@@ -1549,28 +1573,28 @@ impl EqStream {
             Some(d) => d,
             None => return,
         };
-        self.handle_ordered_decoded(&decoded, is_fragment);
+        self.handle_ordered_decoded(&decoded, is_fragment, arrival);
     }
 
     /// Process an ALREADY-DECODED reliable inner (`seq(BE u16) + data`): classify by sequence, ACK,
     /// and deliver in order. Shared by the standalone path (after one decode) and the OP_Combined
     /// sub-packet path (subs are already plaintext). (#302)
-    fn handle_ordered_decoded(&mut self, decoded: &[u8], is_fragment: bool) {
+    fn handle_ordered_decoded(&mut self, decoded: &[u8], is_fragment: bool, arrival: Option<PacketArrival>) {
         if decoded.len() < 2 {
             return;
         }
         let seq = Cursor::new(&decoded[..2]).read_u16::<BigEndian>().unwrap();
-        let data = decoded[2..].to_vec();
+        let packet = OrderedDatagram { bytes: decoded[2..].to_vec(), is_fragment, arrival };
 
         match classify_seq(seq, self.next_recv_seq) {
             SeqClass::Deliver => {
                 self.next_recv_seq = self.next_recv_seq.wrapping_add(1);
-                self.deliver_seq(seq, data, is_fragment);
+                self.deliver_seq(seq, packet);
                 // Drain buffered continuations
-                while let Some((ndata, nfrag)) = self.recv_buf.remove(&self.next_recv_seq) {
+                while let Some(buffered) = self.recv_buf.remove(&self.next_recv_seq) {
                     let nseq = self.next_recv_seq;
                     self.next_recv_seq = self.next_recv_seq.wrapping_add(1);
-                    self.deliver_seq(nseq, ndata, nfrag);
+                    self.deliver_seq(nseq, buffered);
                 }
                 if self.recv_buf.is_empty() {
                     self.incoming_high_water = None;
@@ -1591,7 +1615,7 @@ impl EqStream {
                         self.incoming_high_water = Some(seq);
                     }
                 }
-                self.recv_buf.insert(seq, (data, is_fragment));
+                self.recv_buf.insert(seq, packet);
                 // Mirror the server's own receive path (EQEmu `eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:715`,
                 // `SendOutOfOrderAck(stream_id, sequence)`): on a gap, immediately OutOfOrderAck the
                 // out-of-order packet we just BUFFERED. The server's `OutOfOrderAck` handler drops that
@@ -1628,29 +1652,29 @@ impl EqStream {
         }
     }
 
-    fn deliver_seq(&mut self, seq: u16, data: Vec<u8>, is_fragment: bool) {
+    fn deliver_seq(&mut self, seq: u16, packet: OrderedDatagram) {
         // Preserve the immediate ACK's timestamp for the row emitted just below. If the socket
         // refused it, capture leaves the timestamp empty until a successful ACK covers the row.
-        let acked_at = self.send_ack(seq);
-        if is_fragment {
+        let receive = ReceiveEvidence { arrival: packet.arrival, acked_at: self.send_ack(seq) };
+        if packet.is_fragment {
             // A fragment group spans several reliable seqs; the completing seq is recorded (#525).
-            if let Some(complete) = self.frags.add(&data, !self.frags.in_progress()) {
-                self.dispatch_app(&complete, Some(seq), acked_at);
+            if let Some(complete) = self.frags.add(&packet.bytes, !self.frags.in_progress()) {
+                self.dispatch_app(&complete, Some(seq), receive);
             }
         } else {
-            self.dispatch_app(&data, Some(seq), acked_at);
+            self.dispatch_app(&packet.bytes, Some(seq), receive);
         }
     }
 
-    fn handle_packet(&mut self, payload: &[u8]) {
-        self.handle_ordered(payload, false);
+    fn handle_packet(&mut self, payload: &[u8], arrival: Option<PacketArrival>) {
+        self.handle_ordered(payload, false, arrival);
     }
 
-    fn handle_fragment(&mut self, payload: &[u8]) {
-        self.handle_ordered(payload, true);
+    fn handle_fragment(&mut self, payload: &[u8], arrival: Option<PacketArrival>) {
+        self.handle_ordered(payload, true, arrival);
     }
 
-    fn handle_transport_combined(&mut self, payload: &[u8]) {
+    fn handle_transport_combined(&mut self, payload: &[u8], arrival: Option<PacketArrival>) {
         let payload = match self.decode(payload) {
             Some(d) => d,
             None => return,
@@ -1675,16 +1699,16 @@ impl EqStream {
                     // WITHOUT re-decoding; routing them through `dispatch_transport` (which decodes
                     // again) double-decodes the sub → a corrupt seq → the reliable is never ACKed →
                     // the server's resend_timeout (30s) closes the session (idle linkdead, #302).
-                    self.handle_predecoded_transport(sub[1], &sub[2..]);
+                    self.handle_predecoded_transport(sub[1], &sub[2..], arrival);
                 } else {
-                    self.dispatch_app(sub, None, None);
+                    self.dispatch_app(sub, None, ReceiveEvidence { arrival, acked_at: None });
                 }
             }
             offset += sub_len;
         }
     }
 
-    fn handle_combined(&mut self, payload: &[u8]) {
+    fn handle_combined(&mut self, payload: &[u8], arrival: Option<PacketArrival>) {
         let mut offset = 0;
         while offset < payload.len() {
             let mut sub_len = payload[offset] as usize;
@@ -1696,7 +1720,7 @@ impl EqStream {
             if offset + sub_len > payload.len() {
                 break;
             }
-            self.dispatch_app(&payload[offset..offset + sub_len], None, None);
+            self.dispatch_app(&payload[offset..offset + sub_len], None, ReceiveEvidence { arrival, acked_at: None });
             offset += sub_len;
         }
     }
@@ -1705,13 +1729,13 @@ impl EqStream {
     /// this packet was delivered under (`Some` on the ordered reliable path via `deliver_seq`,
     /// `None` for sub-packets pulled from an OP_Combined bundle — those are not individually
     /// sequenced). Used only for telemetry (#525); the app dispatch is unaffected.
-    fn dispatch_app(&mut self, data: &[u8], rel_seq: Option<u16>, acked_at: Option<Instant>) {
+    fn dispatch_app(&mut self, data: &[u8], rel_seq: Option<u16>, receive: ReceiveEvidence) {
         if data.len() < 2 {
             return;
         }
         let opcode = Cursor::new(&data[..2]).read_u16::<byteorder::LittleEndian>().unwrap();
         // Telemetry boundary (#525): reliable iff we know a sequence for it. Zero cost when disabled.
-        self.capture_app(Dir::In, opcode, &data[2..], rel_seq, None, acked_at);
+        self.capture_app(Dir::In, opcode, &data[2..], rel_seq, None, receive);
         let payload = data[2..].to_vec();
         let _ = self.app_tx.send(AppPacket { opcode, payload });
     }
@@ -2306,6 +2330,8 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().opcode, 0x1234);
         let before = trace.page(0, 10, None, None);
         assert_eq!(before.packets[0].acked_at_ms, None);
+        assert_eq!(before.packets[0].ack_seq, None);
+        assert!(!before.packets[0].ack_exact);
         assert_eq!(before.counts.sent, 0);
 
         stream.flush_pending_control();
@@ -2336,7 +2362,34 @@ mod tests {
         let page = trace.page(0, 10, None, None);
         assert!(page.packets[0].acked_at_ms.is_some());
         assert_eq!(page.packets[0].acked_at_ms, page.packets[1].acked_at_ms);
+        assert_eq!(page.packets[0].ack_seq, Some(0));
+        assert!(!page.packets[0].ack_exact);
+        assert_eq!(page.packets[1].ack_seq, Some(0));
+        assert!(page.packets[1].ack_exact);
         assert_eq!(page.counts.sent, 1);
+    }
+
+    /// Assigning arrival indices at delivery would put the buffered packet in the wrong order.
+    #[tokio::test]
+    async fn packet_trace_preserves_socket_arrival_through_reordering() {
+        use std::time::Duration;
+
+        let started = Instant::now() - Duration::from_secs(1);
+        let trace = SessionTrace::new(started);
+        let (mut stream, mut rx, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+        stream.on_raw_recv_at(&[0, OP_PACKET, 0, 1, 0x35, 0x12], started + Duration::from_millis(11));
+        assert!(trace.page(0, 10, None, None).packets.is_empty());
+        stream.on_raw_recv_at(&[0, OP_PACKET, 0, 0, 0x34, 0x12], started + Duration::from_millis(19));
+
+        let page = trace.page(0, 10, None, None);
+        assert_eq!(rx.try_recv().unwrap().opcode, 0x1234);
+        assert_eq!(rx.try_recv().unwrap().opcode, 0x1235);
+        assert_eq!(page.packets[0].arrival_n, Some(2));
+        assert_eq!(page.packets[1].arrival_n, Some(1));
+        assert_eq!(page.packets[0].arrived_at_ms, Some(19));
+        assert_eq!(page.packets[1].arrived_at_ms, Some(11));
     }
 
     /// Omitting the high-water reset masks the next hole once the previous buffer has drained.

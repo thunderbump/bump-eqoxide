@@ -105,7 +105,7 @@ impl Wiring {
 
 /// Deadline lives in the physics owner. No HTTP retry, poll, or slow transaction renews it.
 struct Motion {
-    id: String,
+    id: Arc<str>,
     wish: [f32; 2],
     until: Instant,
 }
@@ -118,6 +118,7 @@ struct Host {
     epoch: u64,
     heading: f32,
     motion: Option<Motion>,
+    ending_motion: Option<Arc<str>>,
     attack_until: Option<Instant>,
     action_ids: HashMap<u64, (String, bool)>,
     transaction_uncertain: Arc<AtomicBool>,
@@ -141,9 +142,16 @@ impl Host {
             .publish_outcome(id, status, reason.map(str::to_owned), evidence);
     }
     fn halt(&mut self, reason: &str, command: Option<&str>) {
-        if let Some(motion) = self.motion.take() {
+        let motion = self.motion.take();
+        let ending = self.ending_motion.take();
+        if motion.is_some() || ending.is_some() {
+            let mut view = self.controller_slots.controller_view.lock().unwrap();
+            view.active_motion_command = None;
+            view.position_commands = ipc::PositionCommands::None;
+        }
+        if let Some(motion) = motion {
             self.control
-                .publish_event(json!({"kind":"motion_stopped","id":motion.id,"reason":reason}));
+                .publish_event(json!({"kind":"motion_stopped","id":motion.id.as_ref(),"reason":reason}));
         }
         self.attack_until = None;
         // LAST-WINS: safety off must replace an attack still waiting in the net mailbox.
@@ -164,7 +172,8 @@ impl Host {
         if self.motion.as_ref().is_some_and(|m| now >= m.until) {
             let motion = self.motion.take().unwrap();
             self.control
-                .publish_event(json!({"kind":"motion_expired","id":motion.id}));
+                .publish_event(json!({"kind":"motion_expired","id":motion.id.as_ref()}));
+            self.ending_motion = Some(motion.id);
         }
         if self.attack_until.is_some_and(|until| now >= until) {
             self.attack_until = None;
@@ -216,8 +225,12 @@ impl Host {
             return;
         }
         view.zone_epoch = Some(self.epoch);
+        let active_command = self.motion.as_ref().map(|motion| &motion.id);
+        view.active_motion_command = active_command.cloned();
         if stepped {
             view.step_seq = view.step_seq.wrapping_add(1);
+            view.position_commands.include(active_command);
+            view.position_commands.include(self.ending_motion.take().as_ref());
         }
         if let Some((_, issued)) = taken {
             // Monotonic: zone entry may have settled a later correction while this step ran, and
@@ -381,14 +394,16 @@ impl Host {
                     self.heading = heading;
                 }
                 self.motion = Some(Motion {
-                    id: id.clone(),
+                    id: id.as_str().into(),
                     wish,
                     until: now + Duration::from_millis(duration_ms),
                 });
                 self.outcome(&id,Status::AppliedLocal,None,Some(json!({"kind":"controller_intent","duration_ms":duration_ms,"server_position_confirmed":false})));
             }
             Operation::Stop => {
-                self.motion = None;
+                if let Some(motion) = self.motion.take() {
+                    self.ending_motion = Some(motion.id);
+                }
                 self.outcome(
                     &id,
                     Status::AppliedLocal,
@@ -514,7 +529,9 @@ impl Host {
                             Operation::Sit => {
                                 let accepted = self.command.request_sit_with_attack_off(&id);
                                 if accepted {
-                                    self.motion = None;
+                                    if let Some(motion) = self.motion.take() {
+                                        self.ending_motion = Some(motion.id);
+                                    }
                                     self.attack_until = None;
                                 }
                                 accepted
@@ -787,6 +804,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         epoch: 0,
         heading: 0.0,
         motion: None,
+        ending_motion: None,
         attack_until: None,
         action_ids: HashMap::new(),
         transaction_uncertain: Arc::new(AtomicBool::new(false)),
@@ -1004,6 +1022,7 @@ mod tests {
             epoch: 1,
             heading: 0.0,
             motion: None,
+            ending_motion: None,
             attack_until: None,
             action_ids: HashMap::new(),
             transaction_uncertain: Arc::new(AtomicBool::new(false)),
@@ -1018,7 +1037,7 @@ mod tests {
         published_position: None,
         }
     }
-    fn floor() -> Collision {
+    pub(super) fn floor() -> Collision {
         Collision::from_server_triangles(
             vec![
                 ServerTriangle([
@@ -1128,7 +1147,7 @@ mod tests {
             *host.controller_slots.pos_correction.lock().unwrap() = Some([40.0, 0.0, 0.0]);
         }
         host.step(&gs, Some(&col), true, Instant::now(), 0.02);
-        let view = *host.controller_slots.controller_view.lock().unwrap();
+        let view = host.controller_slots.controller_view.lock().unwrap().clone();
         assert_eq!(view.correction_adopted, 3);
         assert!((view.pos[0] - 40.0).abs() < 0.01, "published with the corrected position");
     }
@@ -1149,7 +1168,7 @@ mod tests {
         // holds correction 1, stamped with the count it read when it took the slot.
         host.controller_slots.controller_view.lock().unwrap().correction_adopted = 2;
         host.step(&gs, Some(&col), true, Instant::now(), 0.02);
-        let view = *host.controller_slots.controller_view.lock().unwrap();
+        let view = host.controller_slots.controller_view.lock().unwrap().clone();
         assert_eq!(view.correction_adopted, 2, "adoption never moves backwards");
     }
     fn rat(id: u32, x: f32) -> eqoxide_core::game_state::Entity {
@@ -1362,6 +1381,7 @@ mod transaction_admission_tests {
             epoch: 1,
             heading: 0.0,
             motion: None,
+            ending_motion: None,
             attack_until: None,
             action_ids: HashMap::new(),
             transaction_uncertain: Arc::new(AtomicBool::new(false)),

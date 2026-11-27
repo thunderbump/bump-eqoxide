@@ -10,6 +10,19 @@ use std::{
 };
 
 pub const SESSION_PACKET_CAPACITY: usize = 20_000;
+const PAYLOAD_CAPACITY: usize = 512;
+
+#[derive(Clone, Copy)]
+pub struct PacketArrival {
+    pub n: u64,
+    pub at_ms: u64,
+}
+
+#[derive(Default)]
+pub struct ReceiveEvidence {
+    pub arrival: Option<PacketArrival>,
+    pub acked_at: Option<Instant>,
+}
 
 #[derive(Clone)]
 pub struct SessionTrace {
@@ -43,10 +56,39 @@ pub struct SessionPacket {
     len: usize,
     reliable: bool,
     wire_seq: Option<u16>,
+    pub arrival_n: Option<u64>,
+    pub arrived_at_ms: Option<u64>,
     pub acked_at_ms: Option<u64>,
+    pub ack_seq: Option<u16>,
+    pub ack_exact: bool,
     #[serde(serialize_with = "serialize_command_id")]
     command_id: Option<Arc<str>>,
     fields: Fields,
+    payload_truncated: bool,
+    #[serde(skip)]
+    payload: Arc<[u8]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_hex: Option<String>,
+}
+
+impl SessionPacket {
+    pub fn include_raw_payload(&mut self) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hex = String::with_capacity(self.payload.len() * 2);
+        for &byte in self.payload.iter() {
+            hex.push(HEX[(byte >> 4) as usize] as char);
+            hex.push(HEX[(byte & 0xf) as usize] as char);
+        }
+        self.payload_hex = Some(hex);
+    }
+
+    fn set_ack(&mut self, sequence: u16, at_ms: u64) {
+        if self.acked_at_ms.is_none() {
+            self.acked_at_ms = Some(at_ms);
+            self.ack_seq = Some(sequence);
+            self.ack_exact = self.wire_seq == Some(sequence);
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -68,6 +110,9 @@ enum Fields {
         entity: u16,
         position: [f32; 3],
         heading: u32,
+    },
+    Entity {
+        entity: u32,
     },
     Health {
         entity: u16,
@@ -111,26 +156,28 @@ impl SessionTrace {
         wire_seq: Option<u16>,
         command_id: Option<Arc<str>>,
     ) {
-        self.capture_with_ack(dir, opcode, payload, wire_seq, command_id, None);
+        self.capture_with_receive(dir, opcode, payload, wire_seq, command_id, ReceiveEvidence::default());
     }
 
-    pub fn capture_with_ack(
+    pub fn capture_with_receive(
         &self,
         dir: Dir,
         opcode: u16,
         payload: &[u8],
         wire_seq: Option<u16>,
         command_id: Option<Arc<str>>,
-        acked_at: Option<Instant>,
+        receive: ReceiveEvidence,
     ) -> u64 {
         let at_ms = self.clock_ms(Instant::now());
         let fields = decode_fields(dir, opcode, payload);
+        let prefix = Arc::from(&payload[..payload.len().min(PAYLOAD_CAPACITY)]);
         let mut state = self.state.lock().unwrap();
         if state.packets.len() == SESSION_PACKET_CAPACITY {
             state.packets.pop_front();
         }
         state.last_n += 1;
         let n = state.last_n;
+        let ack = receive.acked_at.zip(wire_seq);
         state.packets.push_back(Arc::new(SessionPacket {
             n,
             at_ms,
@@ -140,9 +187,16 @@ impl SessionTrace {
             len: payload.len() + 2,
             reliable: wire_seq.is_some(),
             wire_seq,
-            acked_at_ms: acked_at.map(|at| self.clock_ms(at)),
+            arrival_n: receive.arrival.map(|arrival| arrival.n),
+            arrived_at_ms: receive.arrival.map(|arrival| arrival.at_ms),
+            acked_at_ms: ack.map(|(at, _)| self.clock_ms(at)),
+            ack_seq: ack.map(|(_, seq)| seq),
+            ack_exact: ack.is_some(),
             command_id,
             fields,
+            payload_truncated: payload.len() > PAYLOAD_CAPACITY,
+            payload: prefix,
+            payload_hex: None,
         }));
         n
     }
@@ -153,14 +207,14 @@ impl SessionTrace {
 
     /// Resolve ACKs that were still queued when their application rows were captured. Replacing
     /// shared rows preserves the snapshot an HTTP reader may already be serializing.
-    pub fn mark_acked(&self, rows: impl Iterator<Item = u64>, at: Instant) {
+    pub fn mark_acked(&self, rows: impl Iterator<Item = u64>, sequence: u16, at: Instant) {
         let at_ms = self.clock_ms(at);
         let mut state = self.state.lock().unwrap();
         let first = state.last_n - state.packets.len() as u64 + 1;
         for n in rows {
             if let Some(index) = n.checked_sub(first) {
                 if let Some(packet) = state.packets.get_mut(index as usize) {
-                    Arc::make_mut(packet).acked_at_ms.get_or_insert(at_ms);
+                    Arc::make_mut(packet).set_ack(sequence, at_ms);
                 }
             }
         }
@@ -179,8 +233,10 @@ impl SessionTrace {
         }
     }
 
-    pub fn record_receive(&self) {
-        self.state.lock().unwrap().counts.received += 1;
+    pub fn record_receive(&self, at: Instant) -> PacketArrival {
+        let mut state = self.state.lock().unwrap();
+        state.counts.received += 1;
+        PacketArrival { n: state.counts.received, at_ms: self.clock_ms(at) }
     }
 
     pub fn record_sequence_gap(&self) {
@@ -251,9 +307,16 @@ fn decode_fields(dir: Dir, opcode: u16, body: &[u8]) -> Fields {
         },
         (Dir::In, p::OP_ZONE_ENTRY) => {
             if let Some((spawn, _, heading)) = p::parse_rof2_spawn_with_wire_heading(body) {
+                // The wire reader returns ASCII names. Cap malformed long names so decoded
+                // metadata cannot bypass the trace's per-row byte bound.
+                let name = if spawn.name.len() <= PAYLOAD_CAPACITY {
+                    spawn.name
+                } else {
+                    spawn.name[..PAYLOAD_CAPACITY].to_owned()
+                };
                 Fields::Spawn {
                     entity: spawn.spawn_id,
-                    name: spawn.name,
+                    name,
                     position: [spawn.x, spawn.y, spawn.z],
                     heading,
                 }
@@ -272,6 +335,9 @@ fn decode_fields(dir: Dir, opcode: u16, body: &[u8]) -> Fields {
                 Fields::Empty {}
             }
         }
+        (Dir::In, p::OP_DELETE_SPAWN) if body.len() >= 4 => Fields::Entity {
+            entity: u32_at(0),
+        },
         (Dir::In, p::OP_MOB_HEALTH) if body.len() >= p::SIZE_MOB_HEALTH => Fields::Health {
             entity: u16_at(0),
             percent: body[2],

@@ -47,7 +47,7 @@
 //! byte-identical.
 
 mod session;
-pub use session::{PacketPage, SessionTrace, SESSION_PACKET_CAPACITY};
+pub use session::{PacketArrival, PacketPage, ReceiveEvidence, SessionTrace, SESSION_PACKET_CAPACITY};
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};

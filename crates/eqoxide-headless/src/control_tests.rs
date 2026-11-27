@@ -652,7 +652,7 @@ async fn packet_trace_orders_and_filters_decoded_packets() {
     trace.capture(Dir::In, OP_TARGET_COMMAND, &0u32.to_le_bytes(), Some(5), None);
     trace.record_send(false);
     trace.record_send(true);
-    trace.record_receive();
+    trace.record_receive(Instant::now());
     trace.record_sequence_gap();
     trace.record_drop(5);
 
@@ -696,7 +696,8 @@ async fn packet_trace_orders_and_filters_decoded_packets() {
     assert_eq!(packets[0], json!({
         "n":3, "at_ms":rest["packets"][0]["at_ms"], "dir":"out",
         "opcode":OP_TARGET_MOUSE, "opcode_name":"OP_TARGET_MOUSE", "len":6, "reliable":true,
-        "wire_seq":8, "acked_at_ms":null, "command_id":"target-b", "fields":{"target_id":42},
+        "wire_seq":8, "arrival_n":null, "arrived_at_ms":null, "acked_at_ms":null,
+        "ack_seq":null, "ack_exact":false, "payload_truncated":false, "command_id":"target-b", "fields":{"target_id":42},
     }));
 }
 
@@ -745,6 +746,7 @@ async fn packet_trace_decodes_zone_entry_wire_payload() {
     assert_inbound_wire_fields(
         eqoxide_net::protocol::OP_ZONE_ENTRY,
         "OP_ZONE_ENTRY",
+        // Keep the captured layout and set a nonzero raw heading.
         concat!(
             "436c69656e7461620001000000010000a0400000000000000000000000000000010100000064",
             "000000000000000000000000000000000000000000000000c040001f85eb3e3333333f010000",
@@ -755,11 +757,11 @@ async fn packet_trace_decodes_zone_entry_wire_payload() {
             "0000000000000000000000000000000000000000000000000000000000000000000000000000",
             "0000000000000000000000000000000000000000000000000000000000000000000000000000",
             "0000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000000000000055020000000018e30700006400000000000000000000000000000030303030",
+            "0000000000000055020000000018e30f18006400000000000000000000000000000030303030",
             "3030303030303030303030300000000000000000000000000000000000000000000000000000",
             "000000000000000000000000",
         ),
-        json!({"entity":1, "name":"Clientab", "position":[-925.0,1194.0,3.125], "heading":0}),
+        json!({"entity":1, "name":"Clientab", "position":[-925.0,1194.0,3.125], "heading":769}),
     ).await;
 }
 
@@ -788,8 +790,8 @@ async fn packet_trace_decodes_damage_wire_payload() {
     assert_inbound_wire_fields(
         eqoxide_net::protocol::OP_DAMAGE,
         "OP_DAMAGE",
-        "0200010004ffff0000020000000000000000000000000000000000000000",
-        json!({"source":1,"target":2,"type":4,"spell":65535,"damage":2}),
+        "020001000445230100020000000000000000000000000000000000000000",
+        json!({"source":1,"target":2,"type":4,"spell":74565,"damage":2}),
     ).await;
 }
 
@@ -801,6 +803,39 @@ async fn packet_trace_decodes_mob_health_wire_payload() {
         "020051",
         json!({"entity":2,"percent":81}),
     ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_delete_spawn_id() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_DELETE_SPAWN,
+        "OP_DELETE_SPAWN",
+        "2345010000",
+        json!({"entity":83235}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_raw_payload_is_opt_in_and_truncated() {
+    use eqoxide_net::packet_telemetry::Dir;
+    let control = control(1, 1);
+    control.packet_trace.capture(Dir::Out, 0xfffe, &[0xab; 513], None, None);
+    control.packet_trace.capture(Dir::Out, 0xfffe, &[0x00, 0xde], None, None);
+
+    let (_, default) = authorized(&control, "GET", "/v2/player/packets", None).await;
+    assert!(default["packets"][0].get("payload_hex").is_none());
+    let (status, raw) = authorized(&control, "GET", "/v2/player/packets?raw=1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let packets = raw["packets"].as_array().unwrap();
+    assert_eq!(packets[0]["payload_hex"], "ab".repeat(512));
+    assert_eq!(packets[0]["payload_truncated"], true);
+    assert_eq!(packets[0]["len"], 515);
+    assert_eq!(packets[1]["payload_hex"], "00de");
+    assert_eq!(packets[1]["payload_truncated"], false);
+    assert_eq!(
+        authorized(&control, "GET", "/v2/player/packets?raw=2", None).await.0,
+        StatusCode::BAD_REQUEST,
+    );
 }
 
 async fn assert_inbound_wire_fields(opcode: u16, name: &str, hex: &str, expected: Value) {
@@ -828,13 +863,16 @@ async fn assert_inbound_wire_fields(opcode: u16, name: &str, hex: &str, expected
     }).await.unwrap();
     assert_eq!(received.opcode, opcode);
     let (status, result) = authorized(
-        &control, "GET", &format!("/v2/player/packets?opcode={name}"), None,
+        &control, "GET", &format!("/v2/player/packets?opcode={name}&raw=1"), None,
     ).await;
     assert_eq!(status, StatusCode::OK);
     let rows = result["packets"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["opcode_name"], name);
     assert_eq!(rows[0]["wire_seq"], 0);
+    assert_eq!(rows[0]["arrival_n"], 1);
+    assert!(rows[0]["arrived_at_ms"].is_u64());
     assert!(rows[0]["acked_at_ms"].is_u64());
+    assert_eq!(rows[0]["payload_hex"], hex);
     assert_eq!(rows[0]["fields"], expected);
 }
