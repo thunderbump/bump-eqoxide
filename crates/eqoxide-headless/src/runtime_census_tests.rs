@@ -294,11 +294,14 @@ fn expect(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
 /// a readiness gap, or when attack was never on; with attack on, each implicit stop sends exactly
 /// one; an explicit off is sent and owned by its command. A stop sends exactly one rest update.
 ///
-/// MUTATION CHECKS (each RED in at least one ordering): drop the `self.auto_attack` condition for an implicit off in
-/// `drain_combat` → "zone entry"; drop the zone-epoch reset → "zone change"; drop the explicit
+/// MUTATION CHECKS (each RED in at least one ordering): drop the `self.auto_attack` condition for
+/// an implicit off in `drain_combat` → "zone entry"; drop the zone-epoch reset or the explicit
 /// off's zone check → "zone change"; route `attack_off` through the implicit write → "explicit off
-/// while off"; delete the rest flush → "move"; send a second rest update after the flush → "move";
-/// send byte 1 for every attack packet → "lease expiry".
+/// while off"; delete the rest flush, or send a second rest after it → "move"; send byte 1 for
+/// every attack packet, or a one-byte payload → "lease expiry"; drop the host's settlement before
+/// the zone fence → the "zone change" receipt check; keepalive interval at 290 ms or 1300 s → the
+/// keepalive spacing check or "long idle". The terminal, shutdown and same-frame orderings are
+/// pinned by the tests at the end of this file.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Resume {
     AtNewZone,
