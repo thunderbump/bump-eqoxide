@@ -53,13 +53,20 @@ impl CommandState {
     /// An off here is explicit: it is sent even if the client believes attack is already off. It
     /// carries no packet attribution (packet command IDs are v2 command IDs) and no zone.
     ///
-    /// An off is also accepted over a queued off (an implicit one from a halt, or another explicit
-    /// one): it adds its own explicit entry, so a v1 `DELETE` during zoning is not refused as busy.
-    /// Anything else over a queued request is refused, as for every single-slot mailbox.
+    /// An off is accepted over anything queued: over a queued on it replaces it, and over a queued
+    /// off (an implicit one from a halt, or another explicit one) it adds its own explicit entry,
+    /// so a v1 `DELETE` is never refused as busy. An on over a queued request is refused, as for
+    /// every single-slot mailbox.
     pub fn request_attack(&self, on: bool) -> bool {
         let key = std::sync::Arc::as_ptr(&self.combat.attack) as usize;
         let mut slot = self.combat.attack.lock().unwrap();
         match (*slot, on) {
+            (Some(true), false) => {
+                // An off replaces a queued on, which is never sent.
+                self.actions.replace_with_safety(key, None);
+                self.combat.attack_off_explicit.lock().unwrap().push(ExplicitAttackOff::default());
+                *slot = Some(false);
+            }
             (Some(false), false) | (None, false) => {
                 self.combat.attack_off_explicit.lock().unwrap().push(ExplicitAttackOff::default());
                 *slot = Some(false);

@@ -181,6 +181,8 @@ impl Host {
     /// and on every tick after a terminal network outcome.
     fn finish_session(&self, gs: &GameState) {
         self.settle_attack_offs(gs);
+        // A zone that ended before the session did keeps its own reason.
+        self.control.fence_zone(gs.zone_epoch);
         self.abandon_attack_offs();
         self.control.end_session("not_ready");
     }
@@ -923,6 +925,10 @@ impl Host {
             // No network owner is left; on every tick after, since safety commands raced in
             // before admission closed still need an end.
             self.finish_session(gs);
+        } else if shutdown() {
+            // A kick parks the network owner with shutdown set and no terminal outcome: admit
+            // nothing that could wait for a send that may never come.
+            self.control.close_admission();
         }
         self.settle_attack_offs(gs);
         if gs.zone_epoch != self.epoch {

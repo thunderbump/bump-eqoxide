@@ -888,3 +888,15 @@ async fn a_v1_off_in_a_later_batch_reports_only_after_it_is_sent() {
     session.drain();
     assert_eq!(attack_rows(&session.packets("").await).len(), eqoxide_command::EXPLICIT_OFFS_PER_DRAIN + 1);
 }
+
+/// A v1 or UI off over a queued attack-on replaces it: the on is never sent, and the off is.
+#[tokio::test]
+async fn a_v1_off_over_a_queued_on_replaces_it() {
+    let mut session = Session::new().await;
+    assert!(session.host.command.request_attack(true));
+    assert!(session.host.command.request_attack(false), "an off is never refused as busy");
+    session.drain();
+    let rows = attack_rows(&session.packets("raw=1").await);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["payload_hex"].as_str().unwrap()[..2].to_string(), "00");
+}

@@ -63,6 +63,7 @@ struct Census {
     resume: Resume,
     /// The run loop's terminal network outcome, passed to every frame once set.
     terminal: Option<String>,
+    shutdown: bool,
     _peer: UdpSocket,
 }
 
@@ -97,6 +98,7 @@ impl Census {
             net_running: true,
             resume,
             terminal: None,
+            shutdown: false,
             _peer: peer,
         }
     }
@@ -128,10 +130,11 @@ impl Census {
         let snapshot = self.gs.clone();
         self.host.drain_completions();
         let link = || Link { tick_age: 0, inbound_age: 0, link_age: 0, dropped: false };
+        let shutdown = self.shutdown;
         let ready = self
             .host
             .frame(
-                &snapshot, &mut self.frame, &self.terminal, &|| false, &link, now, TICK.as_secs_f32(),
+                &snapshot, &mut self.frame, &self.terminal, &|| shutdown, &link, now, TICK.as_secs_f32(),
                 self.started, &self.collision,
                 &mut |_| Ok((Arc::new(floor()), json!({"status":"loaded"}))),
             )
@@ -318,6 +321,15 @@ async fn scripted_session(resume: Resume) {
     assert_eq!(exact(&s.phase("zone entry")), expect(&[]), "zone entry sends nothing exact");
     s.ticks(5).await;
     assert_eq!(exact(&s.phase("idle")), expect(&[]));
+    // Long idle: at least 1.5 s of wall time, so the keepalive must come (its spacing is asserted
+    // as each send is recorded).
+    let idle_started = Instant::now();
+    while idle_started.elapsed() < Duration::from_millis(1500) {
+        s.tick().await;
+    }
+    let idle = s.phase("long idle");
+    assert!(count(&idle, KEEPALIVE) >= 1, "a keepalive after 1.3 s of silence: {idle:?}");
+    assert_eq!(exact(&idle), expect(&[]));
 
     // Move for 300 ms, then stop: moving updates, then exactly one rest update, the move's.
     s.put("move", json!({"kind":"move_for","east":1.0,"north":0.0,"duration_ms":300})).await;
@@ -427,4 +439,35 @@ async fn a_terminal_network_outcome_settles_queued_attack_offs() {
         assert_eq!(receipt.evidence, Some(json!({"kind":"attack_off_not_sent","packets":[]})), "{id}");
     }
     assert_eq!(exact(&s.phase("terminal")), expect(&[]), "nothing is sent after the end");
+}
+
+/// The zone ends and then the session, both seen in one host frame: an `attack_off` still in the
+/// journal keeps the zone's reason, not the session's.
+#[tokio::test]
+async fn a_zone_end_before_the_session_end_keeps_its_reason() {
+    let mut s = Census::new(Resume::AfterGeometry).await;
+    s.enter_zone("qeynos2").await;
+    s.net_running = false;
+    s.put("off", json!({"kind":"attack_off"})).await;
+    s.controller.begin_zone_in(&mut s.gs);
+    s.terminal = Some("session_ended".into());
+    s.tick().await;
+    let receipt = s.host.control.command("off").unwrap();
+    assert_eq!((receipt.status, receipt.reason.as_deref()),
+        (Status::Refused, Some("stale_zone_epoch_before_dispatch")), "{receipt:?}");
+    assert_eq!(receipt.evidence, Some(json!({"kind":"attack_off_not_sent","packets":[]})));
+}
+
+/// A kick sets shutdown and parks the network owner with no terminal outcome: from the first
+/// shutdown frame, nothing more is admitted.
+#[tokio::test]
+async fn shutdown_closes_admission() {
+    let mut s = Census::new(Resume::AfterGeometry).await;
+    s.enter_zone("qeynos2").await;
+    s.shutdown = true;
+    s.tick().await;
+    s.put_any("late", json!({"kind":"attack_off"})).await;
+    let receipt = s.host.control.command("late").unwrap();
+    assert_eq!((receipt.status, receipt.reason.as_deref()), (Status::Refused, Some("not_ready")), "{receipt:?}");
+    assert_eq!(receipt.evidence, Some(json!({"kind":"attack_off_not_sent","packets":[]})));
 }

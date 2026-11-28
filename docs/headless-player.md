@@ -112,9 +112,9 @@ Attack-off on the wire.
   - `applied_local` with evidence `{"kind":"attack_off_sent"}` once its packet is queued into the reliable window, which retransmits it until acknowledged (the trace row's `acked_at_ms` shows acknowledgement);
   - `refused` with reason `stale_zone_epoch_before_dispatch` and evidence `{"kind":"attack_off_not_sent","packets":[]}` when the zone it was accepted in ended first. Such an off is not sent into the next zone.
 
-  A readiness drop (death, link loss, geometry loading) does not fence an `attack_off`: it is the safety stop for that moment. When the session ends (including a kick or a logout deadline), a queued off that no network owner will send ends `refused` with reason `not_ready`, and later `attack_off` commands are refused at admission. Every refused `attack_off` carries the `attack_off_not_sent` evidence, whichever step refused it. A burst of explicit offs goes out at most 8 per network tick, in order.
+  A readiness drop (death, link loss, geometry loading) does not fence an `attack_off`: it is the safety stop for that moment. When the session ends (including a kick or a logout deadline), a queued off that no network owner will send ends `refused` with reason `not_ready`, or `stale_zone_epoch_before_dispatch` if its zone had already ended. From the moment shutdown begins, `attack_off` commands are refused at admission. Every refused `attack_off` carries the `attack_off_not_sent` evidence, whichever step refused it. A burst of explicit offs goes out at most 8 per network tick, in order.
 - **An implicit stop queued with an explicit off** adds no packet.
-- **v1 and UI requests.** v1 `DELETE /v1/combat/attack` and UI toggles also always send, even over a queued off, but they carry no packet attribution and no zone.
+- **v1 and UI requests.** v1 `DELETE /v1/combat/attack` and UI toggles also always send, even over a queued off or a queued on (which they replace), but they carry no packet attribution and no zone.
 
 | Operation kind | Fields / limits |
 | --- | --- |

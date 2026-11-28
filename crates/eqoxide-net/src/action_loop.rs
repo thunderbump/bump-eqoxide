@@ -556,8 +556,8 @@ pub struct ActionLoop {
     last_tick:        Instant,
     /// The last `OP_AutoAttack` state this client put on the wire in the current zone. While true,
     /// the pet attacks the current target. The server's flag starts false in every zone process
-    /// (`Client::Client`, bump-EQEmu cd66dd0a6 zone/client.cpp:227) and only our `OP_AutoAttack 1`
-    /// sets it (client_packet.cpp:3538), so this mirrors the server's flag exactly.
+    /// (`Client::Client`, eqemu:zone/client.cpp@5dc093fe5:227) and only our `OP_AutoAttack 1` sets
+    /// it (eqemu:zone/client_packet.cpp@9a0579f37:3538), so this mirrors the server's flag exactly.
     auto_attack:      bool,
     /// The zone epoch `auto_attack` belongs to. A new zone resets it, as the new zone's Client does.
     auto_attack_epoch: u64,
