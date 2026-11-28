@@ -154,6 +154,153 @@ pub struct GameplayLifecycle {
     pub net_health:          eqoxide_ipc::NetHealthShared,
 }
 
+pub(crate) fn drain_camp(
+    action_loop: &ActionLoop,
+    s: &mut EqStream,
+    gs: &mut GameState,
+    camp: &eqoxide_ipc::CampReq,
+    camp_until: &eqoxide_ipc::CampUntil,
+) {
+    action_loop.drain_camp_request(camp, |cmd, command_id| {
+        let Some(cmd) = cmd.for_epoch(gs.zone_epoch) else { return; };
+        let now = std::time::Instant::now();
+        let current = *camp_until.lock().unwrap();
+        let (next, action) = camp_apply(cmd, current, now, CAMP_DURATION);
+        *camp_until.lock().unwrap() = next;
+        use crate::protocol::build_spawn_appearance_packet;
+        match action {
+            CampAction::Started => {
+                s.send_app_packet_with_command(OP_CAMP, &[], command_id.as_ref());
+                // Sit, like the real client — camping is a seated action and standing cancels it.
+                s.send_app_packet_with_command(OP_SPAWN_APPEARANCE,
+                    &build_spawn_appearance_packet(gs.player_id as u16, 14, 110),
+                    command_id.as_ref());
+                gs.sitting = true;
+                gs.log_msg("system", "Camping to desktop...");
+                tracing::info!("EQ: camp started — clean shutdown in {}s", CAMP_DURATION.as_secs());
+            }
+            CampAction::Cancelled => {
+                // Standing both cancels the server camp timer and stands the character back up.
+                s.send_app_packet_with_command(OP_SPAWN_APPEARANCE,
+                    &build_spawn_appearance_packet(gs.player_id as u16, 14, 100),
+                    command_id.as_ref());
+                gs.sitting = false;
+                gs.log_msg("system", "Camp cancelled.");
+                tracing::info!("EQ: camp cancelled");
+            }
+            CampAction::NoOp => {}
+        }
+    });
+}
+
+pub(crate) fn drain_loot_packets(
+    corpse_loot: &mut crate::corpse_loot::CorpseLoot,
+    s: &mut EqStream,
+    gs: &mut GameState,
+) {
+    if let Some(request) = corpse_loot.next_request(gs, std::time::Instant::now()) {
+        s.send_app_packet_with_command(OP_LOOT_ITEM, &request, gs.loot_command_id.as_ref());
+    }
+
+    // ── Auto-loot ──────────────────────────────────────────────────────────
+    // `loot_tick_action` is the pure decision (no I/O, no gs); this loop performs whatever it
+    // decides and applies the resulting state. The one thing it NEVER decides is "Looting
+    // complete" — that message may only come from the inbound OP_LootComplete handler
+    // (apply_loot_complete in packet_handler.rs), never from this timer (#346).
+    match loot_tick_action(&LootTickState {
+        session_active:   gs.loot_session_active,
+        confirmed:        gs.loot_confirmed,
+        current_corpse:   gs.loot_current_corpse,
+        queued_at:        gs.loot_queued_at,
+        pending_front:    gs.pending_loot.front().map(|request| request.corpse_id),
+        last_activity:    gs.loot_last_activity,
+        end_requested_at: gs.loot_end_requested_at,
+        defensive_close_at: gs.loot_defensive_close_at,
+    }, std::time::Instant::now()) {
+        LootTickAction::None => {}
+        LootTickAction::Open(corpse_id) => {
+            let request = gs.pending_loot.pop_front().expect("Open selects the front corpse");
+            debug_assert_eq!(request.corpse_id, corpse_id);
+            gs.loot_command_id = request.command_id;
+            s.send_app_packet_with_command(OP_LOOT_REQUEST, &corpse_id.to_le_bytes(), gs.loot_command_id.as_ref());
+            gs.loot_session_active = true;
+            gs.loot_confirmed = false;
+            gs.loot_current_corpse = Some(corpse_id);
+            gs.loot_last_activity = Some(std::time::Instant::now());
+            gs.loot_end_requested_at = None;
+            if gs.pending_loot.is_empty() {
+                gs.loot_queued_at = None;
+            }
+            tracing::info!("EQ: auto-loot: sent OP_LootRequest for corpse_id={}", corpse_id);
+        }
+        LootTickAction::Close(corpse_id) => {
+            // Payload MUST be the corpse's spawn_id (4 bytes) — EQEmu's Handle_OP_EndLootRequest
+            // drops any OP_EndLootRequest whose size != sizeof(uint32) without replying, so the
+            // old empty-payload send could never have produced an OP_LootComplete at all
+            // (eqemu:zone/client_packet.cpp@ca704c7f8:6266).
+            s.send_app_packet_with_command(OP_END_LOOT_REQUEST, &corpse_id.to_le_bytes(), gs.loot_command_id.as_ref());
+            gs.loot_end_requested_at = Some(std::time::Instant::now());
+            tracing::info!(
+                "EQ: auto-loot: sent OP_EndLootRequest for corpse_id={} — awaiting OP_LootComplete",
+                corpse_id
+            );
+        }
+        LootTickAction::OpenTimedOut(corpse_id) => {
+            apply_loot_open_timeout(gs, corpse_id);
+            // #414: release the server-side loot lock speculatively even though this corpse
+            // never confirmed open — `Corpse::EndLoot` doesn't check ownership (verified
+            // against EQEmu eqemu:zone/corpse.cpp@7ab909ee4:1787-1802 via eq-client-expert), so this is safe.
+            // Waiting for it to resolve (loot_defensive_close_at, set inside
+            // apply_loot_open_timeout) before opening the next corpse narrows the window in
+            // which a late OP_MoneyOnCorpse for THIS corpse could land on a later session.
+            s.send_app_packet_with_command(OP_END_LOOT_REQUEST, &corpse_id.to_le_bytes(), gs.loot_command_id.as_ref());
+            tracing::info!(
+                "EQ: auto-loot: sent defensive OP_EndLootRequest for corpse_id={} after open-timeout",
+                corpse_id
+            );
+        }
+        LootTickAction::TimedOut => {
+            // OP_EndLootRequest got no OP_LootComplete ack in time. Say so honestly instead of
+            // fabricating "Looting complete". #414: don't unwedge the queue immediately either
+            // — a genuinely-late OP_LootComplete for THIS corpse is still possible, and letting
+            // the next corpse open right away is exactly what would let that late reply get
+            // misattributed as an "aborted" outcome for the NEXT corpse's still-legitimate
+            // session (apply_loot_complete's branch-2 misfire). Enter the same defensive-close
+            // quarantine `OpenTimedOut` uses instead; the queue resumes once it resolves.
+            let corpse = gs.loot_current_corpse;
+            gs.loot_confirmed = false;
+            gs.loot_last_activity = None;
+            gs.loot_end_requested_at = None;
+            gs.loot_defensive_close_at = Some(std::time::Instant::now());
+            let msg = format!(
+                "Loot failed — no close confirmation from the server (corpse_id={:?})",
+                corpse
+            );
+            gs.log_msg("loot", &msg);
+            gs.push_event("loot", "failed", "system", true, &msg);
+            tracing::warn!("EQ: auto-loot: {}", msg);
+            // loot_session_active and loot_current_corpse are deliberately left as-is: the
+            // quarantine (loot_tick_action's defensive_close_at branch) needs session_active
+            // to stay true so it keeps withholding the next Open() until this resolves.
+        }
+        LootTickAction::DefensiveCloseTimedOut => {
+            // #414: the defensive OP_EndLootRequest itself got no ack either — give up on this
+            // corpse entirely. The failure was already reported when OpenTimedOut/TimedOut
+            // fired, so there's nothing new to tell the agent; just free the slot.
+            let corpse = gs.loot_current_corpse.take();
+            gs.loot_command_id = None;
+            gs.loot_session_active = false;
+            gs.loot_confirmed = false;
+            gs.loot_defensive_close_at = None;
+            tracing::warn!(
+                "EQ: auto-loot: defensive OP_EndLootRequest for corpse_id={:?} never acked — giving up, resuming queue",
+                corpse
+            );
+            gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
+        }
+    }
+}
+
 /// Consume the zone stream and run the gameplay loop indefinitely.
 pub async fn run_gameplay_phase(
     stream_init:   EqStream,
@@ -221,33 +368,7 @@ pub async fn run_gameplay_phase(
         // alive (keepalives below still fire) until CAMP_DURATION elapses, then set `shutdown` so
         // the disconnect is clean (the server has set `instalog`, so no linkdead). Cancelling sends
         // a Standing `OP_SpawnAppearance`, which disables the server-side camp timer.
-        if let Some(cmd) = camp.lock().unwrap().take().and_then(|cmd|cmd.for_epoch(gs.zone_epoch)) {
-            let now      = std::time::Instant::now();
-            let current  = *camp_until.lock().unwrap();
-            let (next, action) = camp_apply(cmd, current, now, CAMP_DURATION);
-            *camp_until.lock().unwrap() = next;
-            use crate::protocol::build_spawn_appearance_packet;
-            match action {
-                CampAction::Started => {
-                    s.send_app_packet(OP_CAMP, &[]);
-                    // Sit, like the real client — camping is a seated action and standing cancels it.
-                    s.send_app_packet(OP_SPAWN_APPEARANCE,
-                        &build_spawn_appearance_packet(gs.player_id as u16, 14, 110));
-                    gs.sitting = true;
-                    gs.log_msg("system", "Camping to desktop...");
-                    tracing::info!("EQ: camp started — clean shutdown in {}s", CAMP_DURATION.as_secs());
-                }
-                CampAction::Cancelled => {
-                    // Standing both cancels the server camp timer and stands the character back up.
-                    s.send_app_packet(OP_SPAWN_APPEARANCE,
-                        &build_spawn_appearance_packet(gs.player_id as u16, 14, 100));
-                    gs.sitting = false;
-                    gs.log_msg("system", "Camp cancelled.");
-                    tracing::info!("EQ: camp cancelled");
-                }
-                CampAction::NoOp => {}
-            }
-        }
+        drain_camp(&action_loop, s, &mut gs, &camp, &camp_until);
         // Camp deadline reached → request a clean shutdown (handled at the top of the next loop).
         if camp_expired(*camp_until.lock().unwrap(), std::time::Instant::now()) {
             tracing::info!("EQ: camp complete — disconnecting cleanly (no linkdead)");
@@ -515,104 +636,7 @@ pub async fn run_gameplay_phase(
             }
         }
 
-        if let Some(request) = corpse_loot.next_request(&mut gs, std::time::Instant::now()) {
-            s.send_app_packet(OP_LOOT_ITEM, &request);
-        }
-
-        // ── Auto-loot ──────────────────────────────────────────────────────────
-        // `loot_tick_action` is the pure decision (no I/O, no gs); this loop performs whatever it
-        // decides and applies the resulting state. The one thing it NEVER decides is "Looting
-        // complete" — that message may only come from the inbound OP_LootComplete handler
-        // (apply_loot_complete in packet_handler.rs), never from this timer (#346).
-        match loot_tick_action(&LootTickState {
-            session_active:   gs.loot_session_active,
-            confirmed:        gs.loot_confirmed,
-            current_corpse:   gs.loot_current_corpse,
-            queued_at:        gs.loot_queued_at,
-            pending_front:    gs.pending_loot.front().copied(),
-            last_activity:    gs.loot_last_activity,
-            end_requested_at: gs.loot_end_requested_at,
-            defensive_close_at: gs.loot_defensive_close_at,
-        }, std::time::Instant::now()) {
-            LootTickAction::None => {}
-            LootTickAction::Open(corpse_id) => {
-                gs.pending_loot.pop_front();
-                s.send_app_packet(OP_LOOT_REQUEST, &corpse_id.to_le_bytes());
-                gs.loot_session_active = true;
-                gs.loot_confirmed = false;
-                gs.loot_current_corpse = Some(corpse_id);
-                gs.loot_last_activity = Some(std::time::Instant::now());
-                gs.loot_end_requested_at = None;
-                if gs.pending_loot.is_empty() {
-                    gs.loot_queued_at = None;
-                }
-                tracing::info!("EQ: auto-loot: sent OP_LootRequest for corpse_id={}", corpse_id);
-            }
-            LootTickAction::Close(corpse_id) => {
-                // Payload MUST be the corpse's spawn_id (4 bytes) — EQEmu's Handle_OP_EndLootRequest
-                // drops any OP_EndLootRequest whose size != sizeof(uint32) without replying, so the
-                // old empty-payload send could never have produced an OP_LootComplete at all
-                // (eqemu:zone/client_packet.cpp@ca704c7f8:6266).
-                s.send_app_packet(OP_END_LOOT_REQUEST, &corpse_id.to_le_bytes());
-                gs.loot_end_requested_at = Some(std::time::Instant::now());
-                tracing::info!(
-                    "EQ: auto-loot: sent OP_EndLootRequest for corpse_id={} — awaiting OP_LootComplete",
-                    corpse_id
-                );
-            }
-            LootTickAction::OpenTimedOut(corpse_id) => {
-                apply_loot_open_timeout(&mut gs, corpse_id);
-                // #414: release the server-side loot lock speculatively even though this corpse
-                // never confirmed open — `Corpse::EndLoot` doesn't check ownership (verified
-                // against EQEmu eqemu:zone/corpse.cpp@7ab909ee4:1787-1802 via eq-client-expert), so this is safe.
-                // Waiting for it to resolve (loot_defensive_close_at, set inside
-                // apply_loot_open_timeout) before opening the next corpse narrows the window in
-                // which a late OP_MoneyOnCorpse for THIS corpse could land on a later session.
-                s.send_app_packet(OP_END_LOOT_REQUEST, &corpse_id.to_le_bytes());
-                tracing::info!(
-                    "EQ: auto-loot: sent defensive OP_EndLootRequest for corpse_id={} after open-timeout",
-                    corpse_id
-                );
-            }
-            LootTickAction::TimedOut => {
-                // OP_EndLootRequest got no OP_LootComplete ack in time. Say so honestly instead of
-                // fabricating "Looting complete". #414: don't unwedge the queue immediately either
-                // — a genuinely-late OP_LootComplete for THIS corpse is still possible, and letting
-                // the next corpse open right away is exactly what would let that late reply get
-                // misattributed as an "aborted" outcome for the NEXT corpse's still-legitimate
-                // session (apply_loot_complete's branch-2 misfire). Enter the same defensive-close
-                // quarantine `OpenTimedOut` uses instead; the queue resumes once it resolves.
-                let corpse = gs.loot_current_corpse;
-                gs.loot_confirmed = false;
-                gs.loot_last_activity = None;
-                gs.loot_end_requested_at = None;
-                gs.loot_defensive_close_at = Some(std::time::Instant::now());
-                let msg = format!(
-                    "Loot failed — no close confirmation from the server (corpse_id={:?})",
-                    corpse
-                );
-                gs.log_msg("loot", &msg);
-                gs.push_event("loot", "failed", "system", true, &msg);
-                tracing::warn!("EQ: auto-loot: {}", msg);
-                // loot_session_active and loot_current_corpse are deliberately left as-is: the
-                // quarantine (loot_tick_action's defensive_close_at branch) needs session_active
-                // to stay true so it keeps withholding the next Open() until this resolves.
-            }
-            LootTickAction::DefensiveCloseTimedOut => {
-                // #414: the defensive OP_EndLootRequest itself got no ack either — give up on this
-                // corpse entirely. The failure was already reported when OpenTimedOut/TimedOut
-                // fired, so there's nothing new to tell the agent; just free the slot.
-                let corpse = gs.loot_current_corpse.take();
-                gs.loot_session_active = false;
-                gs.loot_confirmed = false;
-                gs.loot_defensive_close_at = None;
-                tracing::warn!(
-                    "EQ: auto-loot: defensive OP_EndLootRequest for corpse_id={:?} never acked — giving up, resuming queue",
-                    corpse
-                );
-                gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
-            }
-        }
+        drain_loot_packets(&mut corpse_loot, s, &mut gs);
 
         if world_reconnect_needed {
             tracing::info!("EQ: zone change approved — reconnecting to world for zone handoff");
@@ -670,7 +694,7 @@ pub async fn run_gameplay_phase(
             // NOT papered over with a second OP_ZoneEntry (that would self-kick an admitted-but-slow
             // session). See ~/git/eq_kb/zone-entry-{handshake-race,
             // duplicate-on-admitted-client}.md.
-            match EqStream::connect(&zone_ip, zone_port, new_tx, net_health.clone()).await {
+            match EqStream::connect_zone(&zone_ip, zone_port, new_tx, net_health.clone()).await {
                 Ok(new_stream) => {
                     stream = Some(new_stream);
                     net_rx = Some(new_rx);
@@ -937,7 +961,7 @@ async fn reconnect_via_world(
     // single send lives in run_zone_entry_handshake, on the stream we return here.
     tracing::info!("EQ: zone change: connecting to new zone {}:{}", zone_ip, zone_port);
     let (zone_tx, zone_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
-    let zone_stream = match EqStream::connect(&zone_ip, zone_port, zone_tx, net_health.clone()).await {
+    let zone_stream = match EqStream::connect_zone(&zone_ip, zone_port, zone_tx, net_health.clone()).await {
         Ok(s) => s,
         Err(e) => { tracing::warn!("EQ: zone change: zone connect failed: {e}"); return false; }
     };

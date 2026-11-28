@@ -5,6 +5,7 @@
 //! thin typed read/write of a slot in `self.combat`; validation and packet-building stay where they
 //! were (the HTTP handler and `ActionLoop::tick`). No behavior change — just one typed surface.
 
+use super::actions::TracedRequest;
 use super::{Action, CommandState};
 use eqoxide_ipc::{CastEnd, CastRequest, CommandResult};
 use tokio::sync::oneshot;
@@ -21,6 +22,13 @@ impl CommandState {
     /// Toggle auto-attack (POST/DELETE /v1/combat/attack, the Attack button). `on` = engage.
     pub fn request_attack(&self, on: bool) -> bool {
         self.enqueue(&self.combat.attack, on, false, Action::CombatAttack)
+    }
+
+    /// Safety-off is last-wins. An overwritten attack must never lend its ID to the off packet.
+    pub fn overwrite_attack_off(&self, command: Option<&str>) {
+        let mut slot = self.combat.attack.lock().unwrap();
+        *slot = Some(false);
+        self.actions.set_packet_command(std::sync::Arc::as_ptr(&self.combat.attack) as usize, command);
     }
 
     /// Consider a spawn (POST /v1/combat/consider, the Consider button) — con color/faction reply.
@@ -64,9 +72,17 @@ impl CommandState {
         self.dequeue(&self.combat.target)
     }
 
+    pub fn take_target_with_command(&self) -> Option<TracedRequest<u32>> {
+        self.dequeue_with_command(&self.combat.target)
+    }
+
     /// Drain a pending auto-attack toggle. `Some(true)` = engage, `Some(false)` = disengage.
     pub fn take_attack(&self) -> Option<bool> {
         self.dequeue(&self.combat.attack)
+    }
+
+    pub fn take_attack_with_command(&self) -> Option<TracedRequest<bool>> {
+        self.dequeue_with_command(&self.combat.attack)
     }
 
     /// Drain a pending consider request.

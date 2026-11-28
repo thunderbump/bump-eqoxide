@@ -226,6 +226,9 @@ mod tests {
         case!("request_give", |c| c.request_give(11, 23), |c| c.request_give(11, 24), |c| c.take_give(), Some((11, 23)));
         case!("request_door_click", |c| c.request_door_click(3), |c| c.request_door_click(4), |c| c.take_door_click(), Some(3));
         case!("request_sit", |c| c.request_sit(true), |c| c.request_sit(false), |c| c.take_sit(), Some(true));
+        case!("request_sit_with_attack_off",
+            |c| c.request_sit(false), |c| c.request_sit_with_attack_off("sit"),
+            |c| (c.take_sit(), c.take_attack()), (Some(false), None));
         case!("request_run_mode", |c| c.request_run_mode(true), |c| c.request_run_mode(false), |c| c.take_run_mode(), Some(true));
         case!("request_dialogue_click",
             |c| c.request_dialogue_click(DialogueChoice { text: "first".into(), ..Default::default() }),

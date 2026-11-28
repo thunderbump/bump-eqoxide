@@ -78,6 +78,7 @@ async fn all_endpoints_require_exact_bearer_authentication() {
     for path in [
         "/v2/player/state",
         "/v2/player/events",
+        "/v2/player/packets",
         "/v2/player/commands/id",
     ] {
         for token in [None, Some("Bearer wrong"), Some("private-test-token")] {
@@ -623,4 +624,279 @@ async fn safety_supersession_does_not_promise_a_dispatched_attack_was_refused() 
         control.command("attack").unwrap().status,
         CommandStatus::Unknown
     );
+}
+
+#[tokio::test]
+async fn packet_trace_orders_and_filters_decoded_packets() {
+    use eqoxide_net::{
+        action_loop::encode_client_position_update,
+        packet_telemetry::Dir,
+        protocol::{OP_CLIENT_UPDATE, OP_DAMAGE, OP_TARGET_COMMAND, OP_TARGET_MOUSE},
+    };
+
+    let now = Instant::now();
+    let trace = SessionTrace::new(now - Duration::from_millis(42));
+    let control = control(10, 10).with_packet_trace(trace.clone());
+
+    let position = encode_client_position_update(0x9a02, 12, [15.0, -20.0, 0.0], [1.0, 2.0, 3.0], 400, 17);
+    trace.capture(Dir::Out, OP_CLIENT_UPDATE, &position, None, None);
+    trace.capture(Dir::Out, OP_TARGET_MOUSE, &41u32.to_le_bytes(), Some(7), Some("target-a".into()));
+    trace.capture(Dir::Out, OP_TARGET_MOUSE, &42u32.to_le_bytes(), Some(8), Some("target-b".into()));
+    trace.capture(Dir::Out, OP_TARGET_COMMAND, &43u32.to_le_bytes(), Some(9), Some("target-b".into()));
+    let mut damage = [0; 13];
+    damage[0..2].copy_from_slice(&12u16.to_le_bytes());
+    damage[2..4].copy_from_slice(&42u16.to_le_bytes());
+    damage[5..9].copy_from_slice(&21u32.to_le_bytes());
+    damage[9..13].copy_from_slice(&(-5i32).to_le_bytes());
+    trace.capture(Dir::In, OP_DAMAGE, &damage, Some(4), None);
+    trace.capture(Dir::In, OP_TARGET_COMMAND, &0u32.to_le_bytes(), Some(5), None);
+    trace.record_send(false);
+    trace.record_send(true);
+    trace.record_receive(Instant::now());
+    trace.record_sequence_gap();
+    trace.record_drop(5);
+
+    let (status, first) = authorized(&control, "GET", "/v2/player/packets?limit=2", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["next"], 2);
+    assert_eq!(first["gap"], false);
+    let pos = &first["packets"][0];
+    assert_eq!(pos["n"], 1);
+    assert!(pos["at_ms"].as_u64().unwrap() >= 42);
+    assert_eq!(pos["opcode"], OP_CLIENT_UPDATE);
+    assert_eq!(pos["dir"], "out");
+    assert_eq!(pos["len"], 48);
+    assert_eq!(pos["reliable"], false);
+    assert_eq!(pos["wire_seq"], Value::Null);
+    assert_eq!(pos["command_id"], Value::Null);
+    assert_eq!(pos["fields"], json!({
+        "sequence": 0x9a02,
+        "position": [15.0, -20.0, eqoxide_core::coord::WIRE_Z_OFFSET],
+        "delta": [1.0, 2.0, 3.0], "animation": 17, "heading": 400,
+    }));
+    assert_eq!(first["packets"][1]["n"], 2);
+
+    let (_, rest) = authorized(&control, "GET", "/v2/player/packets?after=2", None).await;
+    let packets = rest["packets"].as_array().unwrap();
+    assert_eq!(packets.iter().map(|p| p["n"].as_u64().unwrap()).collect::<Vec<_>>(), [3, 4, 5, 6]);
+    assert_eq!(rest["next"], 6);
+    assert_eq!(packets[2]["dir"], "in");
+    assert_eq!(packets[2]["command_id"], Value::Null);
+    assert_eq!(packets[2]["fields"], json!({"source":42, "target":12, "type":0, "damage":-5, "spell":21}));
+    assert_eq!(packets[3]["fields"], json!({"target_id":0}));
+    assert_eq!(rest["counters"], json!({
+        "sent":2, "resent":1, "received":1, "dropped_unretried":5, "sequence_gaps":1,
+    }));
+
+    let (_, selected) = authorized(
+        &control, "GET", "/v2/player/packets?opcode=OP_TARGET_MOUSE&command=target-b", None,
+    ).await;
+    assert_eq!(selected["next"], 6);
+    let packets = selected["packets"].as_array().unwrap();
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0], json!({
+        "n":3, "at_ms":rest["packets"][0]["at_ms"], "dir":"out",
+        "opcode":OP_TARGET_MOUSE, "opcode_name":"OP_TARGET_MOUSE", "len":6, "reliable":true,
+        "wire_seq":8, "arrival_n":null, "arrived_at_ms":null, "acked_at_ms":null,
+        "ack_seq":null, "ack_exact":false, "payload_truncated":false, "command_id":"target-b", "fields":{"target_id":42},
+    }));
+}
+
+#[tokio::test]
+async fn packet_trace_gaps_follow_eviction_even_with_filters() {
+    use eqoxide_net::packet_telemetry::Dir;
+
+    let control = control(1, 1);
+    for _ in 0..20_002 {
+        control.packet_trace.capture(Dir::In, 0xfffe, &[], None, None);
+    }
+    let (_, page) = authorized(&control, "GET", "/v2/player/packets?after=1&limit=2", None).await;
+    assert_eq!(page["gap"], true);
+    assert_eq!(page["packets"][0]["n"], 3);
+    assert_eq!(page["packets"][0]["fields"], json!({}));
+    assert_eq!(page["packets"][1]["n"], 4);
+    assert_eq!(page["next"], 4);
+
+    let (_, page) = authorized(&control, "GET", "/v2/player/packets?after=2&limit=1", None).await;
+    assert_eq!(page["gap"], false);
+    assert_eq!(page["next"], 3);
+
+    let (_, page) = authorized(&control, "GET", "/v2/player/packets?command=missing", None).await;
+    assert_eq!(page["gap"], true);
+    assert_eq!(page["next"], 20_002);
+    assert_eq!(page["packets"], json!([]));
+}
+
+#[tokio::test]
+async fn packet_trace_rejects_unknown_queries_and_out_of_range_limits() {
+    let control = control(1, 1);
+    for query in ["since=2", "limit=0", "limit=2001"] {
+        let request = Request::get(format!("/v2/player/packets?{query}"))
+            .header("authorization", "Bearer private-test-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = control.router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+}
+
+// Payload bodies from the Qeynos2 stop-timing-v2 journey on 2026-11-27.
+
+// Keep the captured spawn layout and set a nonzero raw heading.
+const SPAWN_BODY: &str = concat!(
+    "436c69656e7461620001000000010000a0400000000000000000000000000000010100000064",
+    "000000000000000000000000000000000000000000000000c040001f85eb3e3333333f010000",
+    "00008c010000ffffffff00000000070064000000000000000000000000000000000000000000",
+    "000000000000000000ffffffffffffffff000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000055020000000018e30f18006400000000000000000000000000000030303030",
+    "3030303030303030303030300000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000",
+);
+
+#[tokio::test]
+async fn packet_trace_decodes_zone_entry_wire_payload() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_ZONE_ENTRY,
+        "OP_ZONE_ENTRY",
+        SPAWN_BODY,
+        json!({"entity":1, "name":"Clientab", "position":[-925.0,1194.0,3.125], "heading":769}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_new_spawn_wire_fields() {
+    let mut body = SPAWN_BODY.to_owned();
+    // Change the NPC and HP bytes. Race 1 uses the same equipment layout for this fixture.
+    body.replace_range(2 * 18..2 * 19, "01");
+    body.replace_range(2 * 37..2 * 38, "51");
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_NEW_SPAWN,
+        "OP_NEW_SPAWN",
+        &body,
+        json!({
+            "entity": 1, "name": "Clientab", "npc": 1, "hp_percent": 81,
+            "position": [-925.0,1194.0,3.125], "heading": 769,
+        }),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_inbound_position_wire_payload() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_CLIENT_UPDATE,
+        "OP_CLIENT_UPDATE",
+        "010000000000550200000000e1e207300064000000000000",
+        json!({"entity":1, "position":[-931.875,1194.0,3.125], "heading":1536}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_target_command_wire_payload() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_TARGET_COMMAND,
+        "OP_TARGET_COMMAND",
+        "02000000",
+        json!({"target_id":2}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_damage_wire_payload() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_DAMAGE,
+        "OP_DAMAGE",
+        "020001000445230100020000000000000000000000000000000000000000",
+        json!({"source":1,"target":2,"type":4,"spell":74565,"damage":2}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_mob_health_wire_payload() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_MOB_HEALTH,
+        "OP_MOB_HEALTH",
+        "020051",
+        json!({"entity":2,"percent":81}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_decodes_delete_spawn_id() {
+    assert_inbound_wire_fields(
+        eqoxide_net::protocol::OP_DELETE_SPAWN,
+        "OP_DELETE_SPAWN",
+        "2345010000",
+        json!({"entity":83235}),
+    ).await;
+}
+
+#[tokio::test]
+async fn packet_trace_raw_payload_is_opt_in_and_truncated() {
+    use eqoxide_net::packet_telemetry::Dir;
+    let control = control(1, 1);
+    control.packet_trace.capture(Dir::Out, 0xfffe, &[0xab; 513], None, None);
+    control.packet_trace.capture(Dir::Out, 0xfffe, &[0xcd; 512], None, None);
+    control.packet_trace.capture(Dir::Out, 0xfffe, &[0x00, 0xde], None, None);
+
+    let (_, default) = authorized(&control, "GET", "/v2/player/packets", None).await;
+    assert!(default["packets"][0].get("payload_hex").is_none());
+    let (status, raw) = authorized(&control, "GET", "/v2/player/packets?raw=1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let packets = raw["packets"].as_array().unwrap();
+    assert_eq!(packets[0]["payload_hex"], "ab".repeat(512));
+    assert_eq!(packets[0]["payload_truncated"], true);
+    assert_eq!(packets[0]["len"], 515);
+    assert_eq!(packets[1]["payload_hex"], "cd".repeat(512));
+    assert_eq!(packets[1]["payload_truncated"], false);
+    assert_eq!(packets[1]["len"], 514);
+    assert_eq!(packets[2]["payload_hex"], "00de");
+    assert_eq!(packets[2]["payload_truncated"], false);
+    assert_eq!(
+        authorized(&control, "GET", "/v2/player/packets?raw=2", None).await.0,
+        StatusCode::BAD_REQUEST,
+    );
+}
+
+async fn assert_inbound_wire_fields(opcode: u16, name: &str, hex: &str, expected: Value) {
+    use eqoxide_net::{testkit::test_stream_with_peer, transport::with_packet_trace};
+
+    let control = control(1, 1);
+    let (mut stream, mut rx, peer, addr) = with_packet_trace(
+        control.packet_trace.clone(),
+        test_stream_with_peer(Default::default()),
+    ).await;
+    // Place the captured app body in a plain OP_Packet frame with sequence zero.
+    let mut datagram = vec![0, 0x09, 0, 0];
+    datagram.extend_from_slice(&opcode.to_le_bytes());
+    datagram.extend(hex.as_bytes().chunks_exact(2)
+        .map(|byte| u8::from_str_radix(std::str::from_utf8(byte).unwrap(), 16).unwrap()));
+    peer.send_to(&datagram, addr).await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            assert!(stream.poll_recv());
+            if let Ok(packet) = rx.try_recv() {
+                break packet;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert_eq!(received.opcode, opcode);
+    let (status, result) = authorized(
+        &control, "GET", &format!("/v2/player/packets?opcode={name}&raw=1"), None,
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = result["packets"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["opcode_name"], name);
+    assert_eq!(rows[0]["wire_seq"], 0);
+    assert_eq!(rows[0]["arrival_n"], 1);
+    assert!(rows[0]["arrived_at_ms"].is_u64());
+    assert!(rows[0]["acked_at_ms"].is_u64());
+    assert_eq!(rows[0]["payload_hex"], hex);
+    assert_eq!(rows[0]["fields"], expected);
 }

@@ -11,6 +11,7 @@
 //! /v1/observe/dialogue) are read-path/published snapshots, not commands — deliberately NOT
 //! exposed here (see `mod.rs`).
 
+use super::actions::TracedRequest;
 use super::{Action, CommandState};
 use crate::slot::Mailbox;
 use eqoxide_core::game_state::DialogueChoice;
@@ -80,6 +81,13 @@ impl CommandState {
         self.enqueue(&self.interact.sit, sit, false, Action::InteractSit)
     }
 
+    /// Publish attack-off before the sit request can drain, once the sit slot is reserved.
+    pub fn request_sit_with_attack_off(&self, command: &str) -> bool {
+        self.enqueue_after(&self.interact.sit, true, false, Action::InteractSit, || {
+            self.overwrite_attack_off(Some(command));
+        })
+    }
+
     /// Run/walk toggle (#625): `Some(true)` = run, `Some(false)` = walk (POST /v1/interact/{run,walk},
     /// the Actions window's Run/Walk button). The drain sends `OP_SetRunMode` (0x009f) and switches
     /// the local movement speed to match.
@@ -111,9 +119,17 @@ impl CommandState {
         self.dequeue(&self.interact.say)
     }
 
+    pub fn take_say_with_command(&self) -> Option<TracedRequest<String>> {
+        self.dequeue_with_command(&self.interact.say)
+    }
+
     /// Drain a pending loot request (corpse spawn id).
     pub fn take_loot(&self) -> Option<u32> {
         self.dequeue(&self.interact.loot)
+    }
+
+    pub fn take_loot_with_command(&self) -> Option<TracedRequest<u32>> {
+        self.dequeue_with_command(&self.interact.loot)
     }
 
     /// Drain a pending give request as `(npc_id, from_slot)`.
@@ -138,6 +154,10 @@ impl CommandState {
     /// Drain a pending sit/stand request.
     pub fn take_sit(&self) -> Option<bool> {
         self.dequeue(&self.interact.sit)
+    }
+
+    pub fn take_sit_with_command(&self) -> Option<TracedRequest<bool>> {
+        self.dequeue_with_command(&self.interact.sit)
     }
 
     /// Drain a pending run/walk toggle request (#625).

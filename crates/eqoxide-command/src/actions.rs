@@ -69,7 +69,8 @@ struct State {
     next: u64,
     zone_epoch: u64,
     fences: HashMap<usize, (u64, u64)>,
-    fifo_fences: HashMap<usize, VecDeque<Option<(u64,u64)>>>,
+    fifo_fences: HashMap<usize, VecDeque<FifoEntry>>,
+    packet_commands: HashMap<usize, Arc<str>>,
     pending: HashMap<u64, Pending>,
     queued: HashMap<usize, Vec<u64>>,
     names: HashMap<usize, Action>,
@@ -77,13 +78,31 @@ struct State {
     held: HashMap<(Action, u64), Vec<u64>>,
     events: Vec<ActionRecord>,
 }
+type PacketCommand = Option<Arc<str>>;
+pub(crate) type TracedRequest<T> = (T, PacketCommand);
+
+struct FifoEntry {
+    fence: Option<(u64, u64)>,
+    command: PacketCommand,
+}
+
 struct Pending { kind: String, accepted: bool, deadline: Instant, zone_epoch: Option<u64> }
 #[derive(Clone, Debug)]
 pub struct ActionRecord { pub id: u64, pub kind: String, pub result: String, pub reason: String }
 #[derive(Clone)]
-pub struct ActionContext { tracker: ActionTracker, id: u64, accepted: Arc<AtomicBool> }
+pub struct ActionContext {
+    tracker: ActionTracker,
+    id: u64,
+    accepted: Arc<AtomicBool>,
+    packet_command: PacketCommand,
+}
 tokio::task_local! { static CONTEXT: ActionContext; }
 impl ActionContext {
+    /// Bind the headless ID before enqueue: the net owner can drain before the host sees acceptance.
+    pub fn with_packet_command(mut self, id: &str) -> Self {
+        self.packet_command = Some(id.into());
+        self
+    }
     pub fn id(&self) -> u64 { self.id }
     pub fn accepted(&self) -> bool { self.accepted.load(Ordering::Acquire) }
     pub async fn scope<F: Future>(&self, future: F) -> F::Output { CONTEXT.scope(self.clone(), future).await }
@@ -94,7 +113,7 @@ impl ActionTracker {
         state.next = state.next.checked_add(1).expect("action ID exhausted");
         let id = state.next;
         state.pending.insert(id, Pending { kind: kind.into(), accepted: false, deadline: Instant::now() + Duration::from_secs(30), zone_epoch: None });
-        ActionContext { tracker: self.clone(), id, accepted: Arc::new(AtomicBool::new(false)) }
+        ActionContext { tracker: self.clone(), id, accepted: Arc::new(AtomicBool::new(false)), packet_command: None }
     }
     /// Attach caller knowledge to the network mailbox, without changing legacy UI callers.
     pub fn begin_for_zone(&self, kind: &str, zone_epoch: u64) -> ActionContext {
@@ -128,27 +147,55 @@ impl ActionTracker {
         let context = CONTEXT.try_with(Clone::clone).ok().filter(|c|Arc::ptr_eq(&self.0,&c.tracker.0));
         let mut state=self.0.lock().unwrap();
         let mut fence=None;
+        let mut command = None;
         if let Some(context)=context {
             state.names.insert(key,name);
             if let Some(p)=state.pending.get_mut(&context.id) {
                 p.accepted=true;p.deadline=Instant::now()+Duration::from_secs(30);
                 context.accepted.store(true,Ordering::Release);
                 fence=p.zone_epoch.map(|epoch|(epoch,context.id));
+                command = context.packet_command;
                 if !awaited {state.queued.entry(key).or_default().push(context.id);}
             }
         }
-        if fifo {state.fifo_fences.entry(key).or_default().push_back(fence);}
-        else if let Some(fence)=fence {state.fences.insert(key,fence);}
+        if fifo {
+            state.fifo_fences.entry(key).or_default().push_back(FifoEntry { fence, command });
+        } else {
+            if let Some(fence) = fence { state.fences.insert(key, fence); }
+            Self::replace_packet_command(&mut state, key, command);
+        }
     }
+
+    fn replace_packet_command(state: &mut State, key: usize, command: PacketCommand) {
+        if let Some(id) = command {
+            state.packet_commands.insert(key, id);
+        } else {
+            state.packet_commands.remove(&key);
+        }
+    }
+
+    // These run under the corresponding payload lock so last-wins writes replace both together.
+    pub(crate) fn set_packet_command(&self, key: usize, command: Option<&str>) {
+        Self::replace_packet_command(&mut self.0.lock().unwrap(), key, command.map(Arc::from));
+    }
+
+    pub(crate) fn take_packet_command(&self, key: usize) -> PacketCommand {
+        self.0.lock().unwrap().packet_commands.remove(&key)
+    }
+
     /// FIFO metadata has one entry per payload, including unscoped graphical messages.
-    pub(crate) fn drain_fifo(&self,key:usize,len:usize)->Vec<bool> {
+    pub(crate) fn drain_fifo(&self, key: usize, len: usize) -> Vec<Result<PacketCommand, ()>> {
         let mut state=self.0.lock().unwrap();
         let mut fences=state.fifo_fences.remove(&key).unwrap_or_default();
         let mut stale=HashSet::new();
         let keep=(0..len).map(|_| {
-            match fences.pop_front().flatten() {
-                Some((epoch,id)) if epoch!=state.zone_epoch=>{stale.insert(id);false},
-                _=>true,
+            let Some(entry) = fences.pop_front() else { return Ok(None); };
+            match entry.fence {
+                Some((epoch, id)) if epoch != state.zone_epoch => {
+                    stale.insert(id);
+                    Err(())
+                }
+                _ => Ok(entry.command),
             }
         }).collect();
         if let Some(ids)=state.queued.remove(&key) {
@@ -158,18 +205,19 @@ impl ActionTracker {
         for id in stale {self.finish(id,"refused","stale_zone_epoch_before_dispatch");}
         keep
     }
-    pub(crate) fn drain(&self, key: usize) -> bool {
+    fn drain(&self, key: usize) -> Result<PacketCommand, ()> {
         let mut state = self.0.lock().unwrap();
+        let command = state.packet_commands.remove(&key);
         if let Some((expected, id)) = state.fences.remove(&key) {
             if expected != state.zone_epoch {
                 state.queued.remove(&key);
                 drop(state);
                 self.finish(id, "refused", "stale_zone_epoch_before_dispatch");
-                return false;
+                return Err(());
             }
         }
         if let Some(ids) = state.queued.remove(&key) { state.drained.entry(key).or_default().extend(ids); }
-        true
+        Ok(command)
     }
     pub fn drain_scope(&self) -> DrainScope { DrainScope(self.clone()) }
 
@@ -208,23 +256,43 @@ impl crate::CommandState {
         for id in self.actions.take_drained(command) { self.actions.finish(id, "refused", reason); }
     }
     pub(crate) fn enqueue<T>(&self, slot: &Mutex<Option<T>>, msg: T, awaited: bool, name: Action) -> bool {
+        self.enqueue_after(slot, msg, awaited, name, || {})
+    }
+
+    pub(crate) fn enqueue_after<T>(
+        &self,
+        slot: &Mutex<Option<T>>,
+        msg: T,
+        awaited: bool,
+        name: Action,
+        before_publish: impl FnOnce(),
+    ) -> bool {
         let mut value = slot.lock().unwrap();
         if value.is_some() { return false; }
+        before_publish();
         *value = Some(msg);
         self.actions.accept(slot as *const _ as usize, awaited, name);
         true
     }
     pub(crate) fn dequeue<T>(&self, slot: &Mutex<Option<T>>) -> Option<T> {
-        self.dequeue_checked(slot).ok().flatten()
+        self.dequeue_with_command(slot).map(|(value, _)| value)
     }
+
+    pub(crate) fn dequeue_with_command<T>(&self, slot: &Mutex<Option<T>>) -> Option<TracedRequest<T>> {
+        self.dequeue_checked_with_command(slot).ok().flatten()
+    }
+
     /// Return a rejected payload to awaited domains so they can answer the caller explicitly.
-    pub(crate) fn dequeue_checked<T>(&self, slot: &Mutex<Option<T>>) -> Result<Option<T>,T> {
-        let mut value=slot.lock().unwrap();
-        let result=value.take();
-        if result.is_some() && !self.actions.drain(slot as *const _ as usize) {
-            return Err(result.unwrap());
+    pub(crate) fn dequeue_checked_with_command<T>(
+        &self,
+        slot: &Mutex<Option<T>>,
+    ) -> Result<Option<TracedRequest<T>>, T> {
+        let mut value = slot.lock().unwrap();
+        let Some(payload) = value.take() else { return Ok(None); };
+        match self.actions.drain(slot as *const _ as usize) {
+            Ok(command) => Ok(Some((payload, command))),
+            Err(()) => Err(payload),
         }
-        Ok(result)
     }
 }
 

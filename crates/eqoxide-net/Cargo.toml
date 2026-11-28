@@ -7,6 +7,9 @@ edition = "2021"
 name = "eqoxide_net"
 path = "src/lib.rs"
 
+[features]
+test-fixtures = []
+
 [dependencies]
 # eqoxide-net is the MVC Model — the net thread that decodes the RoF2 wire and is the SOLE writer of
 # the shared GameState (login flow, zone gameplay loop, packet apply, server reconciliation, the

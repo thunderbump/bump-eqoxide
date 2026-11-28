@@ -424,14 +424,20 @@ fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: eqoxide_ipc::CastRe
 /// and the honest awaited buy path (#448) so both emit byte-identical wire traffic and identical
 /// in-flight/coin-unverified bookkeeping — the awaited path adds ONLY the parked Sender, no
 /// behavior change to the wire. See `drain_merchant` for the surrounding #345/#360/#361 rationale.
-fn send_shop_buy(stream: &mut EqStream, gs: &mut GameState, merchant_id: u32, slot: u32) {
+fn send_shop_buy(
+    stream: &mut EqStream,
+    gs: &mut GameState,
+    merchant_id: u32,
+    slot: u32,
+    command_id: Option<&std::sync::Arc<str>>,
+) {
     // #360/#361: clear a DIFFERENT stale merchant (but don't flicker an already-open one closed) and
     // mark coin unverified until a real OP_PlayerProfile reconciles this buy — a silent
     // inventory-full/LORE refusal sends no echo at all.
     gs.begin_shop_open_for(merchant_id);
     gs.begin_shop_buy();
     let open = merchant_click(merchant_id, gs.player_id, 1);
-    stream.send_app_packet(OP_SHOP_REQUEST, &open);
+    stream.send_app_packet_with_command(OP_SHOP_REQUEST, &open, command_id);
     // RoF2 Merchant_Sell_Struct (32b): npcid@0, playerid@4, itemslot@8, unknown12@12, quantity@16,
     // unknown20@20, price@24, unknown28@28. (The RoF2 server DECODEs an exact 32 bytes, so a short
     // packet is silently dropped.)
@@ -440,7 +446,7 @@ fn send_shop_buy(stream: &mut EqStream, gs: &mut GameState, merchant_id: u32, sl
     buy[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
     buy[8..12].copy_from_slice(&slot.to_le_bytes());
     buy[16..20].copy_from_slice(&1u32.to_le_bytes()); // quantity = 1 (server sets the price)
-    stream.send_app_packet(OP_SHOP_PLAYER_BUY, &buy);
+    stream.send_app_packet_with_command(OP_SHOP_PLAYER_BUY, &buy, command_id);
     tracing::info!("EQ: shop buy sent — merchant_id={} slot={} qty=1", merchant_id, slot);
 }
 
@@ -585,6 +591,8 @@ pub struct ActionLoop {
     /// heading it carried. Together with `last_sent_pos` these decide whether a rest flush is
     /// owed (central-vgwu).
     last_sent_moving: bool,
+    position_commands: eqoxide_ipc::PositionCommands,
+    last_position_commands: eqoxide_ipc::PositionCommands,
     last_sent_heading: f32,
     /// `ControllerView::step_seq` and `pos` as of the last physics step this streamer observed.
     seen_step_seq:    u64,
@@ -704,6 +712,8 @@ impl ActionLoop {
             last_pos_send: Instant::now(),
             last_sent_pos: [0.0, 0.0, 0.0],
             last_sent_moving: false,
+            position_commands: Default::default(),
+            last_position_commands: Default::default(),
             last_sent_heading: 0.0,
             seen_step_seq: 0,
             step_pos: [0.0, 0.0, 0.0],
@@ -1261,6 +1271,14 @@ impl ActionLoop {
     /// (`sync_doors` from `run_gameplay_phase`, and `run_zone_entry_handshake`) that go through here.
     pub fn doors_shared(&self) -> &eqoxide_ipc::DoorsShared { &self.interact.doors_shared }
 
+    pub(crate) fn drain_camp_request(
+        &self,
+        camp: &eqoxide_ipc::CampReq,
+        apply: impl FnOnce(CampCmd, Option<std::sync::Arc<str>>),
+    ) {
+        self.command.drain_camp_with_command(camp, apply);
+    }
+
     /// The published NPC-dialogue choices, for the zone-entry handshake to CLEAR (#941).
     ///
     /// Same shape as [`Self::doors_shared`] above, one step more dangerous: this slot is not only
@@ -1484,8 +1502,8 @@ impl ActionLoop {
         // POST /loot: queue the requested corpse onto the existing auto-loot pipeline. The gameplay
         // loop drains pending_loot — sends OP_LootRequest, echoes each OP_LootItem to take it, then
         // OP_EndLootRequest. The 500ms delay (loot_queued_at) lets the server register the corpse.
-        if let Some(corpse_id) = self.command.take_loot() {
-            gs.pending_loot.push_back(corpse_id);
+        if let Some((corpse_id, command_id)) = self.command.take_loot_with_command() {
+            gs.pending_loot.push_back(eqoxide_core::game_state::LootRequest { corpse_id, command_id });
             self.command.actions().hold_drained(Action::InteractLoot, corpse_id as u64);
             if gs.loot_queued_at.is_none() {
                 gs.loot_queued_at = Some(Instant::now());
@@ -1789,17 +1807,17 @@ impl ActionLoop {
         }
 
         // Check say request — arbitrary Say text (HUD say box / quest keyword follow-up).
-        let say_text = self.command.take_say();
-        if let Some(text) = say_text {
+        let say_text = self.command.take_say_with_command();
+        if let Some((text, command_id)) = say_text {
             // The `/camp` chat keyword is a local command, not Say text: toggle a camp instead of
             // broadcasting it. The gameplay loop drains the camp slot and runs the camp/cancel.
             if text.trim().eq_ignore_ascii_case("/camp") {
-                self.command.request_camp(CampCmd::Toggle);
+                self.command.request_camp_with_command(CampCmd::Toggle, command_id.as_deref());
                 tracing::info!("EQ: /camp chat command — toggling camp");
             } else {
                 let pkt = build_say_packet(&gs.player_name, "", &text);
                 tracing::info!("EQ: say: {}", text);
-                stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
+                stream.send_app_packet_with_command(OP_CHANNEL_MESSAGE, &pkt, command_id.as_ref());
                 let line = format!("You say, '{}'", text);
                 gs.log_msg("chat", &line);
             }
@@ -1821,10 +1839,10 @@ impl ActionLoop {
         // #446: both the Chat window and the POST handlers write through the shared
         // `CommandState::request_chat_send` verb now; this drains the whole FIFO queue at once via
         // `take_chat_send` (same `std::mem::take` behavior the raw slot drain had).
-        let outgoing: Vec<eqoxide_ipc::ChatSend> = self.command.take_chat_send();
-        for c in outgoing {
+        let outgoing = self.command.take_chat_send_with_commands();
+        for (c, command_id) in outgoing {
             let pkt = build_channel_message(&gs.player_name, &c.to, c.chan, &c.text);
-            stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
+            stream.send_app_packet_with_command(OP_CHANNEL_MESSAGE, &pkt, command_id.as_ref());
             let label = match c.chan { 7 => format!("tell {}", c.to), 5 => "ooc".into(),
                                        3 => "shout".into(), 2 => "group".into(), 0 => "guild".into(),
                                        n => format!("chan{n}") };
@@ -1849,8 +1867,8 @@ impl ActionLoop {
         // target_name/target_hp_pct (name/HP — update_hp/update_hp_pct then keep target_hp_pct
         // live as combat HP updates arrive) AND clears target_con/target_con_name/
         // target_attitude so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
-        let target_id = self.command.take_target();
-        if let Some(id) = target_id {
+        let target_id = self.command.take_target_with_command();
+        if let Some((id, command_id)) = target_id {
             // Never adopt a spawn that isn't in the zone. POST /v1/combat/target 404s on an unknown
             // id, but the entity could still despawn between the HTTP check and this drain — and the
             // server silently IGNORES an OP_TargetMouse for an unknown id, so calling set_target
@@ -1864,8 +1882,8 @@ impl ActionLoop {
                 tracing::info!("EQ: target spawn_id={} REFUSED — not in the entity list", id);
             } else {
                 gs.set_target(id);
-                stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
-                stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
+                stream.send_app_packet_with_command(OP_TARGET_MOUSE, &build_target_packet(id), command_id.as_ref());
+                stream.send_app_packet_with_command(OP_CONSIDER, &build_consider_packet(gs.player_id, id), command_id.as_ref());
                 tracing::info!("EQ: target spawn_id={} + consider", id);
             }
         }
@@ -1903,11 +1921,11 @@ impl ActionLoop {
     fn drain_combat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Check attack request — send OP_AUTO_ATTACK(1) to start, OP_AUTO_ATTACK(0) to stop.
         // Server expects exactly 4 bytes; byte[0]=1 enables, byte[0]=0 disables.
-        let attack_req = self.command.take_attack();
-        if let Some(on) = attack_req {
+        let attack_req = self.command.take_attack_with_command();
+        if let Some((on, command_id)) = attack_req {
             self.auto_attack = on;
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
-            stream.send_app_packet(OP_AUTO_ATTACK, &payload);
+            stream.send_app_packet_with_command(OP_AUTO_ATTACK, &payload, command_id.as_ref());
             gs.auto_attack = on;
             tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
         }
@@ -2124,11 +2142,11 @@ impl ActionLoop {
 
     fn drain_sit(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Sit / stand (OP_SpawnAppearance type=14, param 110/100).
-        let sit_req = self.command.take_sit();
-        if let Some(sit) = sit_req {
+        let sit_req = self.command.take_sit_with_command();
+        if let Some((sit, command_id)) = sit_req {
             let param = if sit { 110u32 } else { 100u32 };
             let payload = build_spawn_appearance_packet(gs.player_id as u16, 14, param);
-            stream.send_app_packet(OP_SPAWN_APPEARANCE, &payload);
+            stream.send_app_packet_with_command(OP_SPAWN_APPEARANCE, &payload, command_id.as_ref());
             gs.sitting = sit;
             tracing::info!("EQ: {}", if sit { "sit" } else { "stand" });
         }
@@ -2173,7 +2191,7 @@ impl ActionLoop {
         // may deduct coin or log "Bought item", because it's the only place that knows it succeeded.
         let buy_req = self.command.take_merchant_buy();
         if let Some((merchant_id, slot)) = buy_req {
-            send_shop_buy(stream, gs, merchant_id, slot);
+            send_shop_buy(stream, gs, merchant_id, slot, None);
         }
 
         // Merchant buy (AWAITED, honest Command-with-result path — POST /v1/merchant/buy, #448):
@@ -2199,13 +2217,13 @@ impl ActionLoop {
         // A3.2/A3.3 must copy. (Known residual: a UI fire-and-forget buy of the SAME slot concurrent
         // with a parked awaited buy could still have its echo resolve the awaited buy, because the
         // fire-and-forget path does not park — very low likelihood, and it cannot fabricate success.)
-        if let Some((merchant_id, slot, tx)) = self.command.take_buy_await() {
+        if let Some(((merchant_id, slot, tx), command_id)) = self.command.take_buy_await_with_command() {
             if self.pending_buy.is_some() {
                 let _ = tx.send(eqoxide_command::CommandResult::Refused(
                     "another buy is already in flight; retry after it resolves".into()));
                 tracing::info!("EQ: awaited shop buy REJECTED — one already in flight (merchant_id={merchant_id} slot={slot})");
             } else {
-                send_shop_buy(stream, gs, merchant_id, slot);
+                send_shop_buy(stream, gs, merchant_id, slot, command_id.as_ref());
                 self.pending_buy = Some(PendingBuy { tx, merchant_id, slot, sent_at: Instant::now() });
                 tracing::info!("EQ: awaited shop buy parked — merchant_id={merchant_id} slot={slot}");
             }
@@ -2214,13 +2232,13 @@ impl ActionLoop {
         // Merchant sell: open the merchant (OP_ShopRequest) then sell a player inventory slot
         // (OP_ShopPlayerSell). Same sequencing as buy so the shop is open server-side first.
         // Must be within ~200u of the merchant; the server computes the price (we send 0).
-        let sell_req = self.command.take_merchant_sell();
-        if let Some((merchant_id, slot, quantity)) = sell_req {
+        let sell_req = self.command.take_merchant_sell_with_command();
+        if let Some(((merchant_id, slot, quantity), command_id)) = sell_req {
             // #360: same staleness hazard as the buy path above — clear a DIFFERENT stale merchant
             // before sending, but don't flicker the one that's already open (#361 review FIX 2).
             gs.begin_shop_open_for(merchant_id);
             let open = merchant_click(merchant_id, gs.player_id, 1);
-            stream.send_app_packet(OP_SHOP_REQUEST, &open);
+            stream.send_app_packet_with_command(OP_SHOP_REQUEST, &open, command_id.as_ref());
             // RoF2 Merchant_Purchase_Struct is 20 bytes (rof2_structs.h): npcid(u32)@0,
             // inventory_slot(TypelessInventorySlot_Struct: Slot i16@4, SubIndex i16@6, AugIndex i16@8,
             // Unknown i16@10)@4, quantity(u32)@12, price(u32)@16. The old 16-byte body (plain u32
@@ -2236,7 +2254,7 @@ impl ActionLoop {
             // Unknown01 @10 stays 0.
             sell[12..16].copy_from_slice(&quantity.to_le_bytes());
             // price @16 = 0: the server charges its own buy-back price.
-            stream.send_app_packet(OP_SHOP_PLAYER_SELL, &sell);
+            stream.send_app_packet_with_command(OP_SHOP_PLAYER_SELL, &sell, command_id.as_ref());
             tracing::info!("EQ: shop sell — merchant_id={} slot={} qty={}", merchant_id, slot, quantity);
             // No optimistic "Sold" log: the server's OP_ShopPlayerSell echo (apply_shop_player_sell)
             // confirms the real payout + removes the item, so a premature success can't be printed
@@ -2246,8 +2264,8 @@ impl ActionLoop {
         // Open/close a merchant window (POST /trade/open, /trade/close). OP_ShopRequest with
         // command=1 (open) or 0 (close). The server replies with OP_ShopRequest (Open/Close) +
         // OP_ItemPacket(Merchant) items, decoded in packet_handler into gs.merchant_*.
-        let trade_req = self.command.take_merchant_trade();
-        if let Some(cmd) = trade_req {
+        let trade_req = self.command.take_merchant_trade_with_command();
+        if let Some((cmd, command_id)) = trade_req {
             let (merchant_id, command) = match cmd {
                 TradeCmd::Open(id) => (id, 1u32),
                 TradeCmd::Close    => (gs.merchant_open.unwrap_or(0), 0u32),
@@ -2260,7 +2278,7 @@ impl ActionLoop {
                 gs.begin_shop_open_for(merchant_id);
             }
             let open = merchant_click(merchant_id, gs.player_id, command);
-            stream.send_app_packet(OP_SHOP_REQUEST, &open);
+            stream.send_app_packet_with_command(OP_SHOP_REQUEST, &open, command_id.as_ref());
             tracing::info!("EQ: shop {} — merchant_id={}", if command == 1 { "open" } else { "close" }, merchant_id);
             if command == 0 { gs.merchant_open = None; gs.merchant_items.clear(); }
         }
@@ -2278,7 +2296,7 @@ impl ActionLoop {
         // When an open is already parked we do NOT overwrite it and send NO wire packets — we
         // immediately answer the NEW request `Refused` (packets never sent, so the open
         // DEFINITIVELY did not happen — 409 is honest here, not 202).
-        if let Some((merchant_id, tx)) = self.command.take_open_await() {
+        if let Some(((merchant_id, tx), command_id)) = self.command.take_open_await_with_command() {
             if self.pending_open.is_some() {
                 let _ = tx.send(eqoxide_command::CommandResult::Refused(
                     "another open is already in flight; retry after it resolves".into()));
@@ -2286,7 +2304,7 @@ impl ActionLoop {
             } else {
                 gs.begin_shop_open_for(merchant_id);
                 let open = merchant_click(merchant_id, gs.player_id, 1);
-                stream.send_app_packet(OP_SHOP_REQUEST, &open);
+                stream.send_app_packet_with_command(OP_SHOP_REQUEST, &open, command_id.as_ref());
                 self.pending_open = Some(PendingOpen { tx, merchant_id, sent_at: Instant::now() });
                 tracing::info!("EQ: awaited shop open parked — merchant_id={merchant_id}");
             }
@@ -2300,15 +2318,15 @@ impl ActionLoop {
         // SwapItem rejects number_in_stack > 0 for any non-stackable item (inventory.cpp ~2025,
         // "not a stackable item" -> SwapItemResync = the "Inventory Desyncronization" we hit). 0
         // takes the direct-swap/equip path. (A count would only be for splitting a stack.)
-        let move_req = self.command.take_inventory_move();
-        if let Some((from_slot, to_slot)) = move_req {
+        let move_req = self.command.take_inventory_move_with_command();
+        if let Some(((from_slot, to_slot), command_id)) = move_req {
             if !gs.inventory.iter().any(|item| item.slot == from_slot as i32) {
                 self.command.refuse_drained(Action::InventoryMoveReq, "item_missing");
                 return;
             }
             // build_move_item emits the structured 28-byte RoF2 MoveItem_Struct; a flat 12-byte
             // packet is silently dropped by the server (see build_move_item / eqoxide#11).
-            stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, to_slot));
+            stream.send_app_packet_with_command(OP_MOVE_ITEM, &build_move_item(from_slot, to_slot), command_id.as_ref());
             // EQEmu applies the move silently (no echo), so mirror it into our snapshot or
             // /inventory goes stale and the next move corrupts it (phantom items).
             self.mirror_move_item(gs, from_slot as i32, to_slot as i32);
@@ -2633,9 +2651,13 @@ impl ActionLoop {
     /// server corrections (>12u jumps the server pushed) and forwards them to the controller, and
     /// sends OP_ClientUpdate at ≤280 ms while moving with a forced 1300 ms keepalive when idle.
     fn stream_position(&mut self, stream: &mut EqStream, gs: &mut GameState) {
-        let view = *self.controller.controller_view.lock().unwrap();
-        // Don't stream/mirror until the render controller has spawned (else we'd push origin).
-        if !view.initialized || view.zone_epoch.is_some_and(|epoch| epoch != gs.zone_epoch) { return; }
+        let (view, commands) = {
+            let mut view = self.controller.controller_view.lock().unwrap();
+            // Don't stream/mirror until the render controller has spawned (else we'd push origin).
+            if !view.initialized || view.zone_epoch.is_some_and(|epoch| epoch != gs.zone_epoch) { return; }
+            let commands = std::mem::take(&mut view.position_commands);
+            (view.clone(), commands)
+        };
         // #724 review B1: mirror the controller's "I have stopped the body and cannot resume" state
         // alongside its position, on the same tick and under the same init gate, so `player.hold` on
         // `GET /v1/observe` is exactly as fresh as the `pos` beside it. Level-triggered — the view is
@@ -2799,7 +2821,8 @@ impl ActionLoop {
             // `last_sent_pos` happened to be before the jump (#624 review — the reviewer confirmed
             // this path does not spike; keep it that way explicitly rather than by accident).
             self.send_position_update(stream, gs, gp, gp, gs.player_heading,
-                                      eqoxide_core::game_state::PositionSendReason::Correction);
+                                      eqoxide_core::game_state::PositionSendReason::Correction, Default::default());
+            self.position_commands = Default::default();
             self.last_streamed = gp;
             self.last_pos_send = Instant::now();
             self.last_sent_pos = gp;
@@ -2830,6 +2853,7 @@ impl ActionLoop {
         if view.zone_epoch != self.rest_epoch || unadopted {
             if view.zone_epoch != self.rest_epoch {
                 self.rest_epoch = view.zone_epoch;
+                self.position_commands = Default::default();
                 self.last_sent_moving = false;
                 self.stepped_since_send = false;
             }
@@ -2840,6 +2864,11 @@ impl ActionLoop {
             // view: the teleport itself is not motion, but any travel past the correction is.
             self.step_pos = self.last_sent_pos;
             self.stepped_since_send = false;
+        }
+        if unadopted {
+            self.position_commands = Default::default();
+        } else {
+            self.position_commands.merge(commands);
         }
         let mut at_rest = false;
         if view.step_seq != self.seen_step_seq {
@@ -2859,7 +2888,12 @@ impl ActionLoop {
         if at_rest && rest_owed {
             // `from == to`: zero delta and animation 0, the native "standing here" update.
             use eqoxide_core::game_state::PositionSendReason::Rest;
-            self.send_position_update(stream, gs, pos, pos, view.heading, Rest);
+            let mut commands = std::mem::take(&mut self.position_commands);
+            commands.include(view.active_motion_command.as_ref());
+            if self.last_sent_moving {
+                commands.merge(self.last_position_commands.clone());
+            }
+            self.send_position_update(stream, gs, pos, pos, view.heading, Rest, commands);
             self.last_pos_send = Instant::now();
             self.last_sent_pos = pos;
         } else if (moved && since >= POS_SEND_MOVING_MS) || since >= POS_SEND_KEEPALIVE_MS {
@@ -2871,7 +2905,15 @@ impl ActionLoop {
             // flooring every sustained run's reported speed back down near the walking constant.
             use eqoxide_core::game_state::PositionSendReason::{Keepalive, Moving};
             let reason = if moved && since >= POS_SEND_MOVING_MS { Moving } else { Keepalive };
-            self.send_position_update(stream, gs, self.last_sent_pos, pos, view.heading, reason);
+            let mut commands = std::mem::take(&mut self.position_commands);
+            if !unadopted {
+                // An idle keepalive has no residual motion to attribute once rest was sent.
+                if !rest_drift && !self.last_sent_moving && !self.stepped_since_send {
+                    commands = Default::default();
+                }
+                commands.include(view.active_motion_command.as_ref());
+            }
+            self.send_position_update(stream, gs, self.last_sent_pos, pos, view.heading, reason, commands);
             self.last_pos_send = Instant::now();
             self.last_sent_pos = pos;
         }
@@ -2913,6 +2955,7 @@ impl ActionLoop {
         to: [f32; 3],
         heading: f32,
         reason: eqoxide_core::game_state::PositionSendReason,
+        commands: eqoxide_ipc::PositionCommands,
     ) {
         let dx = to[0] - from[0]; // east  delta (server_x)
         let dy = to[1] - from[1]; // north delta (server_y)
@@ -2960,11 +3003,14 @@ impl ActionLoop {
         // server's idea of where we are has stopped tracking ours. Not escalated further here — the
         // next update ~50ms later supersedes this one, and aborting the loop on a transient
         // WouldBlock would be worse than the drop.
-        if let Err(e) = stream.send_app_packet_unreliable(OP_CLIENT_UPDATE, &buf) {
+        if let Err(e) = stream.send_app_packet_unreliable_with_command(
+            OP_CLIENT_UPDATE, &buf, commands.command_id(),
+        ) {
             tracing::debug!("NET: position update seq {} did not reach the wire ({:?}) — no \
                              retransmit; the next update supersedes it (#612)",
                             self.position_seq.wrapping_sub(1), e.kind());
         }
+        self.last_position_commands = commands;
         // Recorded after the transport call, so state never reports an attempt not yet made.
         self.controller.controller_view.lock().unwrap().last_position_send = Some(record);
     }
@@ -3581,7 +3627,7 @@ mod tests {
                         //    correction is publish it into `pos_correction` and wait to be asked.
                         //    Note the withdrawal above is a write to `gs`, NOT to the view: the
                         //    render thread's published answer is left exactly as it published it.
-                        let view = *nav.controller.controller_view.lock().unwrap();
+                        let view = nav.controller.controller_view.lock().unwrap().clone();
                         assert_eq!(view.pos, FROZEN_POS,
                             "the net thread must not write the controller's position — freeing the \
                              body is the render thread's move to make: {ctx}");
@@ -4146,6 +4192,29 @@ mod tests {
         nav.stream_position(&mut stream, &mut gs); // baseline tick, sends nothing
         assert!(drain_client_updates(&peer).await.is_empty());
         (stream, peer, nav, gs)
+    }
+
+    /// Removing the prior moving send's ID leaves rest untagged when the stopped view has no ID.
+    #[tokio::test]
+    async fn rest_inherits_last_moving_command_without_a_terminal_id() {
+        use crate::{packet_telemetry::SessionTrace, transport::with_packet_trace};
+        use eqoxide_core::game_state::PositionSendReason;
+
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, _peer, mut nav, mut gs) =
+            with_packet_trace(trace.clone(), rest_fixture([0.0; 3])).await;
+        nav.last_pos_send = Instant::now() - Duration::from_millis(300);
+        nav.controller.controller_view.lock().unwrap().active_motion_command = Some("move".into());
+        publish_step(&nav, [9.0, 0.0, 0.0]);
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(last_send(&nav).unwrap().reason, PositionSendReason::Moving);
+        assert!(nav.last_sent_moving);
+
+        nav.controller.controller_view.lock().unwrap().active_motion_command = None;
+        publish_step(&nav, [9.0, 0.0, 0.0]);
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(last_send(&nav).unwrap().reason, PositionSendReason::Rest);
+        assert_eq!(trace.page(0, 10, Some("OP_CLIENT_UPDATE"), Some("move")).packets.len(), 2);
     }
 
     /// One CPU physics step published at `pos`.
@@ -5634,6 +5703,50 @@ mod tests {
         e[0..4].copy_from_slice(&npc_id.to_le_bytes());
         e[8..12].copy_from_slice(&command.to_le_bytes());
         e
+    }
+
+    #[tokio::test]
+    async fn packet_trace_attributes_each_mailbox_drain() {
+        use crate::{packet_telemetry::{opcode_name, SessionTrace}, transport::with_packet_trace};
+
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, _rx) = with_packet_trace(trace.clone(), crate::transport::test_stream(0, 0)).await;
+        let mut nav = new_loop();
+        let mut gs = seed_open_gs();
+        let tracker = nav.command.actions();
+        tracker.set_zone_epoch(1);
+        let _drain = tracker.drain_scope();
+
+        let target = tracker.begin_for_zone("target", 1).with_packet_command("target");
+        assert!(target.scope(async { nav.command.request_target(gs.player_id) }).await);
+        let open = tracker.begin_for_zone("open", 1).with_packet_command("open");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(open.scope(async { nav.command.request_open_await(11, tx) }).await);
+        let tell = tracker.begin_for_zone("tell", 1).with_packet_command("tell");
+        let message = |text: &str| eqoxide_ipc::ChatSend { chan: 7, to: "peer".into(), text: text.into() };
+        nav.command.request_chat_send(message("untracked"));
+        tell.scope(async { nav.command.request_chat_send(message("tracked")) }).await;
+        let attack = tracker.begin_for_zone("attack", 1).with_packet_command("attack");
+        assert!(attack.scope(async { nav.command.request_attack(true) }).await);
+        nav.command.overwrite_attack_off(Some("off"));
+
+        nav.drain_target(&mut stream, &mut gs);
+        nav.drain_merchant(&mut stream, &mut gs);
+        nav.drain_chat(&mut stream, &mut gs);
+        nav.drain_combat(&mut stream, &mut gs);
+
+        let count = |opcode, command| trace.page(0, 20, opcode, command).packets.len();
+        assert_eq!(count(None, None), 6);
+        assert_eq!(count(None, Some("target")), 2);
+        assert_eq!(count(Some(opcode_name(OP_TARGET_MOUSE)), Some("target")), 1);
+        assert_eq!(count(None, Some("open")), 1);
+        assert_eq!(count(Some(opcode_name(OP_SHOP_REQUEST)), Some("open")), 1);
+        assert_eq!(count(Some(opcode_name(OP_CHANNEL_MESSAGE)), None), 2);
+        assert_eq!(count(None, Some("tell")), 1);
+        assert_eq!(count(Some(opcode_name(OP_CHANNEL_MESSAGE)), Some("tell")), 1);
+        assert_eq!(count(None, Some("attack")), 0);
+        assert_eq!(count(None, Some("off")), 1);
+        assert_eq!(count(Some(opcode_name(OP_AUTO_ATTACK)), Some("off")), 1);
     }
 
     fn seed_open_gs() -> GameState {

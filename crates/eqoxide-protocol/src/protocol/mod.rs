@@ -872,6 +872,11 @@ impl SpawnInfo {
 ///   word3: deltaHeading:10, z:19, pad:3
 ///   word4: animation:10, deltaY:13, pad:9
 pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
+    parse_rof2_spawn_with_wire_heading(buf).map(|(spawn, consumed, _)| (spawn, consumed))
+}
+
+/// Decode the same spawn while retaining the raw EQ12 heading for packet evidence.
+pub fn parse_rof2_spawn_with_wire_heading(buf: &[u8]) -> Option<(SpawnInfo, usize, u32)> {
     // Spawn packets are inherently VARIABLE-LENGTH (variable name/lastName cstrs, flag-conditional
     // title/suffix, race-dependent equipment block) and are consumed in a "parse until the buffer
     // runs out / a record won't fit → stop" loop (`apply_zone_spawns`). Truncation therefore means
@@ -1073,7 +1078,8 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     // x: signed 19-bit at bits 0-18 of word2
     let x = sext(w2 & 0x7FFFF, 19) as f32 / 8.0;
     // heading: unsigned 12-bit at bits 19-30 of word2 (0..2047 = 0..360° CW, issue #521)
-    let heading_cw = eq12_server_to_deg_cw((w2 >> 19) & 0xFFF);
+    let wire_heading = (w2 >> 19) & 0xFFF;
+    let heading_cw = eq12_server_to_deg_cw(wire_heading);
     let heading = cw_to_ccw(heading_cw);
     // z: signed 19-bit at bits 10-28 of word3
     let z = sext((w3 >> 10) & 0x7FFFF, 19) as f32 / 8.0;
@@ -1112,7 +1118,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
         flymode, pet_owner_id, player_state,
         x, y, z, heading, animation,
         equipment, equipment_tint, npc_tint_index,
-    }, r.pos()))
+    }, r.pos(), wire_heading))
 }
 
 // ── Race ID → renderer code mapping ────────────────────────────────────────
@@ -1667,8 +1673,13 @@ pub fn enc_eq19(v: f32) -> u32 {
 ///   | word2[x:19, heading:12, pad:1]
 ///   | word3[deltaHeading:10, z:19, pad:3]
 ///   | word4[animation:10, deltaY:13, pad:9]
-/// Coords are EQ19 fixed-point (value/8); heading is unsigned 12-bit CW (0..511=0..360°).
+/// Coords are EQ19 fixed-point (value/8); heading is unsigned EQ12 CW (0..2047 per turn).
 pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
+    decode_position_update_with_wire_heading(p).map(|(update, _)| update)
+}
+
+/// Keep the wire heading alongside the ordinary server position decode.
+pub fn decode_position_update_with_wire_heading(p: &[u8]) -> Option<(PositionUpdate, u32)> {
     if p.len() < SIZE_SPAWN_POSITION_UPDATE { return None; }
     let spawn_id = u16::from_le_bytes([p[0], p[1]]);
     // p[2..4] = vehicle_id (skip)
@@ -1682,13 +1693,14 @@ pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
     // x: signed 19-bit at bits 0-18 of word2
     let x = sext(w2 & 0x7FFFF, 19) as f32 / 8.0;
     // heading: unsigned 12-bit at bits 19-30 of word2 (0..2047 = 0..360° CW, issue #521)
-    let heading_cw = eq12_server_to_deg_cw((w2 >> 19) & 0xFFF);
+    let wire_heading = (w2 >> 19) & 0xFFF;
+    let heading_cw = eq12_server_to_deg_cw(wire_heading);
     let heading = cw_to_ccw(heading_cw);
     // z: signed 19-bit at bits 10-28 of word3
     let z = sext((w3 >> 10) & 0x7FFFF, 19) as f32 / 8.0;
     // animation: unsigned 10-bit at bits 0-9 of word4
     let animation = w4 & 0x3FF;
-    Some(PositionUpdate { spawn_id, x, y, z, heading, animation })
+    Some((PositionUpdate { spawn_id, x, y, z, heading, animation }, wire_heading))
 }
 
 /// Encode a minimal position update (deltas/animation zero) in the RoF2

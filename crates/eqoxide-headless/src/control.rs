@@ -9,12 +9,13 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use eqoxide_net::packet_telemetry::SessionTrace;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::watch;
 
@@ -215,6 +216,7 @@ struct Shared {
 #[derive(Clone)]
 pub struct Control {
     shared: Arc<Shared>,
+    packet_trace: SessionTrace,
 }
 
 impl Control {
@@ -244,6 +246,7 @@ impl Control {
         }
         let (changed, _) = watch::channel(0);
         Ok(Self {
+            packet_trace: SessionTrace::new(Instant::now()),
             shared: Arc::new(Shared {
                 session,
                 authorization: format!("Bearer {credential}"),
@@ -268,11 +271,17 @@ impl Control {
         })
     }
 
+    pub(crate) fn with_packet_trace(mut self, trace: SessionTrace) -> Self {
+        self.packet_trace = trace;
+        self
+    }
+
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v2/player/state", get(get_state))
             .route("/v2/player/commands/:id", get(get_command).put(put_command))
             .route("/v2/player/events", get(get_events))
+            .route("/v2/player/packets", get(get_packets))
             .layer(DefaultBodyLimit::max(16 * 1024))
             .layer(middleware::from_fn_with_state(self.clone(), authenticate))
             .with_state(self.clone())
@@ -727,6 +736,63 @@ async fn get_events(
     }
     let _ = tokio::time::timeout(Duration::from_secs_f64(wait), changed.changed()).await;
     Ok(Json(control.event_batch(after)?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PacketQuery {
+    after: Option<u64>,
+    limit: Option<usize>,
+    opcode: Option<String>,
+    command: Option<String>,
+    raw: Option<u8>,
+}
+
+async fn get_packets(
+    State(control): State<Control>,
+    Query(query): Query<PacketQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = query.limit.unwrap_or(500);
+    if !(1..=2000).contains(&limit) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "limit_must_be_between_1_and_2000".into(),
+        ));
+    }
+    let raw = match query.raw {
+        None | Some(0) => false,
+        Some(1) => true,
+        Some(_) => return Err(ApiError(StatusCode::BAD_REQUEST, "raw_must_be_0_or_1".into())),
+    };
+    let mut page = control.packet_trace.page(
+        query.after.unwrap_or(0),
+        limit,
+        query.opcode.as_deref(),
+        query.command.as_deref(),
+    );
+    if raw {
+        for packet in &mut page.packets {
+            packet.include_raw_payload();
+        }
+    }
+    Ok(Json(json!({
+        "packets": page.packets,
+        "next": page.next,
+        "gap": page.gap,
+        "counters": {
+            // Successful EqStream::transmit calls, including retries.
+            "sent": page.counts.sent,
+            // Successful EqStream::poll_resend transmissions of already-sent datagrams.
+            "resent": page.counts.resent,
+            // EqStream::on_raw_recv counts socket reads before decoding, including transport control.
+            "received": page.counts.received,
+            // EqStream's unretried send failures, control queue losses, and reliable sends
+            // abandoned at teardown that never reached the socket.
+            "dropped_unretried": page.counts.dropped_unretried,
+            // EqStream::handle_ordered_decoded counts newly exposed holes in incoming sequences.
+            "sequence_gaps": page.counts.sequence_gaps,
+        }
+    })))
 }
 
 #[cfg(test)]

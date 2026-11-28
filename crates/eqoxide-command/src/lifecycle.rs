@@ -2,31 +2,42 @@
 //!
 //! Domain: `/v1/lifecycle/*` (camp/exit + respawn). Slots live in `self.lifecycle`.
 //!
-//! Unlike every other migrated domain, the DRAIN side of `camp`/`respawn` is not `ActionLoop` at
-//! all: `ipc::LifecycleSlots`'s own doc says `ActionLoop` only ever WRITES `camp` (the `/camp` chat
-//! keyword) — the real reader is `eq_net::gameplay::run_gameplay_phase`, a standalone async fn that
-//! is handed the raw `camp`/`camp_until`/`respawn` Arcs directly by `run_login_flow`, bypassing
-//! `ActionLoop`/`CommandState` entirely. That drain has real retry-cadence state of its own
-//! (`last_respawn_retry`, `pending_respawn`, `RESPAWN_RETRY_INTERVAL`) — model-internal logic, not a
-//! view command — so it is deliberately left un-migrated here rather than threading `CommandState` through
-//! `run_login_flow`/`run_gameplay_phase` for a read site that was never a raw "poke" to begin with.
-//! `camp_until` (the published camp-deadline snapshot) is read-path and was never a candidate.
+//! Gameplay owns camp/respawn draining and the associated timers. Camp attribution is captured
+//! under the same lock as the last-wins payload so a later toggle replaces both together.
 //!
-//! What DOES migrate: every VIEW write to `camp`/`respawn` — the HTTP handlers
-//! (`http/lifecycle.rs`), the HUD Camp button and Respawn button (`ui/windows/actions.rs`), and the
-//! `/camp` chat keyword (`ui/windows/chat.rs`, `eq_net/action_loop.rs::drain_chat`).
+//! The HTTP handlers, HUD buttons, and `/camp` keyword share these request methods.
 
 use super::CommandState;
-use eqoxide_ipc::CampCmd;
+use eqoxide_ipc::{CampCmd, CampReq};
+use std::sync::Arc;
 
 impl CommandState {
     /// Start or toggle a camp (POST /v1/lifecycle/exit uses `Start`; POST /v1/lifecycle/camp, the
     /// HUD Camp button, and the `/camp` chat keyword use `Toggle`). See `ipc::CampCmd`.
     pub fn request_camp(&self, cmd: CampCmd) {
+        self.request_camp_with_command(cmd, None);
+    }
+
+    pub fn request_camp_with_command(&self, cmd: CampCmd, command: Option<&str>) {
         // LAST-WINS (#347): `camp` is a toggle whose LATEST value is the intended one, and
         // POST /v1/lifecycle/exit (`CampCmd::Start`) must be able to override an in-progress camp —
         // it is the only way to tear down a wedged session. Refusing here would strand it.
-        *self.lifecycle.camp.lock().unwrap() = Some(cmd);
+        let mut slot = self.lifecycle.camp.lock().unwrap();
+        *slot = Some(cmd);
+        self.actions.set_packet_command(Arc::as_ptr(&self.lifecycle.camp) as usize, command);
+    }
+
+    pub fn drain_camp_with_command(
+        &self,
+        camp: &CampReq,
+        apply: impl FnOnce(CampCmd, Option<Arc<str>>),
+    ) {
+        let mut slot = camp.lock().unwrap();
+        if let Some(cmd) = slot.take() {
+            let command = self.actions.take_packet_command(Arc::as_ptr(camp) as usize);
+            // Keep the lock through application so the next writer sees the updated camp timer.
+            apply(cmd, command);
+        }
     }
 
     /// Release a held-dead character back to its bind point (POST /v1/lifecycle/respawn, the HUD

@@ -8,6 +8,7 @@
 //! `self.inventory.inventory` (the live `Vec<InvItem>` snapshot for GET /v1/observe/inventory) is a
 //! read-path/published field, not a command — deliberately NOT exposed here (see `mod.rs`).
 
+use super::actions::TracedRequest;
 use super::{Action, CommandState};
 
 impl CommandState {
@@ -24,6 +25,10 @@ impl CommandState {
     /// Drain a pending move request as `(from_slot, to_slot)`.
     pub fn take_inventory_move(&self) -> Option<(u32, u32)> {
         self.dequeue(&self.inventory.move_req)
+    }
+
+    pub fn take_inventory_move_with_command(&self) -> Option<TracedRequest<(u32, u32)>> {
+        self.dequeue_with_command(&self.inventory.move_req)
     }
 }
 

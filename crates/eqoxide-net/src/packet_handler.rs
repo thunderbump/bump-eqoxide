@@ -1218,7 +1218,7 @@ fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
         let sid = info.spawn_id;
         if gs.automatic_loot && info.npc != 0 && name.to_lowercase().contains("corpse") {
             tracing::info!("EQ: NPC corpse spawned: id={} name={:?} → queuing for loot", sid, name);
-            gs.pending_loot.push_back(sid);
+            gs.pending_loot.push_back(sid.into());
             if gs.loot_queued_at.is_none() {
                 gs.loot_queued_at = Some(std::time::Instant::now());
             }
@@ -2035,7 +2035,7 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
             // doesn't send OP_BecomeCorpse for these deaths — so queue the corpse here. The
             // gameplay loop sends OP_LootRequest after a short delay (loot-empty corpses are a no-op).
             if gs.automatic_loot && killer_id == gs.player_id {
-                gs.pending_loot.push_back(d_id);
+                gs.pending_loot.push_back(d_id.into());
                 if gs.loot_queued_at.is_none() {
                     gs.loot_queued_at = Some(std::time::Instant::now());
                 }
@@ -3335,6 +3335,7 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
         // The corpse never opened — say so honestly (distinct from "Looting complete") instead of
         // letting the auto-loot timer silently declare the session done with zero items (#346).
         let corpse_id = gs.loot_current_corpse.take();
+        gs.loot_command_id = None;
         gs.loot_session_active = false;
         gs.loot_confirmed = false;
         gs.loot_last_activity = None;
@@ -3442,6 +3443,7 @@ fn apply_loot_complete(gs: &mut GameState) {
     // whatever corpse the queue opens next (2) — exactly the branch-2 misattribution #414 reports.
     if gs.loot_defensive_close_at.is_some() {
         let corpse_id = gs.loot_current_corpse.take();
+        gs.loot_command_id = None;
         gs.loot_session_active = false;
         gs.loot_confirmed = false;
         gs.loot_defensive_close_at = None;
@@ -3456,6 +3458,7 @@ fn apply_loot_complete(gs: &mut GameState) {
     // (1) Genuine close — this is the ONLY place "Looting complete" may be emitted.
     if gs.loot_end_requested_at.is_some() {
         let corpse_id = gs.loot_current_corpse.take();
+        gs.loot_command_id = None;
         gs.loot_session_active = false;
         gs.loot_confirmed = false;
         gs.loot_last_activity = None;
@@ -3471,6 +3474,7 @@ fn apply_loot_complete(gs: &mut GameState) {
     // take (LORE / cursor-not-empty / …). Items remain on the corpse; report it honestly.
     if gs.loot_session_active && gs.loot_confirmed {
         let corpse_id = gs.loot_current_corpse.take();
+        gs.loot_command_id = None;
         gs.loot_session_active = false;
         gs.loot_confirmed = false;
         gs.loot_last_activity = None;
@@ -5359,7 +5363,7 @@ mod tests {
         gs.loot_confirmed = false;
         gs.loot_current_corpse = Some(7);
         gs.loot_defensive_close_at = Some(std::time::Instant::now());
-        gs.pending_loot.push_back(11);
+        gs.pending_loot.push_back(11.into());
         let before = gs.messages.len();
 
         super::apply_loot_complete(&mut gs);
@@ -9105,7 +9109,7 @@ mod tests {
         assert_eq!(e.hp_pct, 0.0, "hp_pct must be zeroed");
         assert_eq!(e.pose, Pose::Lying, "animation must be set to 115 (Lying) for dead clip");
         // Auto-loot queued for player's own kill
-        assert!(gs.pending_loot.contains(&42), "corpse id must be queued for auto-loot");
+        assert!(gs.pending_loot.iter().any(|request| request.corpse_id == 42), "corpse id must be queued for auto-loot");
     }
 
     #[test]

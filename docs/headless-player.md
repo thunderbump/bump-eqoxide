@@ -186,6 +186,92 @@ Received chat (including NPC say) carries packet provenance; other game events a
 Outbound local messages are not receipt evidence. `received_self_echo` records a server-returned
 self message with channel/sender/text and `recipient_delivery_confirmed:false`; it does not confirm
 delivery to another player. Legacy self-echo filtering remains unchanged. Received spawn class is exposed as nullable `class_id`.
+
+### Packet trace
+
+`GET /v2/player/packets?after=N&limit=L&opcode=NAME&command=ID&raw=1` uses the same bearer
+token as state, commands, and events. Each session automatically keeps its newest 20,000
+application packets from zone connections, including zone entry. Start with `after=0`, then
+pass the response's `next` as `after` on the next request with the same filters. The cursor
+is a number without a session ID. Reset it to 0 when the state's `session` changes.
+The response pages in increasing `n` order. `limit` defaults to 500 and accepts 1–2000.
+`opcode` matches the exact trace name, such as `OP_TARGET_MOUSE`. `command` matches the
+command ID from the command URL. Unknown query parameters return HTTP 400.
+`gap:true` means some indices after `after` were evicted, regardless of filters.
+
+Each row has a delivery index `n`, capture time `at_ms` on the state's `clock_ms`
+clock, direction `dir` (`in` or `out`), numeric `opcode`, `opcode_name`, `len` in bytes
+including the opcode, `reliable`, `wire_seq`, `command_id`, and decoded `fields`.
+`wire_seq` is null for unreliable packets. For fragmented packets it identifies the first
+outbound fragment or the completing inbound fragment.
+
+Inbound rows carry `arrived_at_ms` on the host clock and a session-wide `arrival_n`
+assigned when the client reads the datagram from the socket, before reordering. Rows
+from the same combined datagram share these values. Fragmented rows use the arrival of
+the completing fragment. A retransmit or duplicate of an inbound reliable packet
+does not create a second row. A datagram carrying a duplicate still consumes an
+arrival index. If the sequence is still buffered, a duplicate can replace the
+buffered payload. When the copies differ, the delivered row pairs the later bytes
+with the first copy's `arrival_n` and `arrived_at_ms`. Socket reads that produce no
+zone row also consume indices. Outbound rows have null arrival fields. Page by `n` and read `arrival_n`
+to recover datagram arrival order.
+
+For an inbound reliable row, `acked_at_ms` records when the socket accepts the first
+cumulative ACK datagram covering its sequence. For a row awaiting ACK, queuing a
+deferred datagram leaves the timestamp null until a successful socket send.
+`ack_seq` is the actual sequence on that ACK, and `ack_exact` is true if it equals `wire_seq`. An immediate ACK is sent before the row
+is captured, so `acked_at_ms` can be at or before `at_ms`. A missing ACK leaves
+`acked_at_ms` and `ack_seq` null and `ack_exact` false. Poll the same cursor range to
+check for an ACK on an existing row. Stop waiting if the stream ends before a covering
+ACK is sent, since the fields can stay null forever. Outbound and unreliable rows have
+the same null ACK fields and false `ack_exact`.
+
+Use `raw=1` to include `payload_hex`, the lowercase hex of the decoded application body
+without the opcode. `payload_truncated` is true whenever the body exceeded the retained
+512-byte prefix. The 20,000-row ring retains at most 10,240,000 raw payload bytes
+(about 9.77 MiB), plus record metadata and allocation overhead. A 2,000-row response
+contains at most 2,048,000 hex characters.
+
+Decoded `fields` use raw wire values. Positions are in x/y/z order and keep wire-datum z.
+Headings use the raw protocol units.
+
+| Opcode | Direction | Fields |
+| --- | --- | --- |
+| `OP_ZONE_ENTRY` (0x5089) | Inbound | `entity`, `name`, `position`, `heading` |
+| `OP_NEW_SPAWN` (0x6097) | Inbound | `entity`, `name`, `npc`, `hp_percent`, `position`, `heading` |
+| `OP_CLIENT_UPDATE` (0x7dfc) | Inbound | `entity`, `position`, `heading` |
+| `OP_CLIENT_UPDATE` (0x7dfc) | Outbound | `sequence`, `position`, `delta`, `animation`, `heading` |
+| `OP_TARGET_COMMAND` (0x58e2) | Both | `target_id` |
+| `OP_TARGET_MOUSE` | Outbound | `target_id` |
+| `OP_DAMAGE` (0x6f15) | Inbound | `target`, `source`, `type`, `spell`, signed `damage` |
+| `OP_MOB_HEALTH` (0x37b1) | Inbound | `entity`, `percent` |
+| `OP_DELETE_SPAWN` (0x7280) | Inbound | `entity` |
+
+Outbound `OP_CLIENT_UPDATE` uses the payload's own 16-bit `sequence` counter.
+Its unreliable transport `wire_seq` is null. The `OP_NEW_SPAWN` `npc` byte uses
+0 for a player, 1 for an NPC, 2 for a player's corpse, and 3 for an NPC's corpse.
+Other opcodes have empty `fields`.
+
+The network owner tags outbound packets emitted by a command drain, including
+awaited merchant open and buy. The explicit loot command ID
+follows its corpse queue entry and tags the open, item takes, and close. A movement
+command tags the position updates it drives, including keepalives while it is active
+and the rest update at its end. Correction re-streams and position windows influenced
+by multiple motion commands have a null `command_id`, as do unowned position updates,
+automatic loot, and inbound packets. Outbound rows record send attempts. Reliable retransmits reuse the original wire bytes and increment
+transport counters without adding another application row.
+
+The response's `counters` cover login, world, and zone transport. They come from one
+snapshot of the trace. `sent` counts successful UDP sends, including control traffic.
+`resent` counts successful repeat sends of datagrams that already reached the socket.
+`received` counts UDP datagrams before decoding. `dropped_unretried` counts terminal
+send failures, deferred control packets discarded by the queue or at teardown, and
+reliable datagrams abandoned at teardown that never reached the socket.
+`sequence_gaps` counts runs of missing incoming reliable sequences when they first
+appear. Contiguous future packets and later fills of an existing hole keep the same count.
+
+### Loot evidence
+
 Automatic corpse looting and automatic zone-line requests are disabled for CPU sessions.
 Only explicit `loot` requests begin looting, including for the character's own kills. The ordinary
 flow requests each received corpse catalog slot once, one item at a time. An unacknowledged take

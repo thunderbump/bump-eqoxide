@@ -261,7 +261,7 @@ async fn run_login_handshake(
                     drop(stream);
                     sleep(Duration::from_millis(800)).await;
                     tracing::info!("EQ: connecting to zone {}:{}", host, port);
-                    stream = EqStream::connect(&host, port, net_tx.clone(), net_health.clone())
+                    stream = EqStream::connect_zone(&host, port, net_tx.clone(), net_health.clone())
                         .await
                         .map_err(|e| format!("Zone connection failed: {e}"))?;
                     // Purge stale spawns/doors before zone entry so the OP_ZoneSpawns/OP_SpawnDoor

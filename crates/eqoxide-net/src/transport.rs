@@ -2,16 +2,29 @@
 //!
 //! Ported from the Python reference at eq_client/connection/stream.py.
 
+use super::packet_telemetry::{
+    self, Dir, PacketArrival, ReceiveEvidence, SessionTrace, SESSION_PACKET_CAPACITY,
+};
+use super::protocol::*;
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use eqoxide_ipc::SessionDropCause;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use super::protocol::*;
-use eqoxide_ipc::SessionDropCause;
+tokio::task_local! {
+    static PACKET_TRACE: SessionTrace;
+}
+
+/// Login, world, and zone streams opened by this owner share a single headless trace.
+pub async fn with_packet_trace<F: Future>(trace: SessionTrace, session: F) -> F::Output {
+    PACKET_TRACE.scope(trace, session).await
+}
 
 /// Upper bound on datagrams drained (and ACKed) per `poll_recv` call. Generous enough to clear a
 /// zone-in spawn burst in one wake, but bounded so a sustained flood can't monopolize the loop —
@@ -391,6 +404,18 @@ struct Sent {
     datagram: Vec<u8>,
     sent_at: Instant,
     retries: u32,
+    transmitted: bool,
+}
+
+struct OrderedDatagram {
+    bytes: Vec<u8>,
+    is_fragment: bool,
+    arrival: Option<PacketArrival>,
+}
+
+struct ControlDatagram {
+    bytes: Vec<u8>,
+    ack_seq: Option<u16>,
 }
 
 /// Is this send error transient — i.e. would the very same datagram plausibly go out if we simply
@@ -468,7 +493,7 @@ pub struct EqStream {
     peer: SocketAddr,
     send_seq: u16,
     next_recv_seq: u16,
-    recv_buf: HashMap<u16, (Vec<u8>, bool)>, // seq → (data, is_fragment)
+    recv_buf: HashMap<u16, OrderedDatagram>,
     /// Sent-but-unACKed reliable datagrams, in send order, retransmitted on OP_OutOfOrder / timeout
     /// until the server ACKs their sequence (#254). Cumulative OP_ACK pops from the front.
     sent: VecDeque<Sent>,
@@ -489,7 +514,7 @@ pub struct EqStream {
     /// CONTROL ONLY. The unreliable `OP_ClientUpdate` firehose is deliberately not deferred — a
     /// stale position is arguably worse than a missing one — but that is a judgement, not a
     /// measurement, and it is tracked as #655 rather than settled here.
-    pending_control: VecDeque<Vec<u8>>,
+    pending_control: VecDeque<ControlDatagram>,
     /// TEST-ONLY fault injection (#641): the next N `transmit` calls behave as though the kernel
     /// refused the datagram with `EAGAIN`, without touching the socket. There is no portable,
     /// deterministic way to make a real `send(2)` on a connected UDP socket return `EAGAIN` from a
@@ -513,6 +538,10 @@ pub struct EqStream {
     /// four loops didn't mirror, so a >15s world reconnect reported `connected: false` on a healthy
     /// link. Whoever receives the datagram owns the clock — a future loop gets this for free.
     net_health: eqoxide_ipc::NetHealthShared,
+    packet_trace: Option<SessionTrace>,
+    capture_zone_packets: bool,
+    pending_packet_acks: VecDeque<(u16, u64)>,
+    incoming_high_water: Option<u16>,
 }
 
 impl EqStream {
@@ -521,6 +550,25 @@ impl EqStream {
         port: u16,
         app_tx: mpsc::UnboundedSender<AppPacket>,
         net_health: eqoxide_ipc::NetHealthShared,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::connect_stream(host, port, app_tx, net_health, false).await
+    }
+
+    pub(crate) async fn connect_zone(
+        host: &str,
+        port: u16,
+        app_tx: mpsc::UnboundedSender<AppPacket>,
+        net_health: eqoxide_ipc::NetHealthShared,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::connect_stream(host, port, app_tx, net_health, true).await
+    }
+
+    async fn connect_stream(
+        host: &str,
+        port: u16,
+        app_tx: mpsc::UnboundedSender<AppPacket>,
+        net_health: eqoxide_ipc::NetHealthShared,
+        capture_zone_packets: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let peer: SocketAddr = format!("{}:{}", host, port).parse()?;
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -539,6 +587,10 @@ impl EqStream {
             force_send_refusals: std::cell::Cell::new(0),
             frags: FragmentBuffer::new(),
             net_health,
+            packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
+            capture_zone_packets,
+            pending_packet_acks: VecDeque::new(),
+            incoming_high_water: None,
             app_tx,
         };
 
@@ -636,12 +688,12 @@ impl EqStream {
                     // an asterisk on it is how it rots back into #343 (review). `last_tick` is bumped
                     // alongside it (#477): a datagram arriving mid-handshake is proof the net thread
                     // is alive and progressing, so the liveness clock must not be allowed to go stale.
+                    let now = Instant::now();
                     let mut h = stream.net_health.lock().unwrap();
-                    let now = std::time::Instant::now();
                     h.last_datagram = now;
                     h.last_tick = now;
                     drop(h);
-                    stream.on_raw_recv(&recv_buf[..n]);
+                    stream.on_raw_recv_at(&recv_buf[..n], now);
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => {} // recv timeout, keep waiting
@@ -665,11 +717,20 @@ impl EqStream {
 
     /// Send an application-level EQ packet (2-byte LE opcode + payload).
     pub fn send_app_packet(&mut self, opcode: u16, payload: &[u8]) {
+        self.send_app_packet_with_command(opcode, payload, None);
+    }
+
+    /// The drain passes the ID carried by this request. Retries replay datagrams without making
+    /// another app trace row, and tick-driven sends have no mailbox command to attribute.
+    pub(crate) fn send_app_packet_with_command(
+        &mut self,
+        opcode: u16,
+        payload: &[u8],
+        command: Option<&Arc<str>>,
+    ) {
         // Telemetry boundary (#525): record BEFORE send_reliable assigns the sequence, so `send_seq`
         // is the sequence this packet's first datagram will carry. Zero cost when disabled.
-        super::packet_telemetry::capture(
-            super::packet_telemetry::Dir::Out, opcode, payload, true, Some(self.send_seq),
-        );
+        self.capture_app(Dir::Out, opcode, payload, Some(self.send_seq), command, ReceiveEvidence::default());
         let mut app_data = Vec::with_capacity(2 + payload.len());
         app_data.write_u16::<byteorder::LittleEndian>(opcode).unwrap();
         app_data.extend_from_slice(payload);
@@ -712,10 +773,17 @@ impl EqStream {
     /// more a client moves, the more reliable position packets it sends and the sooner one is lost
     /// (eqoxide#127). Only valid for opcodes whose low byte is non-zero (the raw-app-packet marker).
     pub fn send_app_packet_unreliable(&mut self, opcode: u16, payload: &[u8]) -> std::io::Result<()> {
-        // Telemetry boundary (#525): unreliable — no sequence number. Zero cost when disabled.
-        super::packet_telemetry::capture(
-            super::packet_telemetry::Dir::Out, opcode, payload, false, None,
-        );
+        self.send_app_packet_unreliable_with_command(opcode, payload, None)
+    }
+
+    pub(crate) fn send_app_packet_unreliable_with_command(
+        &mut self,
+        opcode: u16,
+        payload: &[u8],
+        command: Option<&Arc<str>>,
+    ) -> std::io::Result<()> {
+        // Telemetry boundary (#525): unreliable — no sequence number.
+        self.capture_app(Dir::Out, opcode, payload, None, command, ReceiveEvidence::default());
         debug_assert!(opcode & 0xFF != 0, "raw app packets need a non-zero low opcode byte");
         let body = encode_raw_app(
             opcode, payload,
@@ -727,7 +795,30 @@ impl EqStream {
         // `send_failures` and `send_failures_unretried` by `transmit`. This is the one send class
         // where "it did not go out" is genuinely unrecoverable at the transport layer, which is
         // exactly why it must be observable rather than discarded.
-        self.transmit(&datagram, SendRetry::None)
+        self.transmit(&datagram, SendRetry::None, false)
+    }
+
+    fn capture_app(
+        &mut self,
+        dir: Dir,
+        opcode: u16,
+        payload: &[u8],
+        wire_seq: Option<u16>,
+        command: Option<&Arc<str>>,
+        receive: ReceiveEvidence,
+    ) {
+        packet_telemetry::capture(dir, opcode, payload, wire_seq.is_some(), wire_seq);
+        // Opcode names and field layouts on this route are for the zone protocol.
+        if let Some(trace) = self.packet_trace.as_ref().filter(|_| self.capture_zone_packets) {
+            let awaiting_ack = receive.acked_at.is_none();
+            let n = trace.capture_with_receive(dir, opcode, payload, wire_seq, command.cloned(), receive);
+            if let (Dir::In, Some(seq), true) = (dir, wire_seq, awaiting_ack) {
+                if self.pending_packet_acks.len() == SESSION_PACKET_CAPACITY {
+                    self.pending_packet_acks.pop_front();
+                }
+                self.pending_packet_acks.push_back((seq, n));
+            }
+        }
     }
 
     /// Poll for incoming data. Non-blocking. Returns false if the socket is closed.
@@ -753,8 +844,9 @@ impl EqStream {
                 Ok(n) => {
                     // Link liveness (#343): ANY datagram, stamped BEFORE decode so session-layer
                     // ACKs/keepalives — which never become application packets — still count.
-                    self.net_health.lock().unwrap().last_datagram = std::time::Instant::now();
-                    self.on_raw_recv(&buf[..n]);
+                    let now = Instant::now();
+                    self.net_health.lock().unwrap().last_datagram = now;
+                    self.on_raw_recv_at(&buf[..n], now);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
                 // #642: a non-WouldBlock recv error on a CONNECTED UDP socket is the documented
@@ -822,9 +914,13 @@ impl EqStream {
             // The entry stays in `self.sent` with its backoff advanced, so the very next due pass
             // re-sends this same datagram — the recovery is this loop itself, and there is no caller
             // above it to hand an error to. Not silent: `transmit` stamps `NetHealth` + WARNs.
-            if let Err(e) = self.transmit(&self.sent[i].datagram, SendRetry::Retransmitted) {
-                tracing::debug!("NET: retransmit of seq {} failed ({:?}); will retry on the next \
-                                 backoff pass (#612)", self.sent[i].seq, e.kind());
+            let packet = &self.sent[i];
+            match self.transmit(&packet.datagram, SendRetry::Retransmitted, packet.transmitted) {
+                Ok(()) => self.sent[i].transmitted = true,
+                Err(e) => tracing::debug!(
+                    "NET: retransmit of seq {} failed ({:?}); will retry on the next backoff pass (#612)",
+                    packet.seq, e.kind(),
+                ),
             }
             self.sent[i].sent_at = now;
             self.sent[i].retries = self.sent[i].retries.saturating_add(1);
@@ -863,7 +959,7 @@ impl EqStream {
         raw.extend_from_slice(&payload);
         raw = self.append_crc(raw);
         self.flush_pending_control();
-        self.transmit(&raw, SendRetry::None)
+        self.transmit(&raw, SendRetry::None, false)
     }
 
     // ── Internal send helpers ─────────────────────────────────────────────────
@@ -916,7 +1012,7 @@ impl EqStream {
     /// It is deliberately ONE retry, not a loop: a genuine `EAGAIN` must stay observable rather
     /// than being spun on inside a non-blocking send path, and the tick retry is the recovery.
     #[must_use = "a send outcome must be handled — discarding it is the #612 agent-honesty bug"]
-    fn transmit(&self, datagram: &[u8], retry: SendRetry) -> std::io::Result<()> {
+    fn transmit(&self, datagram: &[u8], retry: SendRetry, is_resend: bool) -> std::io::Result<()> {
         #[cfg(test)]
         let attempt: std::io::Result<usize> = if self.force_send_refusals.get() > 0 {
             self.force_send_refusals.set(self.force_send_refusals.get() - 1);
@@ -927,7 +1023,12 @@ impl EqStream {
         #[cfg(not(test))]
         let attempt = self.attempt_send(datagram);
         match attempt {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Some(trace) = &self.packet_trace {
+                    trace.record_send(is_resend);
+                }
+                Ok(())
+            }
             Err(e) => self.record_send_failure(datagram, retry, e),
         }
     }
@@ -1000,6 +1101,9 @@ impl EqStream {
             h.last_send_error_at = Some(now);
             (loud, h.send_failures)
         };
+        if retry != SendRetry::Retransmitted {
+            self.record_packet_drops(1);
+        }
         // The log is only the OPERATOR's copy; `NetHealth` is the AGENT's, and it is stamped
         // unconditionally above. Suppressing a log line therefore never suppresses a fact —
         // that separation is what makes rate-limiting safe here (#612).
@@ -1026,8 +1130,11 @@ impl EqStream {
     /// the same discipline `poll_resend` relies on — and again before any new control send.
     fn flush_pending_control(&mut self) {
         while let Some(front) = self.pending_control.front() {
-            match self.transmit(front, SendRetry::Deferred) {
-                Ok(()) => {}
+            let ack_seq = front.ack_seq;
+            match self.transmit(&front.bytes, SendRetry::Deferred, false) {
+                Ok(()) => {
+                    self.record_packet_ack(ack_seq);
+                }
                 // Still refused. It must stay at the FRONT — popping and re-pushing would reorder it
                 // behind anything queued in between — and we stop, so nothing overtakes it.
                 Err(ref e) if is_transient(e) => return,
@@ -1051,7 +1158,7 @@ impl EqStream {
     /// and the queue was already non-empty). Counting in `record_send_failure` instead made the
     /// number grow with the DURATION of an outage rather than with the number of datagrams delayed:
     /// one stuck datagram re-attempted on three ticks read as `3` (#641 review, finding 1).
-    fn defer_control(&mut self, datagram: Vec<u8>) {
+    fn defer_control(&mut self, datagram: ControlDatagram) {
         // Drop the OLDEST on overflow, not the newest: `OP_ACK` is cumulative, so a later ACK
         // supersedes an earlier one, and the freshest control datagram is the one worth keeping.
         // The evicted one IS a genuine loss — nothing will ever re-send it — so it is counted as one.
@@ -1072,6 +1179,7 @@ impl EqStream {
             h.record_send_pressure(std::time::Instant::now());
         }
         if overflowed {
+            self.record_packet_drops(1);
             tracing::warn!(
                 "NET: control-send retry queue full ({} datagrams) — dropped the oldest; the \
                  socket has been refusing sends for an unusually long time (#641)",
@@ -1093,21 +1201,52 @@ impl EqStream {
     ///
     /// `send_session_disconnect` deliberately does NOT come through here — see its doc comment.
     fn send_raw(&mut self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+        self.send_control(opcode, payload, None).map(|_| ())
+    }
+
+    fn send_control(
+        &mut self,
+        opcode: u8,
+        payload: &[u8],
+        ack_seq: Option<u16>,
+    ) -> std::io::Result<Option<Instant>> {
         let mut raw = vec![0x00, opcode];
         raw.extend_from_slice(payload);
-        raw = self.append_crc(raw);
+        let datagram = ControlDatagram { bytes: self.append_crc(raw), ack_seq };
         // Drain first so a queued datagram cannot end up on the wire AFTER one built later.
         self.flush_pending_control();
         if !self.pending_control.is_empty() {
-            self.defer_control(raw);
-            return Ok(());
+            self.defer_control(datagram);
+            return Ok(None);
         }
-        match self.transmit(&raw, SendRetry::Deferred) {
+        match self.transmit(&datagram.bytes, SendRetry::Deferred, false) {
+            Ok(()) => Ok(self.record_packet_ack(ack_seq)),
             Err(e) if is_transient(&e) => {
-                self.defer_control(raw);
-                Ok(())
+                self.defer_control(datagram);
+                Ok(None)
             }
-            other => other,
+            Err(e) => Err(e),
+        }
+    }
+
+    fn record_packet_ack(&mut self, ack_seq: Option<u16>) -> Option<Instant> {
+        let ack_seq = ack_seq?;
+        let trace = self.packet_trace.as_ref().filter(|_| self.capture_zone_packets)?;
+        let at = Instant::now();
+        // The cumulative ACK also covers earlier delivered rows whose own ACK was queued or
+        // lost. Both the row index and the pending queue belong to this stream's sequence space.
+        let covered = self.pending_packet_acks.iter()
+            .take_while(|&&(seq, _)| seq_leq(seq, ack_seq))
+            .count();
+        if covered > 0 {
+            trace.mark_acked(self.pending_packet_acks.drain(..covered).map(|(_, n)| n), ack_seq, at);
+        }
+        Some(at)
+    }
+
+    fn record_packet_drops(&self, count: u64) {
+        if let Some(trace) = &self.packet_trace {
+            trace.record_drop(count);
         }
     }
 
@@ -1135,15 +1274,16 @@ impl EqStream {
         }
     }
 
-    /// DELIBERATE (#612): a failed ACK is counted by `transmit` (and lands in
-    /// `send_failures_unretried` — we never re-send this datagram) but is not propagated. There is
-    /// no honest error to hand the inbound-dispatch path here, and the recovery is the server's:
-    /// an un-ACKed reliable is retransmitted by ITS resend window, which re-triggers this ACK.
-    fn send_ack(&mut self, seq: u16) {
-        let seq_bytes = seq.to_be_bytes();
-        if let Err(e) = self.send_raw(OP_ACK, &self.encode(seq_bytes.as_ref())) {
-            tracing::debug!("NET: ACK for seq {} did not reach the wire ({:?}); the server will \
-                             retransmit and we will re-ACK (#612)", seq, e.kind());
+    /// A transient send failure queues this ACK. A permanent loss leaves the corresponding
+    /// trace rows pending until a later cumulative ACK gets through.
+    fn send_ack(&mut self, seq: u16) -> Option<Instant> {
+        match self.send_control(OP_ACK, &self.encode(&seq.to_be_bytes()), Some(seq)) {
+            Ok(at) => at,
+            Err(e) => {
+                tracing::debug!("NET: ACK for seq {} did not reach the wire ({:?}); the server will \
+                                 retransmit and we will re-ACK (#612)", seq, e.kind());
+                None
+            }
         }
     }
 
@@ -1215,12 +1355,14 @@ impl EqStream {
         let mut raw = vec![0x00, opcode];
         raw.extend_from_slice(encoded_inner);
         let datagram = self.append_crc(raw);
-        let outcome = self.transmit(&datagram, SendRetry::Retransmitted);
+        let outcome = self.transmit(&datagram, SendRetry::Retransmitted, false);
         // Pushed to the resend window on FAILURE too — deliberately, and this is the reason the
         // reliable path can honestly report a failed send without it meaning "lost" (#612): a
         // datagram that never reached the socket is in exactly the same position as one lost in
         // flight, and `poll_resend`'s go-back-N re-sends it verbatim until the server ACKs it.
-        self.sent.push_back(Sent { seq, datagram, sent_at: Instant::now(), retries: 0 });
+        self.sent.push_back(Sent {
+            seq, datagram, sent_at: Instant::now(), retries: 0, transmitted: outcome.is_ok(),
+        });
         outcome
     }
 
@@ -1290,7 +1432,13 @@ impl EqStream {
 
     // ── Receive dispatch ──────────────────────────────────────────────────────
 
+    #[cfg(test)]
     fn on_raw_recv(&mut self, data: &[u8]) {
+        self.on_raw_recv_at(data, Instant::now());
+    }
+
+    fn on_raw_recv_at(&mut self, data: &[u8], at: Instant) {
+        let arrival = self.packet_trace.as_ref().map(|trace| trace.record_receive(at));
         // Strip the outer CRC that trails every datagram.
         let body_end = data.len().saturating_sub(self.session.crc_bytes as usize);
         let body = &data[..body_end];
@@ -1314,18 +1462,18 @@ impl EqStream {
             ) {
                 // Telemetry boundary (#525): raw unreliable app packet (e.g. NPC position
                 // broadcasts) — no reliable sequence. Zero cost when disabled.
-                super::packet_telemetry::capture(
-                    super::packet_telemetry::Dir::In, opcode, &payload, false, None,
-                );
+                self.capture_app(Dir::In, opcode, &payload, None, None, ReceiveEvidence {
+                    arrival, acked_at: None,
+                });
                 let _ = self.app_tx.send(AppPacket { opcode, payload });
             }
             return;
         }
 
-        self.dispatch_transport(body[1], &body[2..]);
+        self.dispatch_transport(body[1], &body[2..], arrival);
     }
 
-    fn dispatch_transport(&mut self, opcode: u8, payload: &[u8]) {
+    fn dispatch_transport(&mut self, opcode: u8, payload: &[u8], arrival: Option<PacketArrival>) {
         match opcode {
             OP_SESSION_RESPONSE => self.handle_session_response(payload),
             // DELIBERATE (#612): session-layer replies to the server's own probes. Counted +
@@ -1333,12 +1481,12 @@ impl EqStream {
             // server re-probes on its own cadence.
             OP_KEEPALIVE => { let _ = self.send_raw(OP_KEEPALIVE, &[]); }
             OP_STAT_REQUEST => { let _ = self.send_raw(OP_STAT_RESPONSE, payload); }
-            OP_COMBINED => self.handle_transport_combined(payload),
-            OP_PACKET => self.handle_packet(payload),
+            OP_COMBINED => self.handle_transport_combined(payload, arrival),
+            OP_PACKET => self.handle_packet(payload, arrival),
             OP_FRAGMENT | OP_FRAGMENT_CONT | OP_FRAGMENT_CONT2 | OP_FRAGMENT_CONT3 => {
-                self.handle_fragment(payload);
+                self.handle_fragment(payload, arrival);
             }
-            OP_APP_COMBINED => self.handle_combined(payload),
+            OP_APP_COMBINED => self.handle_combined(payload, arrival),
             // Inbound reliability control (#254). Both carry an encoded BE u16 sequence, framed like a
             // reliable packet's seq — decode the same way ordered packets are decoded.
             OP_ACK => {
@@ -1371,11 +1519,11 @@ impl EqStream {
     /// decode their body must be handled here WITHOUT decoding, since the combined body was decoded
     /// once already. Everything else (session-response/keepalive/stat/nested-combined) does not decode
     /// its body, so it can share `dispatch_transport` unchanged. (#302)
-    fn handle_predecoded_transport(&mut self, opcode: u8, payload: &[u8]) {
+    fn handle_predecoded_transport(&mut self, opcode: u8, payload: &[u8], arrival: Option<PacketArrival>) {
         match opcode {
-            OP_PACKET => self.handle_ordered_decoded(payload, false),
+            OP_PACKET => self.handle_ordered_decoded(payload, false, arrival),
             OP_FRAGMENT | OP_FRAGMENT_CONT | OP_FRAGMENT_CONT2 | OP_FRAGMENT_CONT3 => {
-                self.handle_ordered_decoded(payload, true);
+                self.handle_ordered_decoded(payload, true, arrival);
             }
             OP_ACK => {
                 if payload.len() >= 2 { self.ack_up_to(u16::from_be_bytes([payload[0], payload[1]])); }
@@ -1384,7 +1532,7 @@ impl EqStream {
                 if payload.len() >= 2 { self.on_out_of_order(u16::from_be_bytes([payload[0], payload[1]])); }
             }
             // Non-decoding transport opcodes are safe to route through the standard dispatch.
-            _ => self.dispatch_transport(opcode, payload),
+            _ => self.dispatch_transport(opcode, payload, arrival),
         }
     }
 
@@ -1417,7 +1565,7 @@ impl EqStream {
     /// still encoded, so decode once then process. (A reliable arriving as an OP_Combined SUB is
     /// already plaintext — see `handle_ordered_decoded`, called directly from the combined handler,
     /// to avoid decoding it a second time. #302.)
-    fn handle_ordered(&mut self, payload: &[u8], is_fragment: bool) {
+    fn handle_ordered(&mut self, payload: &[u8], is_fragment: bool, arrival: Option<PacketArrival>) {
         if payload.len() < 2 {
             return;
         }
@@ -1425,32 +1573,57 @@ impl EqStream {
             Some(d) => d,
             None => return,
         };
-        self.handle_ordered_decoded(&decoded, is_fragment);
+        self.handle_ordered_decoded(&decoded, is_fragment, arrival);
     }
 
     /// Process an ALREADY-DECODED reliable inner (`seq(BE u16) + data`): classify by sequence, ACK,
     /// and deliver in order. Shared by the standalone path (after one decode) and the OP_Combined
     /// sub-packet path (subs are already plaintext). (#302)
-    fn handle_ordered_decoded(&mut self, decoded: &[u8], is_fragment: bool) {
+    fn handle_ordered_decoded(&mut self, decoded: &[u8], is_fragment: bool, arrival: Option<PacketArrival>) {
         if decoded.len() < 2 {
             return;
         }
         let seq = Cursor::new(&decoded[..2]).read_u16::<BigEndian>().unwrap();
-        let data = decoded[2..].to_vec();
+        let packet = OrderedDatagram { bytes: decoded[2..].to_vec(), is_fragment, arrival };
 
         match classify_seq(seq, self.next_recv_seq) {
             SeqClass::Deliver => {
                 self.next_recv_seq = self.next_recv_seq.wrapping_add(1);
-                self.deliver_seq(seq, data, is_fragment);
+                self.deliver_seq(seq, packet);
                 // Drain buffered continuations
-                while let Some((ndata, nfrag)) = self.recv_buf.remove(&self.next_recv_seq) {
+                while let Some(buffered) = self.recv_buf.remove(&self.next_recv_seq) {
                     let nseq = self.next_recv_seq;
                     self.next_recv_seq = self.next_recv_seq.wrapping_add(1);
-                    self.deliver_seq(nseq, ndata, nfrag);
+                    self.deliver_seq(nseq, buffered);
+                }
+                if self.recv_buf.is_empty() {
+                    self.incoming_high_water = None;
                 }
             }
             SeqClass::Future => {
-                self.recv_buf.insert(seq, (data, is_fragment));
+                if let Some(trace) = &self.packet_trace {
+                    let distance = seq.wrapping_sub(self.next_recv_seq);
+                    let high_water = self.incoming_high_water
+                        .map(|high| high.wrapping_sub(self.next_recv_seq));
+                    if high_water.is_none_or(|high| distance > high) {
+                        // A forward jump exposes a new run of missing sequences. A contiguous
+                        // future packet extends the same buffered run, and fills behind it
+                        // cannot cause a new hole.
+                        if high_water.is_none_or(|high| distance.saturating_sub(high) > 1) {
+                            trace.record_sequence_gap();
+                        }
+                        self.incoming_high_water = Some(seq);
+                    }
+                }
+                // Keep the first socket arrival while preserving the existing payload
+                // replacement and ACK behavior for a buffered retransmission.
+                let buffered = self.recv_buf.entry(seq).or_insert(OrderedDatagram {
+                    bytes: Vec::new(),
+                    is_fragment,
+                    arrival,
+                });
+                buffered.bytes = packet.bytes;
+                buffered.is_fragment = is_fragment;
                 // Mirror the server's own receive path (EQEmu `eqemu:common/net/reliable_stream_connection.cpp@7ab909ee4:715`,
                 // `SendOutOfOrderAck(stream_id, sequence)`): on a gap, immediately OutOfOrderAck the
                 // out-of-order packet we just BUFFERED. The server's `OutOfOrderAck` handler drops that
@@ -1482,32 +1655,34 @@ impl EqStream {
                 // the lower duplicate seq would under-acknowledge. (`Duplicate` only arises after at
                 // least one in-order delivery, so `next_recv_seq >= 1` and the `wrapping_sub(1)` is a
                 // real prior seq, never a bogus 0xFFFF.) (#463)
-                self.send_ack(self.next_recv_seq.wrapping_sub(1));
+                let _ = self.send_ack(self.next_recv_seq.wrapping_sub(1));
             }
         }
     }
 
-    fn deliver_seq(&mut self, seq: u16, data: Vec<u8>, is_fragment: bool) {
-        self.send_ack(seq);
-        if is_fragment {
+    fn deliver_seq(&mut self, seq: u16, packet: OrderedDatagram) {
+        // Preserve the immediate ACK's timestamp for the row emitted just below. If the socket
+        // refused it, capture leaves the timestamp empty until a successful ACK covers the row.
+        let receive = ReceiveEvidence { arrival: packet.arrival, acked_at: self.send_ack(seq) };
+        if packet.is_fragment {
             // A fragment group spans several reliable seqs; the completing seq is recorded (#525).
-            if let Some(complete) = self.frags.add(&data, !self.frags.in_progress()) {
-                self.dispatch_app(&complete, Some(seq));
+            if let Some(complete) = self.frags.add(&packet.bytes, !self.frags.in_progress()) {
+                self.dispatch_app(&complete, Some(seq), receive);
             }
         } else {
-            self.dispatch_app(&data, Some(seq));
+            self.dispatch_app(&packet.bytes, Some(seq), receive);
         }
     }
 
-    fn handle_packet(&mut self, payload: &[u8]) {
-        self.handle_ordered(payload, false);
+    fn handle_packet(&mut self, payload: &[u8], arrival: Option<PacketArrival>) {
+        self.handle_ordered(payload, false, arrival);
     }
 
-    fn handle_fragment(&mut self, payload: &[u8]) {
-        self.handle_ordered(payload, true);
+    fn handle_fragment(&mut self, payload: &[u8], arrival: Option<PacketArrival>) {
+        self.handle_ordered(payload, true, arrival);
     }
 
-    fn handle_transport_combined(&mut self, payload: &[u8]) {
+    fn handle_transport_combined(&mut self, payload: &[u8], arrival: Option<PacketArrival>) {
         let payload = match self.decode(payload) {
             Some(d) => d,
             None => return,
@@ -1532,16 +1707,16 @@ impl EqStream {
                     // WITHOUT re-decoding; routing them through `dispatch_transport` (which decodes
                     // again) double-decodes the sub → a corrupt seq → the reliable is never ACKed →
                     // the server's resend_timeout (30s) closes the session (idle linkdead, #302).
-                    self.handle_predecoded_transport(sub[1], &sub[2..]);
+                    self.handle_predecoded_transport(sub[1], &sub[2..], arrival);
                 } else {
-                    self.dispatch_app(sub, None);
+                    self.dispatch_app(sub, None, ReceiveEvidence { arrival, acked_at: None });
                 }
             }
             offset += sub_len;
         }
     }
 
-    fn handle_combined(&mut self, payload: &[u8]) {
+    fn handle_combined(&mut self, payload: &[u8], arrival: Option<PacketArrival>) {
         let mut offset = 0;
         while offset < payload.len() {
             let mut sub_len = payload[offset] as usize;
@@ -1553,7 +1728,7 @@ impl EqStream {
             if offset + sub_len > payload.len() {
                 break;
             }
-            self.dispatch_app(&payload[offset..offset + sub_len], None);
+            self.dispatch_app(&payload[offset..offset + sub_len], None, ReceiveEvidence { arrival, acked_at: None });
             offset += sub_len;
         }
     }
@@ -1562,15 +1737,13 @@ impl EqStream {
     /// this packet was delivered under (`Some` on the ordered reliable path via `deliver_seq`,
     /// `None` for sub-packets pulled from an OP_Combined bundle — those are not individually
     /// sequenced). Used only for telemetry (#525); the app dispatch is unaffected.
-    fn dispatch_app(&mut self, data: &[u8], rel_seq: Option<u16>) {
+    fn dispatch_app(&mut self, data: &[u8], rel_seq: Option<u16>, receive: ReceiveEvidence) {
         if data.len() < 2 {
             return;
         }
         let opcode = Cursor::new(&data[..2]).read_u16::<byteorder::LittleEndian>().unwrap();
         // Telemetry boundary (#525): reliable iff we know a sequence for it. Zero cost when disabled.
-        super::packet_telemetry::capture(
-            super::packet_telemetry::Dir::In, opcode, &data[2..], rel_seq.is_some(), rel_seq,
-        );
+        self.capture_app(Dir::In, opcode, &data[2..], rel_seq, None, receive);
         let payload = data[2..].to_vec();
         let _ = self.app_tx.send(AppPacket { opcode, payload });
     }
@@ -1630,6 +1803,7 @@ impl EqStream {
                 h.send_failures = h.send_failures.saturating_add(pending);
                 h.send_failures_unretried = h.send_failures_unretried.saturating_add(pending);
             }
+            self.record_packet_drops(pending);
             tracing::warn!(
                 "NET: session ended with {} session-control datagram(s) still queued for retry — \
                  these are NOT sent (#641)",
@@ -1641,6 +1815,10 @@ impl EqStream {
         }
         let abandoned = self.sent.len() as u64;
         let oldest = self.sent[0].seq;
+        if self.packet_trace.is_some() {
+            let never_sent = self.sent.iter().filter(|packet| !packet.transmitted).count() as u64;
+            self.record_packet_drops(never_sent);
+        }
         self.sent.clear();
         // `Drop` can run while a panic is unwinding, and a poisoned mutex must not turn a bad
         // situation into a double panic — so this is the one place that tolerates a failed lock.
@@ -1720,6 +1898,10 @@ pub(crate) async fn test_stream_with_health(
         force_send_refusals: std::cell::Cell::new(0),
         frags: FragmentBuffer::new(),
         net_health,
+        packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
+        capture_zone_packets: true,
+        pending_packet_acks: VecDeque::new(),
+        incoming_high_water: None,
         app_tx: tx,
     };
     (stream, rx)
@@ -1728,8 +1910,8 @@ pub(crate) async fn test_stream_with_health(
 /// An `EqStream` wired to a REAL local peer socket, so a test can actually deliver a datagram to it
 /// and drive `poll_recv`'s receive path end-to-end. Returns the stream, its app-packet receiver, the
 /// peer socket, and the address to send to. (#343)
-#[cfg(test)]
-pub(crate) async fn test_stream_with_peer(
+#[cfg(any(test, feature = "test-fixtures"))]
+pub async fn test_stream_with_peer(
     net_health: eqoxide_ipc::NetHealthShared,
 ) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>, UdpSocket, SocketAddr) {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -1747,9 +1929,14 @@ pub(crate) async fn test_stream_with_peer(
         recv_buf: HashMap::new(),
         sent: VecDeque::new(),
         pending_control: VecDeque::new(),
+        #[cfg(test)]
         force_send_refusals: std::cell::Cell::new(0),
         frags: FragmentBuffer::new(),
         net_health,
+        packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
+        capture_zone_packets: true,
+        pending_packet_acks: VecDeque::new(),
+        incoming_high_water: None,
         app_tx: tx,
     };
     (stream, rx, peer_sock, stream_addr)
@@ -1782,6 +1969,10 @@ pub(crate) async fn test_stream_with_peer_encoded(
         force_send_refusals: std::cell::Cell::new(0),
         frags: FragmentBuffer::new(),
         net_health,
+        packet_trace: PACKET_TRACE.try_with(Clone::clone).ok(),
+        capture_zone_packets: true,
+        pending_packet_acks: VecDeque::new(),
+        incoming_high_water: None,
         app_tx: tx,
     };
     (stream, rx, peer_sock, stream_addr)
@@ -2090,6 +2281,244 @@ mod tests {
         assert_eq!(classify_seq(2, 0xF001), SeqClass::Future);
         // …while a seq just below `next` (also near the top) is a past duplicate.
         assert_eq!(classify_seq(0xF000, 0xF001), SeqClass::Duplicate);
+    }
+
+    #[tokio::test]
+    async fn packet_trace_counts_transport_retries_and_gaps_without_duplicate_app_rows() {
+        use crate::protocol::OP_TARGET_MOUSE;
+
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, mut rx, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+        let id = Arc::from("target");
+        stream.send_app_packet_with_command(OP_TARGET_MOUSE, &42u32.to_le_bytes(), Some(&id));
+        stream.sent[0].sent_at = Instant::now() - std::time::Duration::from_secs(2);
+        stream.poll_resend();
+
+        let target_page = trace.page(0, 10, None, Some("target"));
+        assert_eq!(target_page.packets.len(), 1);
+        assert_eq!(target_page.counts.sent, 2);
+        assert_eq!(target_page.counts.resent, 1);
+
+        let datagram = |seq| [0, OP_PACKET, 0, seq, 0x34, 0x12];
+        // Receiving a long contiguous run behind a lost sequence opens only one hole.
+        for seq in 1..=30 {
+            stream.on_raw_recv(&datagram(seq));
+        }
+        stream.on_raw_recv(&datagram(30));
+        assert_eq!(trace.page(0, 10, None, None).counts.sequence_gaps, 1);
+        stream.on_raw_recv(&datagram(32));
+        stream.on_raw_recv(&datagram(31));
+        assert_eq!(trace.page(0, 10, None, None).counts.sequence_gaps, 2);
+        stream.on_raw_recv(&datagram(0));
+        for _ in 0..=32 {
+            assert_eq!(rx.try_recv().unwrap().opcode, 0x1234);
+        }
+        assert!(rx.try_recv().is_err());
+
+        let page = trace.page(0, 50, None, None);
+        assert_eq!(page.packets.len(), 34);
+        assert_eq!(page.counts.received, 34);
+        assert_eq!(page.counts.sequence_gaps, 2);
+        assert_eq!(page.counts.resent, 1);
+    }
+
+    /// Keep the row pending while its ACK is deferred. Flushing the real datagram timestamps it.
+    #[tokio::test]
+    async fn packet_trace_acks_only_after_successful_socket_send() {
+        let started = Instant::now() - std::time::Duration::from_millis(100);
+        let trace = SessionTrace::new(started);
+        let (mut stream, mut rx, peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+
+        stream.force_send_refusals.set(1);
+        stream.on_raw_recv(&[0, OP_PACKET, 0, 0, 0x34, 0x12]);
+        assert_eq!(rx.try_recv().unwrap().opcode, 0x1234);
+        let before = trace.page(0, 10, None, None);
+        assert_eq!(before.packets[0].acked_at_ms, None);
+        assert_eq!(before.packets[0].ack_seq, None);
+        assert!(!before.packets[0].ack_exact);
+        assert_eq!(before.counts.sent, 0);
+
+        stream.flush_pending_control();
+        let mut received = [0; 8];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), peer.recv(&mut received))
+            .await.unwrap().unwrap();
+        assert_eq!(&received[..n], &[0, OP_ACK, 0, 0]);
+        let after = trace.page(0, 10, None, None);
+        assert!(after.packets[0].acked_at_ms.unwrap() >= 100);
+        assert_eq!(after.counts.sent, 1);
+    }
+
+    /// An ACK for sequence zero covers a row whose earlier ACK for 0xffff was lost.
+    #[tokio::test]
+    async fn packet_trace_cumulative_ack_covers_wrapped_sequence() {
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, _, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+
+        stream.next_recv_seq = u16::MAX;
+        stream.force_send_refusals.set(1);
+        stream.on_raw_recv(&[0, OP_PACKET, 0xff, 0xff, 0x34, 0x12]);
+        // Simulate eviction of the deferred first ACK. The next successful ACK is cumulative.
+        assert_eq!(stream.pending_control.pop_front().unwrap().ack_seq, Some(u16::MAX));
+        assert_eq!(trace.page(0, 10, None, None).packets[0].acked_at_ms, None);
+        stream.on_raw_recv(&[0, OP_PACKET, 0, 0, 0x34, 0x12]);
+        let page = trace.page(0, 10, None, None);
+        assert!(page.packets[0].acked_at_ms.is_some());
+        assert_eq!(page.packets[0].acked_at_ms, page.packets[1].acked_at_ms);
+        assert_eq!(page.packets[0].ack_seq, Some(0));
+        assert!(!page.packets[0].ack_exact);
+        assert_eq!(page.packets[1].ack_seq, Some(0));
+        assert!(page.packets[1].ack_exact);
+        assert_eq!(page.counts.sent, 1);
+    }
+
+    /// Assigning arrival indices at delivery would put the buffered packet in the wrong order.
+    #[tokio::test]
+    async fn packet_trace_preserves_socket_arrival_through_reordering() {
+        use std::time::Duration;
+
+        let started = Instant::now() - Duration::from_secs(1);
+        let trace = SessionTrace::new(started);
+        let (mut stream, mut rx, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+        stream.on_raw_recv_at(&[0, OP_PACKET, 0, 1, 0x35, 0x12], started + Duration::from_millis(11));
+        assert!(trace.page(0, 10, None, None).packets.is_empty());
+        stream.on_raw_recv_at(&[0, OP_PACKET, 0, 0, 0x34, 0x12], started + Duration::from_millis(19));
+
+        let page = trace.page(0, 10, None, None);
+        assert_eq!(rx.try_recv().unwrap().opcode, 0x1234);
+        assert_eq!(rx.try_recv().unwrap().opcode, 0x1235);
+        assert_eq!(page.packets[0].arrival_n, Some(2));
+        assert_eq!(page.packets[1].arrival_n, Some(1));
+        assert_eq!(page.packets[0].arrived_at_ms, Some(19));
+        assert_eq!(page.packets[1].arrived_at_ms, Some(11));
+    }
+
+    /// A buffered retry can replace the bytes, but must not move the first arrival past another row.
+    #[tokio::test]
+    async fn packet_trace_keeps_first_arrival_for_buffered_duplicate() {
+        use std::time::Duration;
+
+        let started = Instant::now() - Duration::from_secs(1);
+        let trace = SessionTrace::new(started);
+        let (mut stream, mut rx, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+        for (seq, value, at_ms) in [(2, 20, 10), (1, 10, 20), (2, 21, 30), (0, 0, 40)] {
+            stream.on_raw_recv_at(
+                &[0, OP_PACKET, 0, seq, 0x34, 0x12, value],
+                started + Duration::from_millis(at_ms),
+            );
+        }
+
+        let page = trace.page(0, 10, None, None);
+        assert_eq!(page.packets.len(), 3);
+        for (row, first_n, first_ms, value) in [
+            (&page.packets[0], 4, 40, 0),
+            (&page.packets[1], 2, 20, 10),
+            (&page.packets[2], 1, 10, 21),
+        ] {
+            assert_eq!(row.arrival_n, Some(first_n));
+            assert_eq!(row.arrived_at_ms, Some(first_ms));
+            assert_eq!(rx.try_recv().unwrap().payload, [value]);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(page.counts.received, 4);
+        assert_eq!(page.counts.sent, 6, "three out-of-order ACKs and three cumulative ACKs");
+    }
+
+    /// Omitting the high-water reset masks the next hole once the previous buffer has drained.
+    #[tokio::test]
+    async fn packet_trace_counts_another_hole_after_buffer_drains() {
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, _, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+
+        let datagram = |seq| [0, OP_PACKET, 0, seq, 0x34, 0x12];
+        stream.on_raw_recv(&datagram(1));
+        stream.on_raw_recv(&datagram(0));
+        assert!(stream.recv_buf.is_empty());
+        assert_eq!(trace.page(0, 10, None, None).counts.sequence_gaps, 1);
+
+        stream.on_raw_recv(&datagram(3));
+        assert_eq!(trace.page(0, 10, None, None).counts.sequence_gaps, 2);
+    }
+
+    #[tokio::test]
+    async fn packet_trace_counts_terminal_transport_drops() {
+        let trace = SessionTrace::new(Instant::now());
+        let health = eqoxide_ipc::NetHealthShared::default();
+        let (mut stream, _, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(health.clone()),
+        ).await;
+
+        stream.force_send_refusals.set(1);
+        assert!(stream.send_app_packet_unreliable(0x1234, &[]).is_err());
+        assert_eq!(trace.page(0, 10, None, None).counts.dropped_unretried, 1);
+
+        for _ in 0..=MAX_PENDING_CONTROL {
+            stream.defer_control(ControlDatagram { bytes: vec![0, OP_KEEPALIVE], ack_seq: None });
+        }
+        assert_eq!(trace.page(0, 10, None, None).counts.dropped_unretried, 2);
+
+        drop(stream);
+        let counts = trace.page(0, 10, None, None).counts;
+        assert_eq!(counts.dropped_unretried, MAX_PENDING_CONTROL as u64 + 2);
+        assert_eq!(counts.dropped_unretried, health.lock().unwrap().send_failures_unretried);
+    }
+
+    /// Deferred control and a failed first reliable send each reach the socket only once.
+    #[tokio::test]
+    async fn packet_trace_excludes_first_successful_sends_from_resent() {
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, _, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+
+        stream.force_send_refusals.set(1);
+        stream.send_keepalive().unwrap();
+        assert_eq!(stream.pending_control.len(), 1);
+        stream.flush_pending_control();
+
+        stream.force_send_refusals.set(1);
+        stream.send_app_packet(0x1234, &[]);
+        stream.sent[0].sent_at = Instant::now() - std::time::Duration::from_secs(2);
+        stream.poll_resend();
+
+        let counts = trace.page(0, 10, None, None).counts;
+        assert_eq!(counts.sent, 2);
+        assert_eq!(counts.resent, 0);
+
+        // Leave one first-send failure and one successfully sent reliable unacked.
+        stream.force_send_refusals.set(1);
+        stream.send_app_packet(0x1234, &[]);
+        stream.abandon_outstanding();
+        drop(stream);
+        let counts = trace.page(0, 10, None, None).counts;
+        assert_eq!(counts.dropped_unretried, 1);
+    }
+
+    #[tokio::test]
+    async fn packet_trace_keeps_zone_rows_only_but_counts_all_streams() {
+        let trace = SessionTrace::new(Instant::now());
+        let (mut stream, _, _peer, _) = with_packet_trace(
+            trace.clone(), test_stream_with_peer(Default::default()),
+        ).await;
+
+        stream.capture_zone_packets = false;
+        stream.send_app_packet(0x1234, &[]);
+        stream.on_raw_recv(&[0x34, 0x12]);
+        let page = trace.page(0, 10, None, None);
+        assert!(page.packets.is_empty());
+        assert_eq!(page.counts.sent, 1);
+        assert_eq!(page.counts.received, 1);
     }
 
     #[tokio::test]
@@ -2975,18 +3404,18 @@ mod tests {
         let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
 
         for i in 0..MAX_PENDING_CONTROL {
-            stream.defer_control(vec![i as u8]);
+            stream.defer_control(ControlDatagram { bytes: vec![i as u8], ack_seq: None });
         }
         assert_eq!(stream.pending_control.len(), MAX_PENDING_CONTROL);
         assert_eq!(net_health.lock().unwrap().send_failures, 0,
             "filling the queue to capacity loses nothing (#641)");
 
-        stream.defer_control(vec![0xFF]);
+        stream.defer_control(ControlDatagram { bytes: vec![0xFF], ack_seq: None });
         assert_eq!(stream.pending_control.len(), MAX_PENDING_CONTROL,
             "the queue must stay bounded (#641)");
-        assert_eq!(stream.pending_control.front(), Some(&vec![1u8]),
+        assert_eq!(stream.pending_control.front().map(|packet| packet.bytes.as_slice()), Some(&[1u8][..]),
             "the OLDEST entry is the one dropped — a later ACK supersedes an earlier one (#641)");
-        assert_eq!(stream.pending_control.back(), Some(&vec![0xFFu8]),
+        assert_eq!(stream.pending_control.back().map(|packet| packet.bytes.as_slice()), Some(&[0xFFu8][..]),
             "the newest entry must be kept (#641)");
         let h = *net_health.lock().unwrap();
         assert_eq!((h.send_failures, h.send_failures_unretried), (1, 1),
@@ -3038,7 +3467,7 @@ mod tests {
         let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
         stream.socket.writable().await.unwrap();
 
-        stream.defer_control(vec![0x5A; 70_000]);
+        stream.defer_control(ControlDatagram { bytes: vec![0x5A; 70_000], ack_seq: None });
         assert_eq!(stream.pending_control.len(), 1);
 
         stream.poll_recv();

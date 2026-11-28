@@ -1,6 +1,6 @@
 //! In-game state — player, entities, zone info, message log.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 /// A zone exit point received in OP_SEND_ZONE_POINTS.
 /// Stored in EQ server convention: server_x = east, server_y = north, server_z = up.
@@ -1279,6 +1279,19 @@ pub enum ServerAck {
     SpellUnmemorized { slot: u32 },
 }
 
+/// One entry in the corpse queue. Automatic loot has no originating command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LootRequest {
+    pub corpse_id: u32,
+    pub command_id: Option<Arc<str>>,
+}
+
+impl From<u32> for LootRequest {
+    fn from(corpse_id: u32) -> Self {
+        Self { corpse_id, command_id: None }
+    }
+}
+
 /// ## MVC structure (increment C1, #451)
 /// `GameState = { world: WorldState (Model-only server truth) , the client PREDICTION , … }`.
 /// `world` (see [`WorldState`]) is the server-authoritative world the Model writes and Views only
@@ -1685,8 +1698,8 @@ pub struct GameState {
     pub next_combat_id: u64,
 
     // Loot state
-    /// Corpse spawn_ids queued for auto-looting (populated by OP_BecomeCorpse).
-    pub pending_loot: VecDeque<u32>,
+    /// Corpses queued by automatic loot or a locally requested loot command.
+    pub pending_loot: VecDeque<LootRequest>,
     /// True from the moment OP_LootRequest is SENT until the server confirms it closed (via
     /// OP_LootComplete) or refuses it (via OP_MoneyOnCorpse with a non-accept response). Do not
     /// read this alone as "the corpse is open" — see `loot_confirmed` (#346).
@@ -1699,6 +1712,8 @@ pub struct GameState {
     /// well-formed OP_EndLootRequest (the server requires the corpse's spawn_id as its payload —
     /// an empty payload is silently dropped, #346) and to name the corpse in refusal messages.
     pub loot_current_corpse: Option<u32>,
+    /// Command attached to the exact queue entry that opened this corpse.
+    pub loot_command_id: Option<Arc<str>>,
     /// Updated each time the server sends a loot-related packet; used to notice item echoes have
     /// gone quiet so it's time to ask the server to close the session (OP_EndLootRequest). This
     /// no longer decides when "Looting complete" is reported — that only ever comes from the
@@ -2058,6 +2073,7 @@ impl GameState {
         self.loot_session_active = false;
         self.loot_confirmed = false;
         self.loot_current_corpse = None;
+        self.loot_command_id = None;
         self.loot_last_activity = None;
         self.loot_end_requested_at = None;
         self.loot_queued_at = None;
@@ -4199,6 +4215,7 @@ pub(crate) mod tests {
         assert!(!gs.loot_session_active, "loot_session_active");
         assert!(!gs.loot_confirmed, "loot_confirmed");
         assert!(gs.loot_current_corpse.is_none(), "loot_current_corpse");
+        assert!(gs.loot_command_id.is_none(), "loot_command_id");
         assert!(gs.loot_last_activity.is_none(), "loot_last_activity");
         assert!(gs.loot_end_requested_at.is_none(), "loot_end_requested_at");
         assert!(gs.loot_queued_at.is_none(), "loot_queued_at");
@@ -4233,10 +4250,11 @@ pub(crate) mod tests {
     /// queued id) and blocks the new zone's first loot (the quarantine).
     fn populate_loot_session(gs: &mut GameState) {
         let now = std::time::Instant::now();
-        gs.pending_loot.push_back(31); // a second corpse, still queued, in the DEPARTED zone
+        gs.pending_loot.push_back(31.into()); // a second corpse, still queued, in the DEPARTED zone
         gs.loot_session_active = true;
         gs.loot_confirmed = true;
         gs.loot_current_corpse = Some(30);
+        gs.loot_command_id = Some("old-loot".into());
         gs.loot_last_activity = Some(now);
         gs.loot_end_requested_at = Some(now);
         gs.loot_queued_at = Some(now);
@@ -4564,7 +4582,7 @@ pub(crate) mod tests {
             trainer_open: _, trainer_skills: _,
             merchant_open: _, merchant_items: _,
             pet_id: _,
-            pending_loot: _, loot_session_active: _, loot_confirmed: _, loot_current_corpse: _,
+            pending_loot: _, loot_session_active: _, loot_confirmed: _, loot_current_corpse: _, loot_command_id: _,
             loot_last_activity: _, loot_end_requested_at: _, loot_queued_at: _,
             loot_defensive_close_at: _,
             combat_anims: _, recent_attackers: _,

@@ -29,7 +29,6 @@ use std::{
 
 struct Wiring {
     command: CommandState,
-    combat: ipc::CombatSlots,
     controller: ipc::ControllerSlots,
     snapshot: ipc::GameStateSnapshot,
     health: ipc::NetHealthShared,
@@ -40,7 +39,6 @@ struct Wiring {
 }
 impl Wiring {
     fn new(maps_dir: std::path::PathBuf) -> Self {
-        let combat = ipc::CombatSlots::default();
         let merchant = ipc::MerchantSlots::default();
         let inventory = ipc::InventorySlots::default();
         let interact = ipc::InteractSlots::default();
@@ -53,7 +51,7 @@ impl Wiring {
         let life = ipc::LifecycleSlots::default();
         let controller = ipc::ControllerSlots::default();
         let command = CommandState::new(
-            combat.clone(),
+            ipc::CombatSlots::default(),
             merchant.clone(),
             inventory.clone(),
             interact.clone(),
@@ -94,7 +92,6 @@ impl Wiring {
         };
         Self {
             command,
-            combat,
             controller,
             snapshot,
             health,
@@ -108,20 +105,20 @@ impl Wiring {
 
 /// Deadline lives in the physics owner. No HTTP retry, poll, or slow transaction renews it.
 struct Motion {
-    id: String,
+    id: Arc<str>,
     wish: [f32; 2],
     until: Instant,
 }
 struct Host {
     control: Control,
     command: CommandState,
-    combat: ipc::CombatSlots,
     controller_slots: ipc::ControllerSlots,
     body: Option<CharacterController>,
     zone_in: ZoneIn,
     epoch: u64,
     heading: f32,
     motion: Option<Motion>,
+    ending_motion: Option<Arc<str>>,
     attack_until: Option<Instant>,
     action_ids: HashMap<u64, (String, bool)>,
     transaction_uncertain: Arc<AtomicBool>,
@@ -144,14 +141,21 @@ impl Host {
             .control
             .publish_outcome(id, status, reason.map(str::to_owned), evidence);
     }
-    fn halt(&mut self, reason: &str) {
-        if let Some(motion) = self.motion.take() {
+    fn halt(&mut self, reason: &str, command: Option<&str>) {
+        let motion = self.motion.take();
+        let ending = self.ending_motion.take();
+        if motion.is_some() || ending.is_some() {
+            let mut view = self.controller_slots.controller_view.lock().unwrap();
+            view.active_motion_command = None;
+            view.position_commands = ipc::PositionCommands::None;
+        }
+        if let Some(motion) = motion {
             self.control
-                .publish_event(json!({"kind":"motion_stopped","id":motion.id,"reason":reason}));
+                .publish_event(json!({"kind":"motion_stopped","id":motion.id.as_ref(),"reason":reason}));
         }
         self.attack_until = None;
         // LAST-WINS: safety off must replace an attack still waiting in the net mailbox.
-        *self.combat.attack.lock().unwrap() = Some(false);
+        self.command.overwrite_attack_off(command);
     }
     fn step(
         &mut self,
@@ -162,17 +166,18 @@ impl Host {
         dt: f32,
     ) {
         if !ready {
-            self.halt("not_ready");
+            self.halt("not_ready", None);
             return;
         }
         if self.motion.as_ref().is_some_and(|m| now >= m.until) {
             let motion = self.motion.take().unwrap();
             self.control
-                .publish_event(json!({"kind":"motion_expired","id":motion.id}));
+                .publish_event(json!({"kind":"motion_expired","id":motion.id.as_ref()}));
+            self.ending_motion = Some(motion.id);
         }
         if self.attack_until.is_some_and(|until| now >= until) {
             self.attack_until = None;
-            *self.combat.attack.lock().unwrap() = Some(false); // LAST-WINS: lease expiry
+            self.command.overwrite_attack_off(None); // LAST-WINS: lease expiry
             self.control
                 .publish_event(json!({"kind":"attack_lease_expired"}));
         }
@@ -220,13 +225,19 @@ impl Host {
             return;
         }
         view.zone_epoch = Some(self.epoch);
+        if let Some((_, issued)) = taken {
+            // An old physics step can publish after the net owner's snapshot and before it
+            // issues this correction. Replace that provenance before recording the adopted step.
+            view.position_commands = ipc::PositionCommands::None;
+            // Zone entry can settle a later correction while this step runs.
+            view.correction_adopted = view.correction_adopted.max(issued);
+        }
+        let active_command = self.motion.as_ref().map(|motion| &motion.id);
+        view.active_motion_command = active_command.cloned();
         if stepped {
             view.step_seq = view.step_seq.wrapping_add(1);
-        }
-        if let Some((_, issued)) = taken {
-            // Monotonic: zone entry may have settled a later correction while this step ran, and
-            // publishing this one's older count would roll that back.
-            view.correction_adopted = view.correction_adopted.max(issued);
+            view.position_commands.include(active_command);
+            view.position_commands.include(self.ending_motion.take().as_ref());
         }
         view.pos = body.pos;
         view.heading = self.heading;
@@ -385,14 +396,16 @@ impl Host {
                     self.heading = heading;
                 }
                 self.motion = Some(Motion {
-                    id: id.clone(),
+                    id: id.as_str().into(),
                     wish,
                     until: now + Duration::from_millis(duration_ms),
                 });
                 self.outcome(&id,Status::AppliedLocal,None,Some(json!({"kind":"controller_intent","duration_ms":duration_ms,"server_position_confirmed":false})));
             }
             Operation::Stop => {
-                self.motion = None;
+                if let Some(motion) = self.motion.take() {
+                    self.ending_motion = Some(motion.id);
+                }
                 self.outcome(
                     &id,
                     Status::AppliedLocal,
@@ -402,7 +415,7 @@ impl Host {
             }
             Operation::AttackOff => {
                 self.attack_until = None;
-                *self.combat.attack.lock().unwrap() = Some(false); // LAST-WINS: safety request
+                self.command.overwrite_attack_off(Some(&id)); // LAST-WINS: safety request
                 self.outcome(
                     &id,
                     Status::AppliedLocal,
@@ -424,7 +437,8 @@ impl Host {
                 let context = self
                     .command
                     .actions()
-                    .begin_for_zone("merchant_open", self.epoch);
+                    .begin_for_zone("merchant_open", self.epoch)
+                    .with_packet_command(&id);
                 if !context
                     .scope(async { self.command.request_open_await(entity_id as u32, tx) })
                     .await
@@ -456,7 +470,11 @@ impl Host {
                     return;
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let context = self.command.actions().begin_for_zone("buy", self.epoch);
+                let context = self
+                    .command
+                    .actions()
+                    .begin_for_zone("buy", self.epoch)
+                    .with_packet_command(&id);
                 if !context
                     .scope(async { self.command.request_buy_await(merchant, slot, tx) })
                     .await
@@ -477,7 +495,9 @@ impl Host {
                     Operation::Sell { .. } | Operation::InventoryMove { .. }
                 );
                 let tracker = self.command.actions();
-                let context = tracker.begin_for_zone("headless_command", self.epoch);
+                let context = tracker
+                    .begin_for_zone("headless_command", self.epoch)
+                    .with_packet_command(&id);
                 let accepted = context
                     .scope(async {
                         match operation {
@@ -509,10 +529,14 @@ impl Host {
                                 }
                             }
                             Operation::Sit => {
-                                self.motion = None;
-                                self.attack_until = None;
-                                *self.combat.attack.lock().unwrap() = Some(false);
-                                self.command.request_sit(true)
+                                let accepted = self.command.request_sit_with_attack_off(&id);
+                                if accepted {
+                                    if let Some(motion) = self.motion.take() {
+                                        self.ending_motion = Some(motion.id);
+                                    }
+                                    self.attack_until = None;
+                                }
+                                accepted
                             }
                             Operation::Stand => self.command.request_sit(false),
                             Operation::Say { text } => self.command.request_say(text),
@@ -554,9 +578,10 @@ impl Host {
                                     && self.command.request_inventory_move(from_slot, to_slot)
                             }
                             Operation::Camp => {
-                                self.halt("camp");
-                                self.command
-                                    .request_camp(ipc::CampCmd::StartInZone(self.epoch));
+                                self.halt("camp", Some(&id));
+                                self.command.request_camp_with_command(
+                                    ipc::CampCmd::StartInZone(self.epoch), Some(&id),
+                                );
                                 true
                             }
                             _ => false,
@@ -765,21 +790,23 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             .as_nanos()
     );
     let started = Instant::now();
-    let control = Control::new(session, profile.control_token.clone(), 4096, 2048)?;
+    let wiring = Wiring::new(profile.maps_dir.clone());
+    let trace = eqoxide_net::packet_telemetry::SessionTrace::new(started);
+    let control = Control::new(session, profile.control_token.clone(), 4096, 2048)?
+        .with_packet_trace(trace.clone());
     let router = control.router();
     let api = tokio::spawn(async move { axum::serve(listener, router).await });
     println!("API_PORT={}", profile.api_port);
-    let wiring = Wiring::new(profile.maps_dir.clone());
     let mut host = Host {
         control: control.clone(),
         command: wiring.command,
-        combat: wiring.combat,
         controller_slots: wiring.controller,
         body: None,
         zone_in: Default::default(),
         epoch: 0,
         heading: 0.0,
         motion: None,
+        ending_motion: None,
         attack_until: None,
         action_ids: HashMap::new(),
         transaction_uncertain: Arc::new(AtomicBool::new(false)),
@@ -804,12 +831,15 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                     .enable_all()
                     .build()
                     .map_err(|_| "network runtime initialization failed".to_string())?
-                    .block_on(eqoxide_net::login::run_login_flow_selected(
-                        config,
-                        1,
-                        wiring.slots,
-                        wiring.lifecycle,
-                        expected,
+                    .block_on(eqoxide_net::transport::with_packet_trace(
+                        trace,
+                        eqoxide_net::login::run_login_flow_selected(
+                            config,
+                            1,
+                            wiring.slots,
+                            wiring.lifecycle,
+                            expected,
+                        ),
                     ))
             }))
             .unwrap_or_else(|_| Err("network task panicked".into()));
@@ -855,14 +885,14 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
             if terminal.is_some() {
-                host.halt("network_ended");
+                host.halt("network_ended", None);
                 control.set_ready(false);
                 control.publish_event(json!({"kind":"session_ended","reason":terminal}));
             }
         }
         let gs = wiring.snapshot.load_full();
         if gs.zone_epoch != host.epoch {
-            host.halt("zone_entry");
+            host.halt("zone_entry", None);
             control.set_ready(false);
             host.body = None;
             host.epoch = gs.zone_epoch;
@@ -886,7 +916,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             && loaded_zone != gs.world.zone_name
         {
             control.set_ready(false);
-            host.halt("loading_geometry");
+            host.halt("loading_geometry", None);
             loaded_zone = gs.world.zone_name.clone();
             match load_collision(&profile.maps_dir, &loaded_zone) {
                 Ok((collision, metadata)) => {
@@ -967,7 +997,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             }
         }
         if api.is_finished() {
-            host.halt("http_server_ended");
+            host.halt("http_server_ended", None);
             wiring.shutdown.store(true, Ordering::Release);
             return Err("control HTTP server ended".into());
         }
@@ -981,17 +1011,20 @@ mod tests {
     use super::*;
     use eqoxide_zone_geometry::collision::ServerTriangle;
     pub(super) fn host() -> Host {
-        let wiring = Wiring::new(std::path::PathBuf::from("/unused"));
+        host_with_wiring(&Wiring::new("/unused".into()))
+    }
+
+    pub(super) fn host_with_wiring(wiring: &Wiring) -> Host {
         Host {
             control: Control::new("test-session".into(), "test-credential".into(), 16, 32).unwrap(),
-            command: wiring.command,
-            combat: wiring.combat,
-            controller_slots: wiring.controller,
+            command: wiring.command.clone(),
+            controller_slots: wiring.controller.clone(),
             body: Some(CharacterController::new([0.0, 0.0, 0.0])),
             zone_in: Default::default(),
             epoch: 1,
             heading: 0.0,
             motion: None,
+            ending_motion: None,
             attack_until: None,
             action_ids: HashMap::new(),
             transaction_uncertain: Arc::new(AtomicBool::new(false)),
@@ -1006,7 +1039,7 @@ mod tests {
         published_position: None,
         }
     }
-    fn floor() -> Collision {
+    pub(super) fn floor() -> Collision {
         Collision::from_server_triangles(
             vec![
                 ServerTriangle([
@@ -1059,7 +1092,7 @@ mod tests {
         assert_eq!(host.body.as_ref().unwrap().pos, moving);
         assert!(host.motion.is_none());
         assert!(host.attack_until.is_none());
-        assert_eq!(*host.combat.attack.lock().unwrap(), Some(false));
+        assert_eq!(host.command.take_attack(), Some(false));
     }
     #[test]
     fn network_loss_clears_wish_and_does_not_initialize_a_body() {
@@ -1116,7 +1149,7 @@ mod tests {
             *host.controller_slots.pos_correction.lock().unwrap() = Some([40.0, 0.0, 0.0]);
         }
         host.step(&gs, Some(&col), true, Instant::now(), 0.02);
-        let view = *host.controller_slots.controller_view.lock().unwrap();
+        let view = host.controller_slots.controller_view.lock().unwrap().clone();
         assert_eq!(view.correction_adopted, 3);
         assert!((view.pos[0] - 40.0).abs() < 0.01, "published with the corrected position");
     }
@@ -1137,7 +1170,7 @@ mod tests {
         // holds correction 1, stamped with the count it read when it took the slot.
         host.controller_slots.controller_view.lock().unwrap().correction_adopted = 2;
         host.step(&gs, Some(&col), true, Instant::now(), 0.02);
-        let view = *host.controller_slots.controller_view.lock().unwrap();
+        let view = host.controller_slots.controller_view.lock().unwrap().clone();
         assert_eq!(view.correction_adopted, 2, "adoption never moves backwards");
     }
     fn rat(id: u32, x: f32) -> eqoxide_core::game_state::Entity {
@@ -1344,13 +1377,13 @@ mod transaction_admission_tests {
         let mut host = Host {
             control: Control::new("s".into(), "credential".into(), 8, 16).unwrap(),
             command: wiring.command,
-            combat: wiring.combat,
             controller_slots: wiring.controller,
             body: None,
             zone_in: Default::default(),
             epoch: 1,
             heading: 0.0,
             motion: None,
+            ending_motion: None,
             attack_until: None,
             action_ids: HashMap::new(),
             transaction_uncertain: Arc::new(AtomicBool::new(false)),
@@ -1476,7 +1509,7 @@ mod execution_claim_tests {
             7, "rat", 0.0, 0.0, 0.0, true,
         ));
         host.dispatch(attack, &gs, true, Instant::now()).await;
-        assert!(host.combat.attack.lock().unwrap().is_none());
+        assert!(host.command.take_attack().is_none());
         assert_eq!(
             host.control.command("attack").unwrap().status,
             Status::Refused
@@ -1518,3 +1551,7 @@ mod execution_claim_tests {
         assert_eq!(host.control.command("buy").unwrap().status, Status::Refused);
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_packet_tests.rs"]
+mod packet_tests;
