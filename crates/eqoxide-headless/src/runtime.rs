@@ -128,8 +128,8 @@ struct Host {
     merchant_value: Value,
     last_event: u64,
     last_echo: u64,
-    /// The last `CombatRecord::id` and death instant published as events (central-6ly1.8).
     completions: Completions,
+    /// The last `CombatRecord::id` and death instant published as events (central-6ly1.8).
     last_combat: u64,
     last_death_count: u32,
     /// The self position in the last published state: every range check measures from this, so a
@@ -917,6 +917,9 @@ pub async fn run(profile: Profile) -> Result<(), String> {
     let mut shutdown_started: Option<Instant> = None;
     loop {
         interval.tick().await;
+        // Outcomes the server already settled are applied before any fence this tick can run,
+        // so a readiness drop or zone change cannot turn a settled buy into `unknown`.
+        host.drain_completions();
         let now = Instant::now();
         let dt = (now - previous).as_secs_f32().min(0.05);
         previous = now;
