@@ -390,16 +390,6 @@ impl Control {
         journal.ready = ready;
     }
 
-    /// A zone change the host has seen before it could publish it: fence the departed zone's
-    /// commands as `publish_state` would, so a later session end cannot take that reason over.
-    pub fn fence_zone(&self, zone_epoch: u64) {
-        let mut journal = self.shared.journal.lock().unwrap();
-        if zone_epoch > journal.zone_epoch {
-            self.fence_locked(&mut journal, "zone_epoch_changed", false);
-            journal.zone_epoch = zone_epoch;
-        }
-    }
-
     /// Shutdown has begun: admit nothing more, safety commands included. Live commands are left to
     /// their owners; `end_session` ends what remains.
     pub fn close_admission(&self) {

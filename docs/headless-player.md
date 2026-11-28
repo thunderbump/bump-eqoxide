@@ -114,6 +114,11 @@ Attack-off on the wire.
 
   A readiness drop (death, link loss, geometry loading) does not fence an `attack_off`: it is the safety stop for that moment. When the session ends (including a kick or a logout deadline), a queued off that no network owner will send ends `refused` with reason `not_ready`, or `stale_zone_epoch_before_dispatch` if its zone had already ended. From the moment shutdown begins, `attack_off` commands are refused at admission. Every refused `attack_off` carries the `attack_off_not_sent` evidence, whichever step refused it. A burst of explicit offs goes out at most 8 per network tick, in order.
 - **An implicit stop queued with an explicit off** adds no packet.
+- **Known windows, until central-6ly1.7's claim slot.** In this build an `attack_off` receipt can settle wrongly, or late, in these cases. The packet trace (`/v2/player/packets?command=<id>`) is the authority for what was actually sent.
+  - **Kick or other parked shutdown.** An off admitted and dispatched just before shutdown can stay `accepted` for up to 8 s. It is then `refused` / `not_ready` as the API closes.
+  - **Host exit with the off already claimed.** If the network owner has taken an off but not yet sent it when the host exits (logout deadline, HTTP end), the receipt is `unknown` with no evidence.
+  - **Same-iteration terminal and zone change.** The network owner can publish a new zone and end in the same host iteration. The host rereads its snapshot so the zone's reason wins, but that ordering is not under test.
+  - **v1 backlog.** A v1 or UI off reports its outcome only when the whole explicit-off backlog has been sent, 8 per network tick.
 - **v1 and UI requests.** v1 `DELETE /v1/combat/attack` and UI toggles also always send, even over a queued off or a queued on (which they replace), but they carry no packet attribution and no zone.
 
 | Operation kind | Fields / limits |

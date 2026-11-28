@@ -900,3 +900,19 @@ async fn a_v1_off_over_a_queued_on_replaces_it() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["payload_hex"].as_str().unwrap()[..2].to_string(), "00");
 }
+
+/// A v1 off over a v2 attack-on still queued: the on is finished as superseded (never sent), and
+/// the off is sent.
+#[tokio::test]
+async fn a_v1_off_over_a_queued_v2_attack_supersedes_it() {
+    let mut session = Session::new().await;
+    session.dispatch("attack", json!({"kind":"attack","lease_ms":1000})).await;
+    assert!(session.host.command.request_attack(false));
+    session.drain();
+    session.host.update_knowledge(&session.gs);
+    let receipt = session.host.control.command("attack").unwrap();
+    assert_eq!((receipt.status, receipt.reason.as_deref()),
+        (Status::Refused, Some("superseded_by_safety_command")), "{receipt:?}");
+    session.assert_packets("attack", &[]).await;
+    assert_eq!(attack_rows(&session.packets("").await).len(), 1, "the off");
+}

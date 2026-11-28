@@ -181,8 +181,6 @@ impl Host {
     /// and on every tick after a terminal network outcome.
     fn finish_session(&self, gs: &GameState) {
         self.settle_attack_offs(gs);
-        // A zone that ended before the session did keeps its own reason.
-        self.control.fence_zone(gs.zone_epoch);
         self.abandon_attack_offs();
         self.control.end_session("not_ready");
     }
@@ -921,11 +919,9 @@ impl Host {
         load: &mut dyn FnMut(&str) -> Result<(Arc<Collision>, Value), String>,
     ) -> Result<bool, String> {
         let Frame { col, loaded_zone, geometry, publish_at } = frame;
-        if terminal.is_some() {
-            // No network owner is left; on every tick after, since safety commands raced in
-            // before admission closed still need an end.
-            self.finish_session(gs);
-        } else if shutdown() {
+        // Read once, so the admission decision and readiness agree within the frame.
+        let shutdown = shutdown();
+        if terminal.is_some() || shutdown {
             // A kick parks the network owner with shutdown set and no terminal outcome: admit
             // nothing that could wait for a send that may never come.
             self.control.close_admission();
@@ -947,6 +943,10 @@ impl Host {
             view.zone_epoch = Some(gs.zone_epoch);
             view.landed_fall_height = None;
             view.relocated = None;
+            drop(view);
+            // Publish this tick: the publication fences the departed zone's commands with their
+            // own reason, before anything later in the frame can end them otherwise.
+            *publish_at = now;
         }
         // Native sends the destination's self spawn before OP_NewZone, so the position can be
         // known while `zone_name` still names the zone being left. Wait for the new zone itself.
@@ -986,7 +986,7 @@ impl Host {
         // refreshed its health during the load.
         let Link { tick_age, inbound_age, link_age, dropped } = link();
         let ready = terminal.is_none()
-            && !shutdown()
+            && !shutdown
             && host_ready(gs, self, col.is_some(), tick_age, link_age, dropped);
         self.step(&gs, col.as_deref(), ready, now, dt);
         self.update_knowledge(&gs);
@@ -1025,6 +1025,12 @@ impl Host {
             *publish_at = now + Duration::from_millis(100);
         }
         self.control.set_ready(ready);
+        if terminal.is_some() {
+            // No network owner is left. After the publication, so a zone that ended first has
+            // already fenced its commands with its own reason, and on every tick after, since a
+            // command admitted before admission closed still needs an end.
+            self.finish_session(gs);
+        }
         Ok(ready)
     }
 }
@@ -1144,12 +1150,16 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
             if terminal.is_some() {
+                control.close_admission();
                 host.drain_completions();
                 host.halt("network_ended", None);
                 control.set_ready(false);
                 control.publish_event(json!({"kind":"session_ended","reason":terminal}));
             }
         }
+        // The network owner may have published a newer state just before it ended; this tick's
+        // fences and settlement must see it.
+        let gs = if terminal.is_some() { wiring.snapshot.load_full() } else { gs };
         let link = || {
             let health = wiring.health.lock().unwrap();
             Link {

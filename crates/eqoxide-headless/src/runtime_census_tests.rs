@@ -328,7 +328,7 @@ async fn scripted_session(resume: Resume) {
         s.tick().await;
     }
     let idle = s.phase("long idle");
-    assert!(count(&idle, KEEPALIVE) >= 1, "a keepalive after 1.3 s of silence: {idle:?}");
+    assert!(count(&idle, KEEPALIVE) >= 1, "a keepalive within 1.5 s of idle (interval 1.3 s): {idle:?}");
     assert_eq!(exact(&idle), expect(&[]));
 
     // Move for 300 ms, then stop: moving updates, then exactly one rest update, the move's.
@@ -449,6 +449,8 @@ async fn a_zone_end_before_the_session_end_keeps_its_reason() {
     s.enter_zone("qeynos2").await;
     s.net_running = false;
     s.put("off", json!({"kind":"attack_off"})).await;
+    // No scheduled publication is due: only the zone change's own publication can fence first.
+    s.frame.publish_at = s.clock + Duration::from_secs(60);
     s.controller.begin_zone_in(&mut s.gs);
     s.terminal = Some("session_ended".into());
     s.tick().await;
@@ -470,4 +472,24 @@ async fn shutdown_closes_admission() {
     let receipt = s.host.control.command("late").unwrap();
     assert_eq!((receipt.status, receipt.reason.as_deref()), (Status::Refused, Some("not_ready")), "{receipt:?}");
     assert_eq!(receipt.evidence, Some(json!({"kind":"attack_off_not_sent","packets":[]})));
+}
+
+/// An off the network owner sent in the departed zone, then the zone and the session end before
+/// the next host frame: the receipt says it was sent, not fenced.
+#[tokio::test]
+async fn an_off_sent_before_a_zone_and_session_end_stays_sent() {
+    let mut s = Census::new(Resume::AfterGeometry).await;
+    s.enter_zone("qeynos2").await;
+    s.net_running = false;
+    s.put("off", json!({"kind":"attack_off"})).await;
+    s.tick().await;
+    let drained = s.host.command.take_attack_request(Some(s.gs.zone_epoch)).unwrap();
+    for off in drained.explicit {
+        s.host.command.attack_off_sent(off.command.as_ref().unwrap());
+    }
+    s.controller.begin_zone_in(&mut s.gs);
+    s.terminal = Some("session_ended".into());
+    s.tick().await;
+    let receipt = s.host.control.command("off").unwrap();
+    assert_eq!(receipt.status, Status::AppliedLocal, "{receipt:?}");
 }
