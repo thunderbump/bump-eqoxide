@@ -140,17 +140,22 @@ impl Host {
     /// Publish an awaited outcome and settle the latch from the receipt as it stands: late
     /// evidence for a fenced `unknown` is not applied, so it cannot reopen transactions either.
     fn apply_completion(&self, done: Completion) {
-        let _ = self.control.publish_outcome(&done.id, done.status, done.reason, done.evidence);
+        let _ = self.control.publish_outcome_with_detail(&done.id, done.status, done.reason, done.detail, done.evidence);
         if done.transaction {
             let settled = self.control.settled_status(&done.id).unwrap_or(done.status);
             self.transaction_uncertain
                 .store(!matches!(settled, Status::Confirmed | Status::Refused), Ordering::Release);
         }
     }
-    fn drain_completions(&mut self) {
+    /// Returns whether any outcome was applied, so the caller can publish state at once and the
+    /// receipt and the inventory it changed reach scripts together.
+    fn drain_completions(&mut self) -> bool {
+        let mut applied = false;
         while let Ok(done) = self.completions.1.try_recv() {
             self.apply_completion(done);
+            applied = true;
         }
+        applied
     }
     fn outcome(&self, id: &str, status: Status, reason: Option<&str>, evidence: Option<Value>) {
         let _ = self
@@ -754,6 +759,7 @@ struct Completion {
     id: String,
     status: Status,
     reason: Option<String>,
+    detail: Option<String>,
     evidence: Option<Value>,
     transaction: bool,
 }
@@ -774,14 +780,18 @@ async fn await_outcome<T: serde::Serialize>(
             None,
             Some(json!({"kind":kind,"receipt":receipt})),
         ),
-        Ok(Ok(ipc::CommandResult::Refused(reason))) => (Status::Refused, Some(reason), None),
+        // The server's refusal is prose; the receipt's reason is a code (design A2.7).
+        Ok(Ok(ipc::CommandResult::Refused(text))) => {
+            return Completion { id, status: Status::Refused, reason: Some("server_refused".into()),
+                detail: Some(text), evidence: None, transaction };
+        }
         _ => (
             Status::Unknown,
             Some("no_correlated_server_receipt_relog_before_another_transaction".into()),
             None,
         ),
     };
-    Completion { id, status, reason, evidence, transaction }
+    Completion { id, status, reason, detail: None, evidence, transaction }
 }
 
 fn load_collision(dir: &std::path::Path, zone: &str) -> Result<(Arc<Collision>, Value), String> {
@@ -919,7 +929,9 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         interval.tick().await;
         // Outcomes the server already settled are applied before any fence this tick can run,
         // so a readiness drop or zone change cannot turn a settled buy into `unknown`.
-        host.drain_completions();
+        if host.drain_completions() {
+            publish_at = Instant::now();
+        }
         let now = Instant::now();
         let dt = (now - previous).as_secs_f32().min(0.05);
         previous = now;
@@ -1032,7 +1044,9 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             publish_at = now + Duration::from_millis(100);
         }
         control.set_ready(ready);
-        host.drain_completions();
+        if host.drain_completions() {
+            publish_at = now;
+        }
         for command in control.drain_actions() {
             host.dispatch(command, &gs, ready, now).await;
         }
@@ -1637,6 +1651,23 @@ mod execution_claim_tests {
         host.drain_completions();
         assert_eq!(host.control.command("buy").unwrap().status, Status::Confirmed);
         assert!(!host.transaction_uncertain.load(Ordering::Acquire), "and the latch cleared with it");
+    }
+
+    /// Review of PR #6: a server refusal's prose goes to `detail`; `reason` is a code.
+    #[tokio::test]
+    async fn a_server_refusal_has_a_code_and_prose_detail() {
+        let host = super::tests::host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(&host.control, "buy", json!({"kind":"buy","slot":1,"quantity":1})).await;
+        host.control.drain_actions();
+        host.control.mark_dispatched("buy").unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ipc::CommandResult<Value>>();
+        tx.send(ipc::CommandResult::Refused("merchant refused".into())).unwrap();
+        host.apply_completion(await_outcome("buy".into(), rx, "server_buy_receipt", true).await);
+        let receipt = host.control.command("buy").unwrap();
+        assert_eq!((receipt.status, receipt.reason.as_deref(), receipt.detail.as_deref()),
+            (Status::Refused, Some("server_refused"), Some("merchant refused")));
     }
 
     /// Review of PR #6: the same holds once the fenced receipt has been evicted.

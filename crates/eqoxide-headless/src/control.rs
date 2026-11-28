@@ -431,6 +431,18 @@ impl Control {
         reason: Option<String>,
         evidence: Option<Value>,
     ) -> Result<CommandReceipt, String> {
+        self.publish_outcome_with_detail(id, status, reason, None, evidence)
+    }
+
+    /// As `publish_outcome`, with prose for `detail` beside the reason code.
+    pub fn publish_outcome_with_detail(
+        &self,
+        id: &str,
+        status: CommandStatus,
+        reason: Option<String>,
+        detail: Option<String>,
+        evidence: Option<Value>,
+    ) -> Result<CommandReceipt, String> {
         if matches!(
             status,
             CommandStatus::Sent | CommandStatus::AppliedLocal | CommandStatus::Confirmed
@@ -467,6 +479,7 @@ impl Control {
         entry.receipt.terminal = status.terminal();
         entry.receipt.reason = reason;
         entry.receipt.evidence = evidence;
+        entry.receipt.detail = detail;
         entry.receipt.updated_at_ms = now_ms;
         let next = entry.receipt.clone();
         if next.terminal {
@@ -885,6 +898,14 @@ async fn put_command(
     // even from a client that sent headers and then stalled.
     if !valid_command_id(&id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_command_id".into(), None));
+    }
+    let json = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json")));
+    if !json {
+        return Err(ApiError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "content_type_must_be_application_json".into(), None));
     }
     let bytes = axum::body::to_bytes(request.into_body(), 16 * 1024).await.map_err(|_| {
         ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid_command_payload".into(), None)

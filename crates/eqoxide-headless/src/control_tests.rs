@@ -1058,6 +1058,10 @@ async fn malformed_bodies_are_422_and_consume_nothing() {
         .body(Body::from("{")).unwrap();
     assert_eq!(control.router().oneshot(bad_id).await.unwrap().status(), StatusCode::BAD_REQUEST,
         "the ID is checked before the body");
+    let plain = Request::builder().method("PUT").uri(path)
+        .header("authorization", "Bearer private-test-token").header("content-type", "text/plain")
+        .body(Body::from(movement().to_string())).unwrap();
+    assert_eq!(control.router().oneshot(plain).await.unwrap().status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(authorized(&control, "PUT", path, Some(movement())).await.0, StatusCode::ACCEPTED,
         "the same ID is still free");
 }

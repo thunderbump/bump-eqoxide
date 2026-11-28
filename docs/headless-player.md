@@ -79,6 +79,13 @@ A command ID is never reusable in a session, including an ID refused at admissio
   503 `safety_reserve_exhausted`.
 - A 503 consumes no identity, so the same ID can be retried.
 - A refusal at admission returns 409 with the receipt and `"admitted": false`.
+- A body sent without `Content-Type: application/json` is 415 and consumes nothing.
+- A server's refusal of an awaited command (merchant open, buy) has reason `server_refused`, with
+  the server's text in `detail`.
+- The receipt for an awaited command and the inventory or merchant revision it changed are
+  published in the same host tick. A request that carries the previous revision in the instant
+  between them is refused as `inventory_revision_required_or_stale`; re-read state and retry with a
+  new ID.
 - A malformed body consumes nothing and returns 422 `invalid_command_payload`. That covers a body
   that is not JSON, a payload of the wrong shape, and a unit operation such as `stop` with extra
   fields.
