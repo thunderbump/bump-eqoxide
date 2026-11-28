@@ -118,7 +118,8 @@ Each receipt carries `terminal`, `accepted_at_ms` and `updated_at_ms` on the hos
 always a snake_case code; a validation failure is `invalid_operation`, with prose in `detail`. Only
 `accepted` and `sent` are non-terminal, and a terminal receipt never changes. A readiness drop or
 zone change fences only non-terminal receipts: never-dispatched work becomes `refused`, and
-dispatched work becomes `unknown`. Late server evidence for a fenced receipt is not applied.
+dispatched work becomes `unknown`. A dispatched `camp` is exempt: it spans the readiness drop it
+causes. Late server evidence for a fenced receipt is not applied.
 This host leaves queued network work accepted until an actual drain outcome or correlated reply;
 it does not manufacture a send receipt. Buy and merchant-open confirmation comes from the real
 server echo. Most other network commands can report `unknown` after dispatch because the protocol
@@ -177,9 +178,13 @@ arrived, null if unknown then), `amount` (the damage on a `hit`, else 0), `spell
 `invulnerable`, `rune`, `landed` (a spell action with zero damage) or `other`. A death of self is
 published once as `died`, with the same `killer` and the session's `death_count`.
 
-When combat records or deaths arrive faster than the host forwards them (more than 512 records, or
-two deaths, between 20 ms host ticks), the host publishes `source_events_dropped` with `source`
-(`combat` or `death`) and `count`, so no loss is silent.
+Anything lost before the host forwards it is reported as `source_events_dropped` with `source` and
+`count`, so no loss is silent. The host forwards every 20 ms tick, and the sources are bounded as
+follows:
+- `game_event`: 200 events;
+- `self_echo`: 32 echoes;
+- `combat`: 512 records;
+- `death`: reported when two deaths fall between two ticks.
 
 ### Self-position updates
 
@@ -207,9 +212,7 @@ port is bound; every
 state's `event_cursor` verbatim. Gaps are explicit; reread state and outstanding commands after one.
 Each event is `{cursor, at_ms, event}`, and the buffer keeps the newest 32 768. State publication is
 not an event, so an idle long-poll waits its full timeout. Read state with `GET /v2/player/state`.
-State's `clock_ms` is read when the state is read, so no `*_at_ms` is newer than it. If the host's
-bounded source queues (200 game events, 32 self echoes) dropped anything before it was forwarded,
-the host publishes `source_events_dropped` with `source` and `count`.
+State's `clock_ms` is read when the state is read, so no `*_at_ms` is newer than it.
 Received chat (including NPC say) carries packet provenance; other game events are labeled client events.
 Outbound local messages are not receipt evidence. `received_self_echo` records a server-returned
 self message with channel/sender/text and `recipient_delivery_confirmed:false`; it does not confirm

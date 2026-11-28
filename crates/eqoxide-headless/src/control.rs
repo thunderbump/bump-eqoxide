@@ -491,6 +491,12 @@ impl Control {
             .map(|e| e.receipt.clone())
     }
 
+    /// Identities consumed from the ordinary space, for tests.
+    #[cfg(test)]
+    pub(crate) fn identities_for_test(&self) -> usize {
+        self.shared.journal.lock().unwrap().identities
+    }
+
     /// The event payloads after `after`, for host tests.
     #[cfg(test)]
     pub(crate) fn events_after_for_test(&self, after: u64) -> Vec<Value> {

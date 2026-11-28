@@ -1021,7 +1021,12 @@ fn the_live_limit_counts_pending_safety_commands() {
     }
     let blocked = control.admit("walk".into(), movement()).unwrap_err();
     assert_eq!((blocked.0, blocked.1.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "live_command_limit"));
-    assert!(control.command("walk").is_none(), "a 503 consumes no identity");
+    let before = control.identities_for_test();
+    for _ in 0..5 {
+        assert!(control.admit("walk".into(), movement()).is_err());
+    }
+    assert_eq!(control.identities_for_test(), before, "a 503 consumes no identity");
+    assert!(control.command("walk").is_none());
     assert_eq!(control.admit("off-64".into(), request(json!({"kind":"attack_off"}))).unwrap().0,
         StatusCode::ACCEPTED, "a safety command is still admitted");
 }
@@ -1088,4 +1093,26 @@ fn fences_supersessions_and_refusals_all_retire() {
     assert!(control.command("stale-0").is_none(), "refusals are evicted like any terminal receipt");
     assert!(control.command("stale-1").is_some() && control.command("stale-2").is_some(),
         "exactly the retention bound is kept");
+}
+
+/// Design A2.2: a dispatched `camp` spans the readiness drop and zone change it causes; an
+/// undispatched one is still refused by the fence.
+#[test]
+fn a_dispatched_camp_spans_fences() {
+    let control = control(10, 100);
+    control.admit("camp".into(), request(json!({"kind":"camp"}))).unwrap();
+    control.drain_actions();
+    control.mark_dispatched("camp").unwrap();
+    control.set_ready(false);
+    control.publish_state(5, json!({})).unwrap();
+    let camp = control.command("camp").unwrap();
+    assert_eq!((camp.status, camp.terminal), (CommandStatus::Accepted, false));
+    control.publish_state(6, json!({})).unwrap();
+    control.set_ready(true);
+    let mut queued = request(json!({"kind":"camp"}));
+    queued["zone_epoch"] = json!(6);
+    control.admit("camp-2".into(), queued).unwrap();
+    control.set_ready(false);
+    assert_eq!(control.command("camp-2").unwrap().status, CommandStatus::Refused,
+        "an undispatched camp is still fenced");
 }
