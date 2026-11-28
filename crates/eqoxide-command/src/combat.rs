@@ -6,6 +6,7 @@
 //! were (the HTTP handler and `ActionLoop::tick`). No behavior change — just one typed surface.
 
 use super::actions::TracedRequest;
+use std::sync::atomic::Ordering;
 use super::{Action, CommandState};
 use eqoxide_ipc::{CastEnd, CastRequest, CommandResult};
 use tokio::sync::oneshot;
@@ -20,14 +21,30 @@ impl CommandState {
     }
 
     /// Toggle auto-attack (POST/DELETE /v1/combat/attack, the Attack button). `on` = engage.
+    /// An off here is explicit: it is sent even if the client believes attack is already off.
     pub fn request_attack(&self, on: bool) -> bool {
-        self.enqueue(&self.combat.attack, on, false, Action::CombatAttack)
+        self.enqueue_after(&self.combat.attack, on, false, Action::CombatAttack, || {
+            if !on {
+                self.combat.attack_off_forced.store(true, Ordering::SeqCst);
+            }
+        })
     }
 
-    /// Safety-off is last-wins. An overwritten attack must never lend its ID to the off packet.
+    /// Implicit safety off (a halt, lease expiry, sit, camp), last-wins. The network owner sends it
+    /// only while attack is on; with attack off it is drained and nothing goes on the wire. An
+    /// overwritten attack must never lend its ID to the off packet.
     pub fn overwrite_attack_off(&self, command: Option<&str>) {
         let mut slot = self.combat.attack.lock().unwrap();
         *slot = Some(false);
+        self.actions.set_packet_command(std::sync::Arc::as_ptr(&self.combat.attack) as usize, command);
+    }
+
+    /// Explicit off (the `attack_off` command), last-wins like [`Self::overwrite_attack_off`], but
+    /// always sent: it is a script's safety stop and a tester's way to send a redundant off.
+    pub fn force_attack_off(&self, command: Option<&str>) {
+        let mut slot = self.combat.attack.lock().unwrap();
+        *slot = Some(false);
+        self.combat.attack_off_forced.store(true, Ordering::SeqCst);
         self.actions.set_packet_command(std::sync::Arc::as_ptr(&self.combat.attack) as usize, command);
     }
 
@@ -82,7 +99,17 @@ impl CommandState {
     }
 
     pub fn take_attack_with_command(&self) -> Option<TracedRequest<bool>> {
-        self.dequeue_with_command(&self.combat.attack)
+        self.take_attack_request().map(|(on, command, _)| (on, command))
+    }
+
+    /// Drain the attack slot with its packet attribution and whether an off was explicit. The
+    /// forced flag is read and cleared under the slot lock, so it always belongs to this payload.
+    pub fn take_attack_request(&self) -> Option<(bool, Option<std::sync::Arc<str>>, bool)> {
+        let mut slot = self.combat.attack.lock().unwrap();
+        let on = slot.take()?;
+        let forced = self.combat.attack_off_forced.swap(false, Ordering::SeqCst);
+        let command = self.actions.drain(std::sync::Arc::as_ptr(&self.combat.attack) as usize).ok()?;
+        Some((on, command, forced))
     }
 
     /// Drain a pending consider request.

@@ -554,9 +554,13 @@ pub struct ActionLoop {
     same_zone_cross_at: Option<Instant>,
     position_seq:     u16,
     last_tick:        Instant,
-    /// Whether auto-attack is currently engaged (set by the /attack toggle). While true, the pet
-    /// attacks the current target.
+    /// The last `OP_AutoAttack` state this client put on the wire in the current zone. While true,
+    /// the pet attacks the current target. The server's flag starts false in every zone process
+    /// (`Client::Client`, bump-EQEmu cd66dd0a6 zone/client.cpp:227) and only our `OP_AutoAttack 1`
+    /// sets it (client_packet.cpp:3538), so this mirrors the server's flag exactly.
     auto_attack:      bool,
+    /// The zone epoch `auto_attack` belongs to. A new zone resets it, as the new zone's Client does.
+    auto_attack_epoch: u64,
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
     last_pet_target:  Option<u32>,
@@ -705,6 +709,7 @@ impl ActionLoop {
             position_seq: 0,
             last_tick: Instant::now(),
             auto_attack: false,
+            auto_attack_epoch: 0,
             last_pet_target: None,
             controller,
             guild_slots,
@@ -1921,8 +1926,22 @@ impl ActionLoop {
     fn drain_combat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Check attack request — send OP_AUTO_ATTACK(1) to start, OP_AUTO_ATTACK(0) to stop.
         // Server expects exactly 4 bytes; byte[0]=1 enables, byte[0]=0 disables.
-        let attack_req = self.command.take_attack_with_command();
-        if let Some((on, command_id)) = attack_req {
+        if gs.zone_epoch != self.auto_attack_epoch {
+            self.auto_attack_epoch = gs.zone_epoch;
+            self.auto_attack = false;
+            gs.auto_attack = false;
+        }
+        let attack_req = self.command.take_attack_request();
+        if let Some((on, command_id, forced)) = attack_req {
+            // An implicit off while the server's flag is already off changes nothing there, and a
+            // real client never sends one: drain it and send nothing. Every safety stop (zone
+            // entry, readiness loss, lease expiry, sit, camp) writes off unconditionally; this is
+            // where it becomes a packet only if attack is actually on. An explicit off (`forced`)
+            // is always sent: it is a script's safety stop, and this belief can be wrong.
+            if !on && !forced && !self.auto_attack {
+                tracing::debug!("EQ: auto-attack already off; nothing sent");
+                return;
+            }
             self.auto_attack = on;
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
             stream.send_app_packet_with_command(OP_AUTO_ATTACK, &payload, command_id.as_ref());
@@ -5728,7 +5747,7 @@ mod tests {
         tell.scope(async { nav.command.request_chat_send(message("tracked")) }).await;
         let attack = tracker.begin_for_zone("attack", 1).with_packet_command("attack");
         assert!(attack.scope(async { nav.command.request_attack(true) }).await);
-        nav.command.overwrite_attack_off(Some("off"));
+        nav.command.force_attack_off(Some("off"));
 
         nav.drain_target(&mut stream, &mut gs);
         nav.drain_merchant(&mut stream, &mut gs);

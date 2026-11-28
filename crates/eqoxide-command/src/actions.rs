@@ -205,7 +205,7 @@ impl ActionTracker {
         for id in stale {self.finish(id,"refused","stale_zone_epoch_before_dispatch");}
         keep
     }
-    fn drain(&self, key: usize) -> Result<PacketCommand, ()> {
+    pub(crate) fn drain(&self, key: usize) -> Result<PacketCommand, ()> {
         let mut state = self.0.lock().unwrap();
         let command = state.packet_commands.remove(&key);
         if let Some((expected, id)) = state.fences.remove(&key) {

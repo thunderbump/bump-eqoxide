@@ -2055,6 +2055,10 @@ pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 #[derive(Clone, Default)]
 pub struct CombatSlots {
     pub attack:   AttackReq,
+    /// Set, under the `attack` lock, when an off was asked for explicitly (`attack_off`, v1
+    /// `DELETE /v1/combat/attack`, a UI toggle). The drain sends an explicit off even when it
+    /// believes attack is already off; an implicit safety off is sent only while attack is on.
+    pub attack_off_forced: Arc<std::sync::atomic::AtomicBool>,
     pub cast:     CastReq,
     /// The honest awaited-cast slot (A3 Migration 3, #448) — sibling of `cast`. See [`CastAwaitReq`].
     pub cast_await: CastAwaitReq,

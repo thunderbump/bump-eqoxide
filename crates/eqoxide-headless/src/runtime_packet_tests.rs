@@ -84,6 +84,14 @@ impl Session {
         }
     }
 
+    /// Turn attack on the way a UI toggle does, outside the journal, and put it on the wire, so the
+    /// network owner knows attack is on. Setting `gs.auto_attack` alone would not tell it.
+    fn engage(&mut self) {
+        assert!(self.host.command.request_attack(true));
+        self.drain();
+        assert!(self.gs.auto_attack);
+    }
+
     fn drain(&mut self) {
         drain_gameplay_commands(
             &mut self.action_loop, &mut self.stream, &mut self.gs, &self.lifecycle,
@@ -135,16 +143,26 @@ async fn attack_owns_auto_attack_packet() {
 #[tokio::test]
 async fn sit_owns_attack_off_and_appearance_packets() {
     let mut session = Session::new().await;
+    session.engage();
     session.dispatch("sit", json!({"kind":"sit"})).await;
     session.drain();
     session.assert_packets("sit", &[OP_AUTO_ATTACK, OP_SPAWN_APPEARANCE]).await;
+}
+
+/// A real client's sit sends no attack-off when attack is off; sending one regardless turns this red.
+#[tokio::test]
+async fn sit_with_attack_off_sends_only_appearance() {
+    let mut session = Session::new().await;
+    session.dispatch("sit", json!({"kind":"sit"})).await;
+    session.drain();
+    session.assert_packets("sit", &[OP_SPAWN_APPEARANCE]).await;
 }
 
 /// Queuing attack-off before reserving the busy sit slot emits a packet for a refused command.
 #[tokio::test]
 async fn refused_sit_owns_no_packets() {
     let mut session = Session::new().await;
-    session.gs.auto_attack = true;
+    session.engage();
     session.gs.sitting = true;
     // Occupy the slot independently of the journal's one-command admission rule.
     assert!(session.host.command.request_sit(false));
@@ -196,11 +214,20 @@ async fn awaited_open_owns_shop_request_packet() {
 #[tokio::test]
 async fn camp_owns_camp_appearance_and_attack_off_packets() {
     let mut session = Session::new().await;
-    session.gs.auto_attack = true;
+    session.engage();
     session.dispatch("camp", json!({"kind":"camp"})).await;
     session.drain();
     session.assert_packets("camp", &[OP_CAMP, OP_SPAWN_APPEARANCE, OP_AUTO_ATTACK]).await;
     assert!(!session.gs.auto_attack);
+}
+
+/// Camp's attack-off is an implicit side effect: with attack off it puts nothing on the wire.
+#[tokio::test]
+async fn camp_with_attack_off_sends_no_attack_off() {
+    let mut session = Session::new().await;
+    session.dispatch("camp", json!({"kind":"camp"})).await;
+    session.drain();
+    session.assert_packets("camp", &[OP_CAMP, OP_SPAWN_APPEARANCE]).await;
 }
 
 
@@ -238,11 +265,21 @@ async fn merchant_close_owns_shop_request_packet() {
 #[tokio::test]
 async fn attack_off_owns_auto_attack_packet() {
     let mut session = Session::new().await;
-    session.gs.auto_attack = true;
+    session.engage();
     session.dispatch("off", json!({"kind":"attack_off"})).await;
     session.drain();
     session.assert_packets("off", &[OP_AUTO_ATTACK]).await;
     assert!(!session.gs.auto_attack);
+}
+
+/// An explicit `attack_off` is sent even when the client believes attack is already off
+/// (coordination: it is the script's safety stop). Routing it through the implicit off turns this red.
+#[tokio::test]
+async fn explicit_attack_off_is_sent_while_attack_is_off() {
+    let mut session = Session::new().await;
+    session.dispatch("off", json!({"kind":"attack_off"})).await;
+    session.drain();
+    session.assert_packets("off", &[OP_AUTO_ATTACK]).await;
 }
 
 /// Removing the dispatch tag from inventory move loses the emitted move packet.
