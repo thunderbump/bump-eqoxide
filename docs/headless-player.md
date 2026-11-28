@@ -108,9 +108,55 @@ process provides no exactly-once guarantee across a crash.
 
 State contains one published revision, native geometry digest, network tick/inbound/link ages,
 predicted feet position, vitals, inventory and catalog revisions. The roster is received knowledge
-within 500 units, sorted by spawn ID and capped at 256. `complete:false` discloses that it is not
-an authoritative world roster; truncation is separate. LOS is a local static native-map query.
-Unknown instance ID is null. Inventory includes local prediction and does not prove a save.
+within 500 units of the predicted position, nearest first (ties by spawn ID) and capped at 256.
+Each entity carries `distance` from that position, `heading` and the nine `equipment` material IDs
+as received. Every range check on a command measures from the self position in the last published
+state, so a script reads the origin the host decides with. The entity's position is its current one,
+which can have moved since that publication. Ordinary commands are not admitted until a publication
+has shown a self position.
+`complete:false` discloses that it is not an authoritative world roster; truncation is separate.
+LOS is a local static native-map query. Unknown instance ID is null. Inventory includes local
+prediction and does not prove a save.
+
+Beside the prediction, `self` carries what the server said:
+- `server_position`: the last position the server asserted for self, or null. Its fields are
+  `position` (feet datum), `heading`, `source` and `at_ms`. `source` is one of:
+  - `server_spawn`: the self spawn at zone entry;
+  - `server_relocation`: a bind respawn in this zone, or a same-zone teleport, with the heading the
+    packet carried. A bind into another zone is recorded by that zone's self spawn;
+  - `server_correction`: a self position update more than 12 units from the client's mirrored
+    position in the horizontal plane, the test that increments `corrections.count`;
+  - `server_update`: any other self position update.
+
+  The server does not echo a client's ordinary movement back to it, so in normal play this field
+  holds the last server-originated placement, not the latest step. Cleared at zone entry, and null
+  until the server's `OP_NewZone` for that zone arrives (the self spawn comes first). The host also
+  waits for it before loading geometry and placing the body.
+- `corrections`: `count` for the session, and `last` (`from`, `to`, `at_ms`), which is cleared at
+  zone entry.
+- `level`.
+- `mana` and `endurance`, each `{value, max, known}`. Mana `max` is the highest mana the client
+  has observed, which can be below the true maximum early in a session. `endurance.confirmed` is true once a server
+  update has arrived.
+- `xp`: `{pct}`, progress through the current level as the server reports it.
+- `buffs`: `{slot, spell_id, ticks_remaining}`. `ticks_remaining` is the count in the last buff
+  packet, not a live countdown. A negative value is a non-countdown buff, such as permanent
+  (-1000) or an aura.
+- `skills`.
+- `dead`.
+- `killer`: `{id, name}` after a death. `id` comes from the death packet and is kept even when
+  `name` is unknown, in which case `name` is null. A self-inflicted death names the player.
+
+Each received `OP_Damage` is also published as a `combat` event: `record_id` (monotonic),
+`zone_epoch`, `source_id`, `target_id`, `source_name` and `target_name` (resolved when the packet
+arrived, null if unknown then), `amount` (the damage on a `hit`, else 0), `spell_id` (null for melee),
+`damage_type` (EQEmu's raw damage-type code, not a skill ID) and `result`. `result` is one of `hit`, `miss`, `block`, `parry`, `riposte`, `dodge`,
+`invulnerable`, `rune`, `landed` (a spell action with zero damage) or `other`. A death of self is
+published once as `died`, with the same `killer` and the session's `death_count`.
+
+When combat records or deaths arrive faster than the host forwards them (more than 512 records, or
+two deaths, between 20 ms host ticks), the host publishes `source_events_dropped` with `source`
+(`combat` or `death`) and `count`, so no loss is silent.
 
 ### Self-position updates
 

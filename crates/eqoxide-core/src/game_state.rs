@@ -1081,6 +1081,105 @@ pub struct ControllerHold {
     pub secs: f32,
 }
 
+/// Which server message last placed the player (central-6ly1.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerPositionSource {
+    /// A self `OP_ClientUpdate` within the correction radius of the client's position.
+    Update,
+    /// A self `OP_ClientUpdate` that moved the player more than the correction radius.
+    Correction,
+    /// The received self spawn at zone entry.
+    Spawn,
+    /// A server-directed placement: a bind respawn or a same-zone teleport.
+    Relocation,
+}
+
+impl ServerPositionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Update => "server_update",
+            Self::Correction => "server_correction",
+            Self::Spawn => "server_spawn",
+            Self::Relocation => "server_relocation",
+        }
+    }
+}
+
+/// The last position the server asserted for the player, in the foot datum.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerSelfPosition {
+    pub pos: [f32; 3],
+    /// Internal CCW degrees, the same convention as `player_heading`.
+    pub heading: f32,
+    pub source: ServerPositionSource,
+    pub at: std::time::Instant,
+}
+
+/// One server correction: where the client had the player and where the server put it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerCorrection {
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+    pub at: std::time::Instant,
+}
+
+/// One received `OP_Damage`, kept structured so callers need not parse the combat text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CombatRecord {
+    /// Monotonic per session; never reused.
+    pub id: u64,
+    pub source_id: u32,
+    pub target_id: u32,
+    /// The wire `damage` when it is a hit (> 0), else 0.
+    pub amount: i32,
+    /// `None` for melee (wire 0 or `SPELL_UNKNOWN`).
+    pub spell_id: Option<u32>,
+    /// The wire `type` byte: EQEmu's damage-type code for the swing or spell, not a skill ID.
+    pub damage_type: u8,
+    pub result: CombatResult,
+    /// Names resolved when the packet arrived, so a later spawn-ID reuse cannot rename them.
+    /// `None` when the spawn was not known then.
+    pub source_name: Option<String>,
+    pub target_name: Option<String>,
+    /// `GameState::zone_epoch` when the packet arrived.
+    pub zone_epoch: u64,
+    pub at: std::time::Instant,
+}
+
+/// The outcome a received `OP_Damage` reports. Negative wire values are EQEmu's `DMG_*` sentinels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombatResult {
+    Hit, Miss, Block, Parry, Riposte, Dodge, Invulnerable, Rune, Other,
+    /// A spell action with no positive damage: a heal, buff or zero-damage landing.
+    Landed,
+}
+
+impl CombatResult {
+    pub fn from_wire(damage: i32) -> Self {
+        match damage {
+            d if d > 0 => Self::Hit,
+            0 => Self::Miss,
+            -1 => Self::Block,
+            -2 => Self::Parry,
+            -3 => Self::Riposte,
+            -4 => Self::Dodge,
+            -5 => Self::Invulnerable,
+            -6 => Self::Rune,
+            _ => Self::Other,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit", Self::Miss => "miss", Self::Block => "block", Self::Parry => "parry",
+            Self::Riposte => "riposte", Self::Dodge => "dodge", Self::Invulnerable => "invulnerable",
+            Self::Rune => "rune", Self::Other => "other", Self::Landed => "landed",
+        }
+    }
+}
+
+/// How many structured combat records `GameState` keeps. Consumers drain by `id`.
+pub const COMBAT_RECORD_CAP: usize = 512;
+
 /// Why `ActionLoop::stream_position` put an `OP_ClientUpdate` on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionSendReason {
@@ -1576,6 +1675,14 @@ pub struct GameState {
     /// happened this zone. ZONE-SCOPED: `begin_zone_in` clears it, because `to` names a point in the
     /// zone being left. The `client_relocations` counter above is what survives a zone change.
     pub last_relocation: Option<Relocation>,
+    /// The last position the server asserted for the player (central-6ly1.8). ZONE-SCOPED: a
+    /// departed zone's coordinates say nothing about the new one.
+    pub server_self_position: Option<ServerSelfPosition>,
+    /// The most recent server correction, beside the `server_corrections` counter. ZONE-SCOPED.
+    pub last_server_correction: Option<ServerCorrection>,
+    /// Received `OP_Damage`, structured, newest last, at most `COMBAT_RECORD_CAP` (central-6ly1.8).
+    pub combat_records: VecDeque<CombatRecord>,
+    pub next_combat_id: u64,
 
     // Loot state
     /// Corpse spawn_ids queued for auto-looting (populated by OP_BecomeCorpse).
@@ -1727,6 +1834,14 @@ pub struct GameState {
     /// happened. Unlike `player_dead_since` these PERSIST past the respawn so `/v1/observe/debug`
     /// can report a recent death (dead / killed_by / died_ago_secs) even after reviving. (#284)
     pub killed_by: String,
+    /// The killer's spawn ID from the death packet, kept when its name is unknown (central-6ly1.8).
+    /// `None` until a death, and when the packet named spawn 0.
+    pub killer_id: Option<u32>,
+    /// Self deaths this session, so a consumer can tell two deaths from one (central-6ly1.8).
+    pub death_count: u32,
+    /// The last death was self-inflicted, decided at death time, so a later spawn-ID change
+    /// cannot relabel the killer.
+    pub killer_is_self: bool,
     pub died_at: Option<std::time::Instant>,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
@@ -1766,6 +1881,13 @@ impl GameState {
             automatic_zone_crossing: true,
             ..Default::default()
         }
+    }
+
+    /// Record a position the server asserted for the player, in the feet datum (central-6ly1.8).
+    pub fn record_server_position(&mut self, pos: [f32; 3], heading: f32, source: ServerPositionSource) {
+        self.server_self_position = Some(ServerSelfPosition {
+            pos, heading, source, at: std::time::Instant::now(),
+        });
     }
 
     /// Start a zone-server session (login zone handoff, or an in-game zone change): purge the
@@ -1829,6 +1951,8 @@ impl GameState {
         // coordinate unread. Same residual window `landed_fall_height` carries and #871 tracks for
         // `player_pos_known` — closed here rather than ridden.
         self.last_relocation = None;
+        self.server_self_position = None;
+        self.last_server_correction = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
@@ -3991,6 +4115,10 @@ pub(crate) mod tests {
         }
         gs.player_afloat_stall = Some(clock.stall().expect("fixture must reach the stall threshold"));
         gs.last_relocation = Some(Relocation { to: [-812.5, 43.0, -119.75], distance: 96.0 });
+        let now = std::time::Instant::now();
+        gs.server_self_position = Some(super::ServerSelfPosition {
+            pos: [1.0, 2.0, 3.0], heading: 0.0, source: super::ServerPositionSource::Update, at: now });
+        gs.last_server_correction = Some(super::ServerCorrection { from: [0.0; 3], to: [99.0, 0.0, 0.0], at: now });
         gs.target_id = Some(18);
         gs.target_name = Some("Guard_Drath000".into());
         gs.target_hp_pct = Some(100.0);
@@ -4043,6 +4171,8 @@ pub(crate) mod tests {
         assert!(gs.player_hold.is_none(), "player_hold");
         assert!(gs.player_afloat_stall.is_none(), "player_afloat_stall");
         assert!(gs.last_relocation.is_none(), "last_relocation");
+        assert!(gs.server_self_position.is_none(), "server_self_position");
+        assert!(gs.last_server_correction.is_none(), "last_server_correction");
         assert!(gs.target_id.is_none(), "target_id");
         assert!(gs.target_name.is_none(), "target_name");
         assert!(gs.target_hp_pct.is_none(), "target_hp_pct");
@@ -4423,6 +4553,8 @@ pub(crate) mod tests {
             // `client_relocations` COUNTER beside it is NOT here — it is session-monotonic; see the
             // NOT-ZONE-SCOPED group below.
             last_relocation: _,
+            // central-6ly1.8: both name coordinates in the departed zone.
+            server_self_position: _, last_server_correction: _,
             target_id: _, target_name: _, target_hp_pct: _,
             target_con: _, target_con_name: _, target_attitude: _,
             target_cleared_reason: _,
@@ -4463,7 +4595,7 @@ pub(crate) mod tests {
             xp_pct: _,
             coin: _, coin_confirmed: _, unverified_buys: _,
             // Death record: `last_cast`-shaped — a true record of something that already happened.
-            player_dead: _, player_dead_since: _, killed_by: _, died_at: _, last_cast: _,
+            player_dead: _, player_dead_since: _, killed_by: _, killer_id: _, death_count: _, killer_is_self: _, died_at: _, last_cast: _,
             // Group/guild/social: keyed by NAME, and a group follows the player across a zone line.
             group_members: _, group_leader: _, pending_invite: _,
             guild_names: _, guild_members: _, pending_guild_invite: _, who_roster: _,
@@ -4476,6 +4608,7 @@ pub(crate) mod tests {
             tasks: _, completed_task_history: _,
             // Logs, feeds and session plumbing.
             messages: _, chat_events: _, received_self_echoes: _, next_chat_id: _, last_book_text: _, ucs: _,
+            combat_records: _, next_combat_id: _,
             // #925: `client_relocations` counts client-side body relocations for the life of the
             // session, exactly like `server_corrections` beside it. (The `last_relocation` detail it
             // pairs with IS zone-scoped — see the ZONE-SCOPED group above.)

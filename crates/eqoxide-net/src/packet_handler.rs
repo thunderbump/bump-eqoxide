@@ -1255,7 +1255,12 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         // the WASD override / lerp), so they don't jerk the character. Only surface + count GENUINE
         // corrections (anti-cheat snaps, wall clips, teleports), which are much larger.
         const CORRECTION_SQ: f32 = 144.0; // 12u — above normal movement jitter, below real rubber-bands
-        if dx * dx + dy * dy > CORRECTION_SQ {
+        let corrected = dx * dx + dy * dy > CORRECTION_SQ;
+        let now = std::time::Instant::now();
+        if corrected {
+            gs.last_server_correction = Some(eqoxide_core::game_state::ServerCorrection {
+                from: [gs.player_x, gs.player_y, gs.player_z], to: [upd.x, upd.y, z_foot], at: now,
+            });
             tracing::info!("SERVER_CORRECT: player pos ({:.1},{:.1},{:.1}) → ({:.1},{:.1},{:.1}) delta ({:.1},{:.1},{:.1})",
                       gs.player_x, gs.player_y, gs.player_z, upd.x, upd.y, upd.z, dx, dy, dz);
             gs.log_msg("zone", &format!("Server corrected position by ({:.0},{:.0},{:.0})", dx, dy, dz));
@@ -1274,6 +1279,9 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
 
         // Keep the player's heading live from real server position updates.
         gs.player_heading = upd.heading;
+        use eqoxide_core::game_state::ServerPositionSource;
+        gs.record_server_position([upd.x, upd.y, z_foot], upd.heading,
+            if corrected { ServerPositionSource::Correction } else { ServerPositionSource::Update });
     } else if let Some(e) = gs.world.entities.get_mut(&sid) {
         e.x = upd.x;
         e.y = upd.y;
@@ -1990,6 +1998,9 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
         gs.killed_by = gs.world.entities.get(&killer_id).map(|e| e.name.clone())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| "something".to_string());
+        gs.killer_id = (killer_id != 0).then_some(killer_id);
+        gs.death_count = gs.death_count.wrapping_add(1);
+        gs.killer_is_self = killer_id != 0 && killer_id == gs.player_id;
         gs.died_at   = Some(std::time::Instant::now());
         gs.hp_pct    = 0.0;
         gs.player_dead = true; // dead pose (eqoxide#61)
@@ -2060,6 +2071,12 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     // (heal/buff/nuke/DoT); 0 or SPELL_UNKNOWN (0xFFFF) for a melee swing.
     let spellid   = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
     let damage    = i32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
+    // central-6ly1.8: names as of this packet, for the structured record below.
+    let known_name = |id: u32| -> Option<String> {
+        if id == gs.player_id && id != 0 { return Some(gs.player_name.clone()); }
+        gs.world.entities.get(&id).map(|e| e.name.clone())
+    };
+    let (record_source, record_target) = (known_name(source_id), known_name(target_id));
     let target_name = gs.world.entities.get(&target_id).map(|e| e.name.clone())
         .unwrap_or_else(|| if target_id == gs.player_id { gs.player_name.clone() } else { format!("#{target_id}") });
     let source_name = gs.world.entities.get(&source_id).map(|e| e.name.clone())
@@ -2098,6 +2115,30 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     };
     tracing::info!("EQ: combat: {msg}");
     gs.log_msg("combat", &msg);
+    // central-6ly1.8: the same packet, structured, so a caller need not parse the text above.
+    gs.next_combat_id += 1;
+    gs.combat_records.push_back(eqoxide_core::game_state::CombatRecord {
+        id: gs.next_combat_id,
+        source_id,
+        target_id,
+        amount: damage.max(0),
+        spell_id: (spellid != 0 && spellid != SPELL_UNKNOWN).then_some(spellid),
+        damage_type: payload[4],
+        // A spell with zero damage landed (a heal or buff); a negative value is still a DMG_*
+        // outcome sentinel, which EQEmu also sends for spells (an invulnerable target).
+        result: if spellid != 0 && spellid != SPELL_UNKNOWN && damage == 0 {
+            eqoxide_core::game_state::CombatResult::Landed
+        } else {
+            eqoxide_core::game_state::CombatResult::from_wire(damage)
+        },
+        source_name: record_source,
+        target_name: record_target,
+        zone_epoch: gs.zone_epoch,
+        at: std::time::Instant::now(),
+    });
+    while gs.combat_records.len() > eqoxide_core::game_state::COMBAT_RECORD_CAP {
+        gs.combat_records.pop_front();
+    }
 
     // #1005: NO local HP arithmetic here. The "optimistic local HP" block that used to sit at this
     // point (eqoxide#55) subtracted `damage`@9 from `gs.cur_hp` and recomputed `hp_pct` from it, to
@@ -3173,14 +3214,40 @@ fn apply_move_door(gs: &mut GameState, p: &[u8]) {
     gs.push_ack(ServerAck::DoorMoved { door_id });
 }
 
+/// Record a same-zone teleport's destination from its `RequestClientZoneChange_Struct` payload:
+/// y at 8, x at 12, wire z at 16, heading at 20 (central-6ly1.8).
+pub(crate) fn record_same_zone_teleport(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 24 { return; }
+    let f = |at: usize| f32::from_le_bytes(payload[at..at + 4].try_into().unwrap());
+    let (y, x, z) = (f(8), f(12), f(16));
+    gs.record_server_position([x, y, z - eqoxide_core::coord::WIRE_Z_OFFSET],
+        server_heading_to_ccw(f(20)), eqoxide_core::game_state::ServerPositionSource::Relocation);
+}
+
+/// A float heading in EQ units (0–512, the server's `m_Position.w`), as `ZonePlayerToBind_Struct`
+/// and `RequestClientZoneChange_Struct` carry it, in the client's CCW degrees.
+pub(crate) fn server_heading_to_ccw(eq_units: f32) -> f32 {
+    crate::protocol::cw_to_ccw((eq_units * 360.0 / 512.0).rem_euclid(360.0))
+}
+
 fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 20 { return; }
     let mut r = WireReader::new(payload, "OP_Respawn");
-    r.skip(4); // spawn_id / zone_id header (unused here)
+    let bind_zone = r.u16() as u32; // ZonePlayerToBind_Struct: bind_zone_id, then instance
+    r.skip(2);
     gs.player_x = r.f32();
     gs.player_y = r.f32();
     gs.player_z = r.f32() - eqoxide_core::coord::WIRE_Z_OFFSET; // wire→foot datum (#522)
     gs.player_pos_known = true; // server-authoritative respawn point (#513)
+    // central-6ly1.8: only a bind in this zone is a position here. A bind in another zone names
+    // coordinates there; the self spawn of that zone records them on entry.
+    // Native sends bind_zone_id 0 for a same-zone bind to SoF-and-later clients
+    // (eqemu:zone/zoning.cpp@cd66dd0a6:955), as `gameplay.rs` already reads it.
+    if bind_zone == 0 || bind_zone == gs.world.zone_id as u32 || gs.world.zone_id == 0 {
+        let heading = server_heading_to_ccw(f32::from_le_bytes(payload[16..20].try_into().unwrap()));
+        gs.record_server_position([gs.player_x, gs.player_y, gs.player_z], heading,
+            eqoxide_core::game_state::ServerPositionSource::Relocation);
+    }
     // #660 B2: the SERVER has now told us where we are, so the position is no longer the
     // client's crossing guess. This is the ONLY kind of event that clears it — the zone echo
     // settles which ZONE, not where in it.
@@ -3480,6 +3547,8 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         gs.player_z       = info.z - eqoxide_core::coord::WIRE_Z_OFFSET;
         gs.player_pos_known = true; // received self spawn establishes this zone's position
         gs.player_heading = info.heading;
+        gs.record_server_position([gs.player_x, gs.player_y, gs.player_z], info.heading,
+            eqoxide_core::game_state::ServerPositionSource::Spawn);
         gs.player_level   = info.level as u32;
         gs.player_race    = eq_race_to_code(info.race).to_string();
         gs.player_gender  = info.gender;
@@ -3691,6 +3760,18 @@ mod tests {
         gs2.player_id = 7; gs2.max_hp = 100; gs2.cur_hp = 100;
         super::apply_death(&mut gs2, &self_death_payload(7));
         assert_eq!(gs2.killed_by, "something");
+        // central-6ly1.8: the killer's ID and a session death count, without changing the
+        // graphical `killed_by` wording for a self-inflicted death.
+        assert_eq!((gs.killer_id, gs.death_count), (Some(42), 1));
+        assert!(!gs.killer_is_self, "a rat is not self");
+        let mut gs3 = GameState::new();
+        gs3.player_id = 7; gs3.player_name = "Me".into();
+        let mut p = vec![0u8; SIZE_DEATH];
+        p[0..4].copy_from_slice(&7u32.to_le_bytes());
+        p[4..8].copy_from_slice(&7u32.to_le_bytes()); // our own spawn killed us
+        super::apply_death(&mut gs3, &p);
+        assert_eq!((gs3.killer_id, gs3.killed_by.as_str()), (Some(7), "something"));
+        assert!(gs3.killer_is_self, "decided at death time");
     }
 
     #[test]
@@ -3707,6 +3788,7 @@ mod tests {
 
         apply_death(&mut gs, &self_death_payload(42)); // duplicate
         assert_eq!(gs.player_dead_since, first, "duplicate must not restart the timer");
+        assert_eq!(gs.death_count, 1, "a duplicate death packet is not a second death");
         let slain_count = gs.messages.iter().filter(|m| m.text.contains("slain")).count();
         assert_eq!(slain_count, 1, "duplicate death must not log a second slain message");
     }
@@ -4456,6 +4538,53 @@ mod tests {
         assert!(!gs.hp_verified(),
             "\"real EQ revives at full HP\" is the client's assumption about the server, not a \
              reading from it");
+    }
+
+    #[test]
+    fn apply_combat_damage_keeps_a_structured_record_6ly1_8() {
+        use super::apply_combat_damage;
+        use eqoxide_core::game_state::CombatResult;
+        let dmg = |target: u16, source: u16, damage_type: u8, spell: u32, damage: i32| -> [u8; 13] {
+            let mut b = [0u8; 13];
+            b[0..2].copy_from_slice(&target.to_le_bytes());
+            b[2..4].copy_from_slice(&source.to_le_bytes());
+            b[4] = damage_type;
+            b[5..9].copy_from_slice(&spell.to_le_bytes());
+            b[9..13].copy_from_slice(&damage.to_le_bytes());
+            b
+        };
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.zone_epoch = 3;
+        gs.player_name = "Me".into();
+        gs.world.entities.insert(99, eqoxide_core::game_state::make_entity(99, "a_rat", 0.0, 0.0, 0.0, true));
+        const MELEE: u32 = 0xFFFF; // SPELL_UNKNOWN: what EQEmu sends for a melee swing
+        apply_combat_damage(&mut gs, &dmg(99, 7, 1, MELEE, 24));
+        apply_combat_damage(&mut gs, &dmg(7, 99, 2, 0, -4));
+        apply_combat_damage(&mut gs, &dmg(99, 7, 0, 13, 0));
+        apply_combat_damage(&mut gs, &dmg(99, 7, 0, 13, -5)); // a spell on an invulnerable target
+        let r: Vec<_> = gs.combat_records.iter()
+            .map(|r| (r.id, r.source_id, r.target_id, r.amount, r.spell_id, r.damage_type, r.result)).collect();
+        assert_eq!(r, vec![
+            (1, 7, 99, 24, None, 1, CombatResult::Hit),
+            (2, 99, 7, 0, None, 2, CombatResult::Dodge),
+            (3, 7, 99, 0, Some(13), 0, CombatResult::Landed),
+            (4, 7, 99, 0, Some(13), 0, CombatResult::Invulnerable),
+        ]);
+        assert_eq!((gs.combat_records[0].source_name.as_deref(), gs.combat_records[0].target_name.as_deref()),
+            (Some("Me"), Some("a_rat")), "names resolved when the packet arrives");
+        assert_eq!(gs.combat_records[0].zone_epoch, 3, "the epoch the packet arrived in");
+        for (wire, result) in [(-1, CombatResult::Block), (-2, CombatResult::Parry), (-3, CombatResult::Riposte),
+                               (-5, CombatResult::Invulnerable), (-6, CombatResult::Rune), (-9, CombatResult::Other)] {
+            apply_combat_damage(&mut gs, &dmg(7, 99, 1, MELEE, wire));
+            assert_eq!(gs.combat_records.back().unwrap().result, result, "wire {wire}");
+        }
+        for _ in 0..eqoxide_core::game_state::COMBAT_RECORD_CAP {
+            apply_combat_damage(&mut gs, &dmg(99, 7, 1, 0, 1));
+        }
+        assert_eq!(gs.combat_records.len(), eqoxide_core::game_state::COMBAT_RECORD_CAP);
+        assert_eq!(gs.combat_records.back().unwrap().id, 10 + eqoxide_core::game_state::COMBAT_RECORD_CAP as u64,
+            "ids keep counting after eviction");
     }
 
     #[test]
@@ -5952,6 +6081,90 @@ mod tests {
         let mut gs = GameState::new();
         register_spawn(&mut gs, mk(1, 0.0, 0.0, 0.0, "a_rat"));
         assert!(gs.world.entities.contains_key(&1496), "a real NPC must still register even at (0,0,0)");
+    }
+
+    /// central-6ly1.8: a self update records where the server put us, and whether it was a
+    /// correction, in the foot datum; another spawn's update records nothing.
+    #[test]
+    fn a_bind_respawn_records_a_server_relocation_6ly1_8() {
+        use eqoxide_core::game_state::ServerPositionSource;
+        let bind = |zone: u16| {
+            let mut p = vec![0u8; 20];
+            p[0..2].copy_from_slice(&zone.to_le_bytes());
+            p[4..8].copy_from_slice(&55.0f32.to_le_bytes());
+            p[8..12].copy_from_slice(&(-3.0f32).to_le_bytes());
+            p[12..16].copy_from_slice(&(7.0 + eqoxide_core::coord::WIRE_Z_OFFSET).to_le_bytes());
+            p[16..20].copy_from_slice(&128.0f32.to_le_bytes()); // 128 of 512 units: 90° clockwise, east
+            p
+        };
+        let mut gs = GameState::new();
+        gs.world.zone_id = 2;
+        super::apply_bind_respawn(&mut gs, &bind(2));
+        let pos = gs.server_self_position.expect("a bind in this zone is a server-asserted position");
+        assert_eq!((pos.pos, pos.source), ([55.0, -3.0, 7.0], ServerPositionSource::Relocation));
+        assert!((pos.heading - 270.0).abs() < 0.01, "east is 270 counter-clockwise: {}", pos.heading);
+        let mut gs = GameState::new();
+        gs.world.zone_id = 2;
+        super::apply_bind_respawn(&mut gs, &bind(9));
+        assert!(gs.server_self_position.is_none(), "a bind in another zone names no position here");
+        let mut gs = GameState::new();
+        gs.world.zone_id = 2;
+        super::apply_bind_respawn(&mut gs, &bind(0));
+        assert!(gs.server_self_position.is_some(), "native sends zone 0 for a same-zone bind");
+    }
+
+    #[test]
+    fn a_same_zone_teleport_records_a_server_relocation_6ly1_8() {
+        use eqoxide_core::game_state::ServerPositionSource;
+        let mut p = vec![0u8; 24];
+        p[8..12].copy_from_slice(&20.0f32.to_le_bytes()); // y
+        p[12..16].copy_from_slice(&10.0f32.to_le_bytes()); // x
+        p[16..20].copy_from_slice(&(5.0 + eqoxide_core::coord::WIRE_Z_OFFSET).to_le_bytes());
+        p[20..24].copy_from_slice(&384.0f32.to_le_bytes()); // 270° clockwise: west
+        let mut gs = GameState::new();
+        super::record_same_zone_teleport(&mut gs, &p);
+        let pos = gs.server_self_position.expect("recorded");
+        assert_eq!((pos.pos, pos.source), ([10.0, 20.0, 5.0], ServerPositionSource::Relocation));
+        assert!((pos.heading - 90.0).abs() < 0.01, "west is 90 counter-clockwise: {}", pos.heading);
+    }
+
+    #[test]
+    fn the_self_spawn_records_a_server_spawn_position_6ly1_8() {
+        use eqoxide_core::game_state::ServerPositionSource;
+        let mut gs = GameState::new();
+        gs.player_name = "Me".into();
+        super::register_spawn(&mut gs, crate::protocol::SpawnInfo {
+            spawn_id: 7, name: "Me".into(), npc: 0, race: 1, x: 1.0, y: 2.0,
+            z: 3.0 + eqoxide_core::coord::WIRE_Z_OFFSET, heading: 45.0,
+            ..crate::protocol::SpawnInfo::for_test()
+        });
+        let pos = gs.server_self_position.expect("the self spawn is a server-asserted position");
+        assert_eq!((pos.pos, pos.heading, pos.source), ([1.0, 2.0, 3.0], 45.0, ServerPositionSource::Spawn));
+    }
+
+    #[test]
+    fn a_self_position_update_records_the_server_position_6ly1_8() {
+        use super::apply_position_update;
+        use crate::protocol::encode_position_update;
+        use eqoxide_core::game_state::ServerPositionSource;
+        let off = eqoxide_core::coord::WIRE_Z_OFFSET;
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        apply_position_update(&mut gs, &encode_position_update(2, 10.0, 20.0, 30.0, 0.0));
+        assert!(gs.server_self_position.is_none());
+
+        apply_position_update(&mut gs, &encode_position_update(1, 5.0, 0.0, 10.0 + off, 90.0));
+        let p = gs.server_self_position.expect("recorded");
+        assert_eq!(p.pos, [5.0, 0.0, 10.0]);
+        assert!((p.heading - 90.0).abs() < 0.5, "heading recorded: {}", p.heading);
+        assert_eq!(p.source, ServerPositionSource::Update, "within 12u of the origin start");
+        assert!(gs.last_server_correction.is_none());
+
+        apply_position_update(&mut gs, &encode_position_update(1, 105.0, 0.0, 10.0 + off, 0.0));
+        let p = gs.server_self_position.expect("recorded");
+        assert_eq!(p.source, ServerPositionSource::Correction);
+        let c = gs.last_server_correction.expect("a correction is recorded");
+        assert_eq!((c.from, c.to), ([5.0, 0.0, 10.0], [105.0, 0.0, 10.0]));
     }
 
     /// **#543/#660 review B2 — the provisional marker must clear HERE, on the real handler.**

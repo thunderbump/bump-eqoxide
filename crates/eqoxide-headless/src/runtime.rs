@@ -131,6 +131,12 @@ struct Host {
     merchant_value: Value,
     last_event: u64,
     last_echo: u64,
+    /// The last `CombatRecord::id` and death instant published as events (central-6ly1.8).
+    last_combat: u64,
+    last_death_count: u32,
+    /// The self position in the last published state: every range check measures from this, so a
+    /// script reading state sees the same distances the host decides with (central-6ly1.8).
+    published_position: Option<[f32; 3]>,
 }
 impl Host {
     fn outcome(&self, id: &str, status: Status, reason: Option<&str>, evidence: Option<Value>) {
@@ -263,6 +269,32 @@ impl Host {
         if let Some(echo) = gs.received_self_echoes.back() {
             self.last_echo = echo.id;
         }
+        // Records older than the bounded source queue were evicted unseen: say so, never silently.
+        if let Some(first) = gs.combat_records.front() {
+            if first.id > self.last_combat + 1 {
+                self.control.publish_event(json!({"kind":"source_events_dropped","source":"combat",
+                    "count":first.id - self.last_combat - 1}));
+            }
+        }
+        for hit in gs.combat_records.iter().filter(|r| r.id > self.last_combat) {
+            self.control.publish_event(json!({"kind":"combat","source":"received_packet","record_id":hit.id,
+                "zone_epoch":hit.zone_epoch,"source_id":hit.source_id,"target_id":hit.target_id,
+                "source_name":hit.source_name,"target_name":hit.target_name,"amount":hit.amount,
+                "spell_id":hit.spell_id,"damage_type":hit.damage_type,"result":hit.result.as_str()}));
+        }
+        if let Some(hit) = gs.combat_records.back() {
+            self.last_combat = hit.id;
+        }
+        if gs.death_count != self.last_death_count {
+            // Two deaths between host reads leave only the latest killer: report the miss.
+            let missed = gs.death_count.wrapping_sub(self.last_death_count).saturating_sub(1);
+            if missed > 0 {
+                self.control.publish_event(json!({"kind":"source_events_dropped","source":"death","count":missed}));
+            }
+            self.last_death_count = gs.death_count;
+            self.control.publish_event(json!({"kind":"died","source":"received_packet","death_count":gs.death_count,
+                "killer":{"id":gs.killer_id,"name":known_killer_name(gs)}}));
+        }
         for event in self.command.actions().take_events() {
             if let Some((id, transaction)) = self.action_ids.remove(&event.id) {
                 let status = match event.result.as_str() {
@@ -288,6 +320,7 @@ impl Host {
     ) {
         let id = command.id;
         let req = command.request;
+        let me = self.published_position;
         if req.zone_epoch != self.epoch || (!ready && !req.operation.is_priority()) {
             self.outcome(
                 &id,
@@ -378,7 +411,7 @@ impl Host {
                 );
             }
             Operation::MerchantOpen { entity_id } => {
-                if !observed_entity(gs, entity_id as u32, 30.0) {
+                if !observed_entity(gs, me, entity_id as u32, 30.0) {
                     self.outcome(
                         &id,
                         Status::Refused,
@@ -450,13 +483,11 @@ impl Host {
                         match operation {
                             Operation::Loot { entity_id } => {
                                 gs.world.entities.get(&(entity_id as u32)).is_some_and(|e| {
-                                    e.dead
-                                        && e.is_npc
-                                        && e.dist_to(gs.player_x, gs.player_y, gs.player_z) <= 20.0
+                                    e.dead && e.is_npc && within(me, e, 20.0)
                                 }) && self.command.request_loot(entity_id as u32)
                             }
                             Operation::Target { entity_id } => {
-                                observed_entity(gs, entity_id as u32, 500.0)
+                                observed_entity(gs, me, entity_id as u32, 500.0)
                                     && self.command.request_target(entity_id as u32)
                             }
                             Operation::Attack { lease_ms } => {
@@ -464,10 +495,7 @@ impl Host {
                                     .target_id
                                     .and_then(|id| gs.world.entities.get(&id))
                                     .is_none_or(|e| {
-                                        e.dead
-                                            || !e.is_npc
-                                            || e.dist_to(gs.player_x, gs.player_y, gs.player_z)
-                                                > 30.0
+                                        e.dead || !e.is_npc || !within(me, e, 30.0)
                                     })
                                 {
                                     false
@@ -579,10 +607,88 @@ fn position_send_json(
             "age_ms":now.saturating_duration_since(sent.at).as_millis() as u64,"delivery_confirmed":false})
     })
 }
-fn observed_entity(gs: &GameState, id: u32, radius: f32) -> bool {
-    gs.world.entities.get(&id).is_some_and(|entity| {
-        !entity.dead && entity.dist_to(gs.player_x, gs.player_y, gs.player_z) <= radius
-    })
+/// Whether the session may run ordinary commands, apart from process shutdown and a terminal
+/// network outcome, which the run loop checks itself.
+fn host_ready(gs: &GameState, host: &Host, col_loaded: bool, tick_age: u64, link_age: u64, dropped: bool) -> bool {
+    gs.player_id != 0
+        && gs.player_pos_known
+        && !gs.world.zone_in_failed
+        && host.body.is_some()
+        && col_loaded
+        && tick_age < 500
+        && link_age < 15000
+        && !dropped
+        && gs.player_dead_since.is_none()
+        // Range checks measure from the last published position, so none can run before one.
+        && host.published_position.is_some()
+        && !(gs.max_hp > 0 && gs.cur_hp <= 0)
+}
+/// The received roster within 500 units of the published position, nearest first, ties by spawn
+/// ID, capped at 256 (central-6ly1.8). Empty while there is no body to measure from.
+fn roster(
+    gs: &GameState,
+    position: Option<[f32; 3]>,
+) -> (Vec<(f32, &eqoxide_core::game_state::Entity)>, bool) {
+    let mut nearby: Vec<_> = gs
+        .world
+        .entities
+        .values()
+        .filter_map(|entity| {
+            distance_from(position, entity)
+                .filter(|d| *d <= 500.0)
+                .map(|d| (d, entity))
+        })
+        .collect();
+    nearby.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.spawn_id.cmp(&b.1.spawn_id)));
+    let truncated = nearby.len() > 256;
+    nearby.truncate(256);
+    (nearby, truncated)
+}
+/// Self fields received from the server (central-6ly1.8), beside the local prediction.
+fn server_self_fields(gs: &GameState, started: Instant) -> serde_json::Map<String, Value> {
+    let value = json!({
+        // Null until OP_NewZone: the self spawn arrives first and would pair the destination's
+        // position with the departing zone's name.
+        "server_position": gs.server_self_position.filter(|_| gs.world.new_zone_applied).map(|p| json!({"position":p.pos,"heading":p.heading,
+            "source":p.source.as_str(),"at_ms":clock_ms(started,p.at)})),
+        "corrections": {"count":gs.server_corrections,"last":gs.last_server_correction.map(|c|
+            json!({"from":c.from,"to":c.to,"at_ms":clock_ms(started,c.at)}))},
+        "level": gs.player_level,
+        "mana": {"value":gs.cur_mana,"max":gs.max_mana,"known":gs.max_mana>0},
+        "endurance": {"value":gs.cur_endurance,"max":gs.max_endurance,"known":gs.max_endurance>0,
+            "confirmed":gs.endurance_confirmed},
+        "xp": {"pct":gs.xp_pct},
+        "buffs": gs.buffs.iter().map(|(slot,b)| json!({"slot":slot,"spell_id":b.spell_id,
+            "ticks_remaining":b.duration_ticks})).collect::<Vec<_>>(),
+        "skills": gs.player_skills,
+        "dead": gs.player_dead_since.is_some(),
+        "killer": gs.died_at.map(|_| json!({"id":gs.killer_id,"name":known_killer_name(gs)})),
+    });
+    match value {
+        Value::Object(map) => map,
+        _ => unreachable!("built as an object"),
+    }
+}
+/// The killer's name, or null when unknown. `GameState::killed_by` falls back to "something" when
+/// the death packet named no known spawn; a self-inflicted death names the player, resolved here
+/// so the graphical overlay's wording is unchanged.
+fn known_killer_name(gs: &GameState) -> Option<String> {
+    if gs.killer_is_self && !gs.player_name.is_empty() {
+        return Some(gs.player_name.clone());
+    }
+    let name = gs.killed_by.as_str();
+    (!name.is_empty() && name != "something").then(|| name.to_owned())
+}
+/// Distance from the published self position, the one value every range check and the roster
+/// use (central-6ly1.8). `None` while there is no body to measure from.
+fn distance_from(me: Option<[f32; 3]>, entity: &eqoxide_core::game_state::Entity) -> Option<f32> {
+    me.map(|p| entity.dist_to(p[0], p[1], p[2]))
+}
+fn within(me: Option<[f32; 3]>, entity: &eqoxide_core::game_state::Entity, radius: f32) -> bool {
+    distance_from(me, entity).is_some_and(|d| d <= radius)
+}
+fn observed_entity(gs: &GameState, me: Option<[f32; 3]>, id: u32, radius: f32) -> bool {
+    gs.world.entities.get(&id).is_some_and(|entity| !entity.dead && within(me, entity, radius))
 }
 async fn complete_await<T: serde::Serialize>(
     control: Control,
@@ -683,6 +789,9 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         merchant_value: Value::Null,
         last_event: 0,
         last_echo: 0,
+        last_combat: 0,
+        last_death_count: 0,
+        published_position: None,
     };
     let (net_tx, mut net) = tokio::sync::oneshot::channel();
     let config = profile.login_config();
@@ -757,6 +866,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             control.set_ready(false);
             host.body = None;
             host.epoch = gs.zone_epoch;
+            host.published_position = None;
             host.zone_in = ZoneIn::default();
             col = None;
             loaded_zone.clear();
@@ -767,8 +877,11 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             view.landed_fall_height = None;
             view.relocated = None;
         }
+        // Native sends the destination's self spawn before OP_NewZone, so the position can be
+        // known while `zone_name` still names the zone being left. Wait for the new zone itself.
         if gs.player_id != 0
             && gs.player_pos_known
+            && gs.world.new_zone_applied
             && !gs.world.zone_name.is_empty()
             && loaded_zone != gs.world.zone_name
         {
@@ -786,7 +899,12 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 }
             }
         }
-        if host.body.is_none() && gs.player_id != 0 && gs.player_pos_known && col.is_some() {
+        if host.body.is_none()
+            && gs.player_id != 0
+            && gs.player_pos_known
+            && gs.world.new_zone_applied
+            && col.is_some()
+        {
             let pos = [gs.player_x, gs.player_y, gs.player_z];
             if pos.iter().all(|v| v.is_finite()) {
                 host.body = Some(CharacterController::new(pos));
@@ -801,39 +919,20 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         drop(health);
         let ready = terminal.is_none()
             && !wiring.shutdown.load(Ordering::Acquire)
-            && gs.player_id != 0
-            && gs.player_pos_known
-            && !gs.world.zone_in_failed
-            && host.body.is_some()
-            && col.is_some()
-            && tick_age < 500
-            && link_age < 15000
-            && !dropped
-            && gs.player_dead_since.is_none()
-            && !(gs.max_hp > 0 && gs.cur_hp <= 0);
+            && host_ready(&gs, &host, col.is_some(), tick_age, link_age, dropped);
         host.step(&gs, col.as_deref(), ready, now, dt);
         host.update_knowledge(&gs);
         if now >= publish_at {
             let position = host.body.as_ref().map(|body| body.pos);
+            host.published_position = position;
             let last_send = host.controller_slots.controller_view.lock().unwrap().last_position_send;
             // Read the clock after the record, so `sent_at_ms` can never exceed `clock_ms`.
             let state_now = Instant::now();
-            let mut nearby: Vec<_> = gs
-                .world
-                .entities
-                .values()
-                .filter(|entity| {
-                    gs.player_pos_known
-                        && entity.dist_to(gs.player_x, gs.player_y, gs.player_z) <= 500.0
-                })
-                .collect();
-            nearby.sort_by_key(|entity| entity.spawn_id);
-            let truncated = nearby.len() > 256;
-            nearby.truncate(256);
-            let entities:Vec<_>=nearby.iter().map(|entity|json!({"id":entity.spawn_id,"class_id":entity.class_id,"name":entity.name,"npc":entity.is_npc,"dead":entity.dead,
-                "position":[entity.x,entity.y,entity.z],"hp_pct":entity.hp_pct,"level":entity.level,
+            let (nearby, truncated) = roster(&gs, position);
+            let entities:Vec<_>=nearby.iter().map(|(distance,entity)|json!({"id":entity.spawn_id,"class_id":entity.class_id,"name":entity.name,"npc":entity.is_npc,"dead":entity.dead,
+                "position":[entity.x,entity.y,entity.z],"distance":distance,"heading":entity.heading,"equipment":entity.equipment,"hp_pct":entity.hp_pct,"level":entity.level,
                 "los":position.zip(col.as_ref()).map(|(p,c)|c.line_clear([p[0],p[1],p[2]+5.0],[entity.x,entity.y,entity.z+5.0],0.0)),"los_source":"local_native_static_geometry"})).collect();
-            control.publish_state(host.epoch,json!({"clock_ms":clock_ms(started,state_now),"phase":if terminal.is_some(){"failed"}else if ready{"ready"}else{"not_ready"},"failure":terminal,
+            let mut state = json!({"clock_ms":clock_ms(started,state_now),"phase":if terminal.is_some(){"failed"}else if ready{"ready"}else{"not_ready"},"failure":terminal,
                 "freshness":{"network_tick_age_ms":tick_age,"inbound_age_ms":inbound_age,"link_age_ms":link_age},
                 "zone":{"id":gs.world.zone_id,"name":gs.world.zone_name,"instance_id":Value::Null},"geometry":geometry,
                 "self":{"id":gs.player_id,"name":gs.player_name,"position":position,"position_source":"local_prediction_from_received_self_spawn",
@@ -841,12 +940,16 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                     "hp":{"value":gs.cur_hp,"max":gs.max_hp,"known":gs.max_hp>0,"confirmed":gs.hp_confirmed},"sitting":gs.sitting,
                     "last_position_send":position_send_json(last_send,started,state_now),
                     "target_id":gs.target_id,"attack_on":gs.auto_attack,"motion_active":host.motion.is_some(),"hold":gs.player_hold.map(|hold|json!({"reason":hold.reason.as_str(),"seconds":hold.secs}))},
-                "nearby":{"available":gs.player_pos_known,"complete":false,"scope":"received_roster_within_radius","radius":500,"limit":256,"truncated":truncated,"entities":entities},
+                "nearby":{"available":position.is_some(),"complete":false,"scope":"received_roster_within_radius","radius":500,"limit":256,"truncated":truncated,"entities":entities},
                 "inventory":{"known":gs.inventory_received,"revision":host.inventory_revision,"items":gs.inventory,"source":"received_with_local_prediction","coin":gs.coin,"coin_confirmed":gs.coin_confirmed},
                 "merchant":{"known":gs.merchant_open.is_some(),"catalog_complete":false,"revision":host.merchant_revision,"open":gs.merchant_open,"items":gs.merchant_items},
                 "policy":{"loot":"explicit_only","automatic_zone_crossing":false},
                 "transactions_blocked_until_relog":host.transaction_uncertain.load(Ordering::Acquire)
-            }))?;
+            });
+            if let Some(me) = state["self"].as_object_mut() {
+                me.extend(server_self_fields(&gs, started));
+            }
+            control.publish_state(host.epoch, state)?;
             publish_at = now + Duration::from_millis(100);
         }
         control.set_ready(ready);
@@ -898,6 +1001,9 @@ mod tests {
             merchant_value: Value::Null,
             last_event: 0,
             last_echo: 0,
+        last_combat: 0,
+        last_death_count: 0,
+        published_position: None,
         }
     }
     fn floor() -> Collision {
@@ -1034,6 +1140,162 @@ mod tests {
         let view = *host.controller_slots.controller_view.lock().unwrap();
         assert_eq!(view.correction_adopted, 2, "adoption never moves backwards");
     }
+    fn rat(id: u32, x: f32) -> eqoxide_core::game_state::Entity {
+        eqoxide_core::game_state::make_entity(id, "a_rat", x, 0.0, 0.0, true)
+    }
+    /// central-6ly1.8: range checks and the roster measure from the published position, not from
+    /// the net mirror `gs.player_x`, which can hold a different value (a server echo, a correction
+    /// not yet adopted).
+    #[test]
+    fn range_checks_and_roster_use_the_published_position() {
+        let mut gs = GameState::new();
+        gs.player_pos_known = true;
+        gs.player_x = 1000.0; // the mirror disagrees with the body
+        gs.world.entities.insert(7, rat(7, 25.0));
+        for id in (8..40).rev() {
+            gs.world.entities.insert(id, rat(id, 10.0));
+        }
+        let me = Some([0.0, 0.0, 0.0]);
+        assert!(observed_entity(&gs, me, 7, 30.0), "25 units from the body is in range");
+        assert!(!observed_entity(&gs, None, 7, 30.0), "no body, no range");
+        let (nearby, truncated) = roster(&gs, me);
+        let order: Vec<_> = nearby.iter().map(|(_, e)| e.spawn_id).collect();
+        let mut expected: Vec<u32> = (8..40).collect();
+        expected.push(7);
+        assert_eq!(order, expected, "nearest first, ties by spawn ID");
+        assert_eq!(nearby.last().unwrap().0, 25.0, "and each entry carries its distance");
+        assert!(!truncated);
+        assert!(roster(&gs, None).0.is_empty());
+    }
+    /// central-6ly1.8: a dispatched command measures range from the position the last state
+    /// publication showed, not from the body (which steps between publications) or the mirror.
+    ///
+    /// MUTATION CHECK: set `me` in `dispatch` from `self.body` or from `gs.player_x` → RED.
+    #[tokio::test]
+    async fn dispatch_measures_range_from_the_published_position() {
+        use tower::ServiceExt;
+        let mut host = host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        host.body = Some(CharacterController::new([1000.0, 0.0, 0.0]));
+        host.published_position = Some([0.0, 0.0, 0.0]);
+        let mut gs = GameState::new();
+        gs.zone_epoch = 1;
+        gs.player_x = -1000.0;
+        gs.world.entities.insert(7, rat(7, 25.0));
+        let body = json!({"session":"test-session","zone_epoch":1,"operation":{"kind":"target","entity_id":7}});
+        let request = axum::http::Request::builder().method("PUT").uri("/v2/player/commands/t1")
+            .header("authorization", "Bearer test-credential").header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string())).unwrap();
+        let response = host.control.router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+        for command in host.control.drain_actions() {
+            host.dispatch(command, &gs, true, Instant::now()).await;
+        }
+        let receipt = host.control.command("t1").unwrap();
+        assert_ne!(receipt.status, Status::Refused,
+            "25 units from the published position is in range: {receipt:?}");
+    }
+    /// central-6ly1.8: no ordinary command runs before a publication has shown the position its
+    /// range checks measure from.
+    ///
+    /// MUTATION CHECK: drop `host.published_position.is_some()` from `host_ready` → RED.
+    #[test]
+    fn readiness_waits_for_a_published_position() {
+        let mut host = host();
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        gs.player_pos_known = true;
+        assert!(!host_ready(&gs, &host, true, 0, 0, false));
+        host.published_position = Some([0.0; 3]);
+        assert!(host_ready(&gs, &host, true, 0, 0, false));
+    }
+    /// central-6ly1.8: the server's view of self beside the prediction, and the vitals.
+    #[test]
+    fn state_publishes_server_position_corrections_and_vitals() {
+        use eqoxide_core::game_state::{ServerCorrection, ServerPositionSource, ServerSelfPosition};
+        let started = Instant::now();
+        let at = started + Duration::from_millis(250);
+        let mut gs = GameState::new();
+        gs.world.new_zone_applied = true;
+        gs.server_self_position = Some(ServerSelfPosition {
+            pos: [1.0, 2.0, 3.0], heading: 90.0, source: ServerPositionSource::Correction, at });
+        gs.server_corrections = 2;
+        gs.last_server_correction = Some(ServerCorrection { from: [0.0; 3], to: [1.0, 2.0, 3.0], at });
+        gs.player_level = 4;
+        gs.cur_mana = 10;
+        gs.max_mana = 20;
+        gs.died_at = Some(at);
+        gs.player_dead_since = Some(at);
+        gs.killed_by = "something".into();
+        gs.killer_id = Some(55);
+        let f = server_self_fields(&gs, started);
+        assert_eq!(f["server_position"], json!({"position":[1.0,2.0,3.0],"heading":90.0,"source":"server_correction","at_ms":250}));
+        assert_eq!(f["corrections"], json!({"count":2,"last":{"from":[0.0,0.0,0.0],"to":[1.0,2.0,3.0],"at_ms":250}}));
+        assert_eq!(f["level"], 4);
+        assert_eq!(f["mana"], json!({"value":10,"max":20,"known":true}));
+        assert_eq!(f["dead"], true);
+        assert_eq!(f["killer"], json!({"id":55,"name":null}), "the id survives an unknown name");
+        gs.killer_is_self = true;
+        gs.player_id = 56; // re-entered under a new spawn ID: still a self-inflicted death
+        gs.player_name = "Me".into();
+        assert_eq!(server_self_fields(&gs, started)["killer"], json!({"id":55,"name":"Me"}),
+            "a self-inflicted death names the player without changing killed_by");
+        assert_eq!(f["server_position"]["source"], "server_correction");
+        gs.world.new_zone_applied = false;
+        assert_eq!(server_self_fields(&gs, started)["server_position"], Value::Null,
+            "a self spawn that arrived before OP_NewZone is not paired with the old zone");
+    }
+    /// central-6ly1.8: each received swing becomes one structured event, and a death one `died`.
+    #[test]
+    fn combat_and_death_are_published_once_each() {
+        use eqoxide_core::game_state::{CombatRecord, CombatResult};
+        let mut host = host();
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        gs.player_name = "Me".into();
+        gs.world.entities.insert(7, rat(7, 5.0));
+        let swing = |id| CombatRecord { id, source_id: 1, target_id: 7, amount: 3, spell_id: (id == 2).then_some(13),
+            damage_type: 1, result: CombatResult::Hit, source_name: Some("Me".into()),
+            target_name: Some("a_rat".into()), zone_epoch: 1, at: Instant::now() };
+        gs.combat_records.push_back(swing(1));
+        gs.combat_records.push_back(swing(2));
+        host.update_knowledge(&gs);
+        host.update_knowledge(&gs);
+        gs.died_at = Some(Instant::now());
+        gs.death_count = 1;
+        gs.killer_id = Some(7);
+        gs.killed_by = "a_rat".into();
+        // The roster now names spawn 7 differently: the record keeps the name from its packet.
+        gs.world.entities.get_mut(&7).unwrap().name = "a_guard".into();
+        host.update_knowledge(&gs);
+        host.update_knowledge(&gs);
+        let batch = host.control.events_after_for_test(0);
+        let kinds: Vec<_> = batch.iter().map(|e| e["kind"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(kinds, vec!["combat", "combat", "died"]);
+        assert_eq!(batch[0], json!({"kind":"combat","source":"received_packet","record_id":1,"zone_epoch":1,
+            "source_id":1,"target_id":7,"source_name":"Me","target_name":"a_rat","amount":3,"spell_id":null,
+            "damage_type":1,"result":"hit"}));
+        assert_eq!(batch[2]["killer"], json!({"id":7,"name":"a_rat"}));
+        assert_eq!(batch[1]["spell_id"], 13, "the spell ID is published");
+        assert_eq!(batch[2]["death_count"], 1);
+
+        // Records evicted before the host saw them, and two deaths between reads, are reported.
+        gs.combat_records.clear();
+        gs.combat_records.push_back(swing(9));
+        gs.death_count = 3;
+        host.update_knowledge(&gs);
+        let batch = host.control.events_after_for_test(0);
+        let tail: Vec<_> = batch[3..].iter().map(|e| (e["kind"].as_str().unwrap().to_owned(),
+            e.get("source").and_then(Value::as_str).unwrap_or_default().to_owned(),
+            e.get("count").cloned().unwrap_or(Value::Null))).collect();
+        assert_eq!(tail, vec![
+            ("source_events_dropped".to_owned(), "combat".to_owned(), json!(6)),
+            ("combat".to_owned(), "received_packet".to_owned(), Value::Null),
+            ("source_events_dropped".to_owned(), "death".to_owned(), json!(1)),
+            ("died".to_owned(), "received_packet".to_owned(), Value::Null),
+        ]);
+    }
     #[test]
     fn state_publishes_the_last_position_send() {
         use eqoxide_core::game_state::{PositionSend, PositionSendReason};
@@ -1098,6 +1360,9 @@ mod transaction_admission_tests {
             merchant_value: Value::Null,
             last_event: 0,
             last_echo: 0,
+        last_combat: 0,
+        last_death_count: 0,
+        published_position: None,
         };
         let mut gs = GameState::new();
         gs.inventory_received = true;

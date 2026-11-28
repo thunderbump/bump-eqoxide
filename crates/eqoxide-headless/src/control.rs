@@ -427,6 +427,12 @@ impl Control {
             .map(|e| e.receipt.clone())
     }
 
+    /// The event payloads after `after`, for host tests.
+    #[cfg(test)]
+    pub(crate) fn events_after_for_test(&self, after: u64) -> Vec<Value> {
+        self.event_batch(after).unwrap().events.into_iter().map(|e| e.event).collect()
+    }
+
     fn cursor(&self, sequence: u64) -> String {
         format!("{}:{sequence}", self.shared.session)
     }
