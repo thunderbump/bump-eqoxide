@@ -299,13 +299,17 @@ Headings use the raw protocol units.
 | `OP_ZONE_ENTRY` (0x5089) | Inbound | `entity`, `name`, `position`, `heading` |
 | `OP_NEW_SPAWN` (0x6097) | Inbound | `entity`, `name`, `npc`, `hp_percent`, `position`, `heading` |
 | `OP_CLIENT_UPDATE` (0x7dfc) | Inbound | `entity`, `position`, `heading` |
-| `OP_CLIENT_UPDATE` (0x7dfc) | Outbound | `sequence`, `position`, `delta`, `animation`, `heading` |
+| `OP_CLIENT_UPDATE` (0x7dfc) | Outbound | `sequence`, `position`, `delta`, `animation`, `heading`, `reason` |
 | `OP_TARGET_COMMAND` (0x58e2) | Both | `target_id` |
 | `OP_TARGET_MOUSE` | Outbound | `target_id` |
 | `OP_DAMAGE` (0x6f15) | Inbound | `target`, `source`, `type`, `spell`, signed `damage` |
 | `OP_MOB_HEALTH` (0x37b1) | Inbound | `entity`, `percent` |
 | `OP_DELETE_SPAWN` (0x7280) | Inbound | `entity` |
 
+Outbound `OP_CLIENT_UPDATE` `reason` is why the client sent it: `moving` (the 280 ms throttle
+while moving), `keepalive` (1300 ms without another send), `rest` (the stop flush, zero delta and
+animation 0) or `correction` (re-streaming a server correction). It is the sender's own record and
+is not on the wire; it matches `self.last_position_send.reason` for the same `sequence`.
 Outbound `OP_CLIENT_UPDATE` uses the payload's own 16-bit `sequence` counter.
 Its unreliable transport `wire_seq` is null. The `OP_NEW_SPAWN` `npc` byte uses
 0 for a player, 1 for an NPC, 2 for a player's corpse, and 3 for an NPC's corpse.

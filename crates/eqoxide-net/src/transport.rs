@@ -730,7 +730,7 @@ impl EqStream {
     ) {
         // Telemetry boundary (#525): record BEFORE send_reliable assigns the sequence, so `send_seq`
         // is the sequence this packet's first datagram will carry. Zero cost when disabled.
-        self.capture_app(Dir::Out, opcode, payload, Some(self.send_seq), command, ReceiveEvidence::default());
+        self.capture_app(Dir::Out, opcode, payload, Some(self.send_seq), command, ReceiveEvidence::default(), None);
         let mut app_data = Vec::with_capacity(2 + payload.len());
         app_data.write_u16::<byteorder::LittleEndian>(opcode).unwrap();
         app_data.extend_from_slice(payload);
@@ -782,8 +782,20 @@ impl EqStream {
         payload: &[u8],
         command: Option<&Arc<str>>,
     ) -> std::io::Result<()> {
+        self.send_app_packet_unreliable_with_reason(opcode, payload, command, None)
+    }
+
+    /// As [`Self::send_app_packet_unreliable_with_command`], with the sender's reason recorded on
+    /// the trace row (outbound position updates).
+    pub(crate) fn send_app_packet_unreliable_with_reason(
+        &mut self,
+        opcode: u16,
+        payload: &[u8],
+        command: Option<&Arc<str>>,
+        reason: Option<&'static str>,
+    ) -> std::io::Result<()> {
         // Telemetry boundary (#525): unreliable — no sequence number.
-        self.capture_app(Dir::Out, opcode, payload, None, command, ReceiveEvidence::default());
+        self.capture_app(Dir::Out, opcode, payload, None, command, ReceiveEvidence::default(), reason);
         debug_assert!(opcode & 0xFF != 0, "raw app packets need a non-zero low opcode byte");
         let body = encode_raw_app(
             opcode, payload,
@@ -806,12 +818,13 @@ impl EqStream {
         wire_seq: Option<u16>,
         command: Option<&Arc<str>>,
         receive: ReceiveEvidence,
+        send_reason: Option<&'static str>,
     ) {
         packet_telemetry::capture(dir, opcode, payload, wire_seq.is_some(), wire_seq);
         // Opcode names and field layouts on this route are for the zone protocol.
         if let Some(trace) = self.packet_trace.as_ref().filter(|_| self.capture_zone_packets) {
             let awaiting_ack = receive.acked_at.is_none();
-            let n = trace.capture_with_receive(dir, opcode, payload, wire_seq, command.cloned(), receive);
+            let n = trace.capture_with_receive(dir, opcode, payload, wire_seq, command.cloned(), receive, send_reason);
             if let (Dir::In, Some(seq), true) = (dir, wire_seq, awaiting_ack) {
                 if self.pending_packet_acks.len() == SESSION_PACKET_CAPACITY {
                     self.pending_packet_acks.pop_front();
@@ -1464,7 +1477,7 @@ impl EqStream {
                 // broadcasts) — no reliable sequence. Zero cost when disabled.
                 self.capture_app(Dir::In, opcode, &payload, None, None, ReceiveEvidence {
                     arrival, acked_at: None,
-                });
+                }, None);
                 let _ = self.app_tx.send(AppPacket { opcode, payload });
             }
             return;
@@ -1743,7 +1756,7 @@ impl EqStream {
         }
         let opcode = Cursor::new(&data[..2]).read_u16::<byteorder::LittleEndian>().unwrap();
         // Telemetry boundary (#525): reliable iff we know a sequence for it. Zero cost when disabled.
-        self.capture_app(Dir::In, opcode, &data[2..], rel_seq, None, receive);
+        self.capture_app(Dir::In, opcode, &data[2..], rel_seq, None, receive, None);
         let payload = data[2..].to_vec();
         let _ = self.app_tx.send(AppPacket { opcode, payload });
     }

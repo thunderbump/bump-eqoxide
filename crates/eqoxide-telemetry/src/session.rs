@@ -100,6 +100,10 @@ enum Fields {
         delta: [f32; 3],
         animation: u32,
         heading: u32,
+        /// Why the client sent it (`moving`, `keepalive`, `rest`, `correction`): the sender's own
+        /// classification, recorded at send time. It is not on the wire.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'static str>,
     },
     Spawn {
         entity: u32,
@@ -161,7 +165,7 @@ impl SessionTrace {
         wire_seq: Option<u16>,
         command_id: Option<Arc<str>>,
     ) {
-        self.capture_with_receive(dir, opcode, payload, wire_seq, command_id, ReceiveEvidence::default());
+        self.capture_with_receive(dir, opcode, payload, wire_seq, command_id, ReceiveEvidence::default(), None);
     }
 
     pub fn capture_with_receive(
@@ -172,9 +176,13 @@ impl SessionTrace {
         wire_seq: Option<u16>,
         command_id: Option<Arc<str>>,
         receive: ReceiveEvidence,
+        send_reason: Option<&'static str>,
     ) -> u64 {
         let at_ms = self.clock_ms(Instant::now());
-        let fields = decode_fields(dir, opcode, payload);
+        let mut fields = decode_fields(dir, opcode, payload);
+        if let Fields::Position { reason, .. } = &mut fields {
+            *reason = send_reason;
+        }
         let prefix = Arc::from(&payload[..payload.len().min(PAYLOAD_CAPACITY)]);
         let mut state = self.state.lock().unwrap();
         if state.packets.len() == SESSION_PACKET_CAPACITY {
@@ -310,6 +318,7 @@ fn decode_fields(dir: Dir, opcode: u16, body: &[u8]) -> Fields {
             delta: [f32_at(10), f32_at(38), f32_at(22)],
             animation: u32_at(34) & 0x3ff,
             heading: u32_at(14) & 0xfff,
+            reason: None,
         },
         (Dir::In, p::OP_ZONE_ENTRY | p::OP_NEW_SPAWN) => {
             if let Some((spawn, _, heading)) = p::parse_rof2_spawn_with_wire_heading(body) {

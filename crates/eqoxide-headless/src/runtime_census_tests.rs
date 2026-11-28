@@ -237,6 +237,8 @@ impl Census {
                         let seq = row["fields"]["sequence"].as_u64().unwrap() as u16;
                         let reason = *self.reasons.get(&seq)
                             .unwrap_or_else(|| panic!("no recorded reason for position update {row}"));
+                        // The trace row carries the same reason the sender recorded.
+                        assert_eq!(row["fields"]["reason"], reason.as_str(), "{row}");
                         match (reason, command) {
                             (Reason::Moving, _) => MOVING.into(),
                             (Reason::Keepalive, _) => KEEPALIVE.into(),
