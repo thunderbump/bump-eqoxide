@@ -210,7 +210,7 @@ This is the complete list. A PR that adds a code adds it here.
 | Precondition at dispatch or claim | `entity_not_received`, `entity_out_of_range`, `no_live_npc_target_in_range`, `item_not_in_slot`, `catalog_slot_not_received`, `merchant_closed`, `inventory_revision_required_or_stale`, `merchant_revision_required_or_stale`, `transaction_outcome_unknown_relog_required`, `stand_before_moving`, `not_grounded`, `in_water`, `not_in_zone_line`, `region_data_unavailable` |
 | After the claim | `partial_send`, `no_server_receipt_in_protocol`, `no_server_evidence_within_window`, `tracking_lost` |
 | Fences | `not_ready`, `zone_epoch_changed`, `dead` |
-| Server rejections, per registry row | `sell_vetoed`, `zone_change_rejected` (`SendZoneError`) |
+| Server rejections, per registry row | `sell_vetoed`, `zone_change_rejected` (`SendZoneError`), `server_refused` (an awaited merchant open or buy the server refused; prose in `detail`) |
 
 These replace `outcome_timeout`, `no_correlated_server_receipt_relog_before_another_transaction`,
 `precondition_failed_or_network_mailbox_busy`, `queued_without_server_receipt` and
