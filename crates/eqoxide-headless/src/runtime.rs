@@ -873,8 +873,8 @@ impl Host {
         gs: &GameState,
         frame: &mut Frame,
         terminal: &Option<String>,
-        shutdown: bool,
-        link: Link,
+        shutdown: &dyn Fn() -> bool,
+        link: &dyn Fn() -> Link,
         now: Instant,
         dt: f32,
         started: Instant,
@@ -933,9 +933,11 @@ impl Host {
                 self.heading = gs.player_heading;
             }
         }
-        let Link { tick_age, inbound_age, link_age, dropped } = link;
+        // Read after the fences and the synchronous geometry load, as the network owner may have
+        // refreshed its health during the load.
+        let Link { tick_age, inbound_age, link_age, dropped } = link();
         let ready = terminal.is_none()
-            && !shutdown
+            && !shutdown()
             && host_ready(gs, self, col.is_some(), tick_age, link_age, dropped);
         self.step(&gs, col.as_deref(), ready, now, dt);
         self.update_knowledge(&gs);
@@ -1099,20 +1101,21 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 control.publish_event(json!({"kind":"session_ended","reason":terminal}));
             }
         }
-        let health = wiring.health.lock().unwrap();
-        let link = Link {
-            tick_age: health.last_tick.elapsed().as_millis() as u64,
-            inbound_age: health.last_packet.elapsed().as_millis() as u64,
-            link_age: health.last_datagram.elapsed().as_millis() as u64,
-            dropped: health.session_drop.is_some(),
+        let link = || {
+            let health = wiring.health.lock().unwrap();
+            Link {
+                tick_age: health.last_tick.elapsed().as_millis() as u64,
+                inbound_age: health.last_packet.elapsed().as_millis() as u64,
+                link_age: health.last_datagram.elapsed().as_millis() as u64,
+                dropped: health.session_drop.is_some(),
+            }
         };
-        drop(health);
         let ready = host.frame(
             &gs,
             &mut frame,
             &terminal,
-            wiring.shutdown.load(Ordering::Acquire),
-            link,
+            &|| wiring.shutdown.load(Ordering::Acquire),
+            &link,
             now,
             dt,
             started,

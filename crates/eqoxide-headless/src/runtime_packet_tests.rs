@@ -538,3 +538,38 @@ async fn turn_expiring_on_correction_adoption_owns_rest_update() {
     assert_eq!(rows[0]["fields"]["heading"], 0);
     assert_eq!(rows[1]["fields"]["heading"], 512);
 }
+
+/// A readiness halt between an explicit off and its drain must not take the packet's attribution.
+/// Replacing the queued off's command ID on every implicit off turns this red.
+#[tokio::test]
+async fn a_halt_before_the_drain_keeps_the_explicit_off_attributed() {
+    let mut session = Session::new().await;
+    session.dispatch("off", json!({"kind":"attack_off"})).await;
+    session.host.halt("not_ready", None);
+    session.drain();
+    session.assert_packets("off", &[OP_AUTO_ATTACK]).await;
+}
+
+/// `sit` after an explicit off, both before one drain: the off stays the explicit command's.
+#[tokio::test]
+async fn sit_after_an_explicit_off_does_not_take_its_packet() {
+    let mut session = Session::new().await;
+    session.dispatch("off", json!({"kind":"attack_off"})).await;
+    session.dispatch("sit", json!({"kind":"sit"})).await;
+    session.drain();
+    session.assert_packets("off", &[OP_AUTO_ATTACK]).await;
+    session.assert_packets("sit", &[OP_SPAWN_APPEARANCE]).await;
+}
+
+/// An explicit off written over an attack-on queued in a departed zone must not inherit that
+/// request's zone fence: the off is still sent and attributed, and the attack-on is never sent.
+#[tokio::test]
+async fn an_explicit_off_over_a_stale_attack_is_still_sent() {
+    let mut session = Session::new().await;
+    session.dispatch("attack", json!({"kind":"attack","lease_ms":1000})).await;
+    session.gs.zone_epoch += 1;
+    session.host.command.force_attack_off(Some("off"));
+    session.drain();
+    session.assert_packets("off", &[OP_AUTO_ATTACK]).await;
+    session.assert_packets("attack", &[]).await;
+}

@@ -33,19 +33,26 @@ impl CommandState {
     /// Implicit safety off (a halt, lease expiry, sit, camp), last-wins. The network owner sends it
     /// only while attack is on; with attack off it is drained and nothing goes on the wire. An
     /// overwritten attack must never lend its ID to the off packet.
+    ///
+    /// An implicit off over a queued off leaves that off exactly as it is: same payload, same
+    /// forced flag, same attribution. It replaces only a queued on.
     pub fn overwrite_attack_off(&self, command: Option<&str>) {
         let mut slot = self.combat.attack.lock().unwrap();
+        if *slot == Some(false) {
+            return;
+        }
         *slot = Some(false);
-        self.actions.set_packet_command(std::sync::Arc::as_ptr(&self.combat.attack) as usize, command);
+        self.actions.replace_with_safety(std::sync::Arc::as_ptr(&self.combat.attack) as usize, command);
     }
 
     /// Explicit off (the `attack_off` command), last-wins like [`Self::overwrite_attack_off`], but
-    /// always sent: it is a script's safety stop and a tester's way to send a redundant off.
+    /// always sent: it is a script's safety stop and a tester's way to send a redundant off. Two
+    /// explicit offs queued before one drain share one packet, attributed to the later command.
     pub fn force_attack_off(&self, command: Option<&str>) {
         let mut slot = self.combat.attack.lock().unwrap();
         *slot = Some(false);
         self.combat.attack_off_forced.store(true, Ordering::SeqCst);
-        self.actions.set_packet_command(std::sync::Arc::as_ptr(&self.combat.attack) as usize, command);
+        self.actions.replace_with_safety(std::sync::Arc::as_ptr(&self.combat.attack) as usize, command);
     }
 
     /// Consider a spawn (POST /v1/combat/consider, the Consider button) — con color/faction reply.
@@ -95,7 +102,7 @@ impl CommandState {
 
     /// Drain a pending auto-attack toggle. `Some(true)` = engage, `Some(false)` = disengage.
     pub fn take_attack(&self) -> Option<bool> {
-        self.dequeue(&self.combat.attack)
+        self.take_attack_request().map(|(on, _, _)| on)
     }
 
     pub fn take_attack_with_command(&self) -> Option<TracedRequest<bool>> {

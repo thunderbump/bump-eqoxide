@@ -2,9 +2,11 @@
 //! per-tick body) and the real network action loop, counting every outbound application packet in
 //! the session trace by opcode. A handoff's "wire impact" statement cites this test's output.
 //!
-//! The network loop ticks twice per 20 ms host tick, as it does live (10 ms and 20 ms). Position
-//! updates are classified as rest (zero delta, animation 0) or moving; their keepalive and throttle
-//! cadence is wall-clock, so only the rest count is asserted exactly.
+//! The network loop ticks twice per 20 ms host tick, as it does live (10 ms and 20 ms), and not at
+//! all during a zone handshake, as `run_zone_entry_handshake` holds it. `OP_AutoAttack` rows are
+//! split by their on/off byte. Position updates are split into moving and rest (zero delta,
+//! animation 0); a rest update attributed to a command is that command's stop flush, named with the
+//! command ID. Keepalive and throttle cadence is wall-clock, so only stop flushes are asserted.
 //!
 //! Print the census with `cargo test -p eqoxide-headless census -- --nocapture`.
 
@@ -23,8 +25,9 @@ use std::{collections::BTreeMap, sync::Arc, time::{Duration, Instant}};
 use tokio::net::UdpSocket;
 use tower::ServiceExt;
 
-const REST: &str = "OP_CLIENT_UPDATE rest";
 const MOVING: &str = "OP_CLIENT_UPDATE moving";
+const ON: &str = "OP_AUTO_ATTACK on";
+const OFF: &str = "OP_AUTO_ATTACK off";
 
 struct Census {
     host: Host,
@@ -39,6 +42,7 @@ struct Census {
     started: Instant,
     read: u64,
     ready: bool,
+    net_running: bool,
     _peer: UdpSocket,
 }
 
@@ -67,6 +71,7 @@ impl Census {
             started,
             read: 0,
             ready: false,
+            net_running: true,
             _peer: peer,
         }
     }
@@ -75,6 +80,9 @@ impl Census {
     async fn tick(&mut self) {
         for _ in 0..2 {
             tokio::time::sleep(Duration::from_millis(10)).await;
+            if !self.net_running {
+                continue;
+            }
             drain_gameplay_commands(
                 &mut self.action_loop, &mut self.stream, &mut self.gs, &self.lifecycle,
             );
@@ -82,11 +90,11 @@ impl Census {
         let snapshot = self.gs.clone();
         let now = Instant::now();
         self.host.drain_completions();
-        let link = Link { tick_age: 0, inbound_age: 0, link_age: 0, dropped: false };
+        let link = || Link { tick_age: 0, inbound_age: 0, link_age: 0, dropped: false };
         let ready = self
             .host
             .frame(
-                &snapshot, &mut self.frame, &None, false, link, now, 0.02, self.started,
+                &snapshot, &mut self.frame, &None, &|| false, &link, now, 0.02, self.started,
                 &self.collision,
                 &mut |_| Ok((Arc::new(floor()), json!({"status":"loaded"}))),
             )
@@ -104,8 +112,10 @@ impl Census {
     }
 
     /// A zone entry in the order native sends it: the network owner begins the zone-in, the self
-    /// spawn arrives, a few ticks pass in the handshake, then `OP_NewZone`.
+    /// spawn arrives, a few ticks pass in the handshake, then `OP_NewZone`. Gameplay drains stop
+    /// for the handshake and resume after it, as in `gameplay.rs`.
     async fn enter_zone(&mut self, zone: &str) {
+        self.net_running = false;
         self.controller.begin_zone_in(&mut self.gs);
         self.gs.player_id = 1;
         self.gs.player_name = "Census".into();
@@ -118,6 +128,7 @@ impl Census {
         self.gs.world.new_zone_applied = true;
         self.gs.upsert_entity(make_entity(7, "a rat", 5.0, 0.0, 0.0, true));
         self.gs.target_id = Some(7);
+        self.net_running = true;
         // Geometry, body, the first publish, then ready.
         self.ticks(10).await;
         assert!(self.ready, "the scripted zone entry must reach ready");
@@ -148,18 +159,29 @@ impl Census {
                 break;
             }
             self.read = page.next;
-            for packet in page.packets {
+            for mut packet in page.packets {
+                packet.include_raw_payload();
                 let row = serde_json::to_value(&packet).unwrap();
                 if row["dir"] != "out" {
                     continue;
                 }
                 let name = row["opcode_name"].as_str().unwrap().to_string();
-                let name = if name == "OP_CLIENT_UPDATE" {
-                    let fields = &row["fields"];
-                    let still = fields["delta"].as_array().unwrap().iter().all(|d| d.as_f64() == Some(0.0));
-                    if still && fields["animation"] == 0 { REST.into() } else { MOVING.into() }
-                } else {
-                    name
+                let name = match name.as_str() {
+                    "OP_CLIENT_UPDATE" => {
+                        let fields = &row["fields"];
+                        let still = fields["delta"].as_array().unwrap().iter().all(|d| d.as_f64() == Some(0.0));
+                        match (still && fields["animation"] == 0, row["command_id"].as_str()) {
+                            (true, Some(id)) => format!("OP_CLIENT_UPDATE rest ({id})"),
+                            (true, None) => "OP_CLIENT_UPDATE rest".into(),
+                            (false, _) => MOVING.into(),
+                        }
+                    }
+                    "OP_AUTO_ATTACK" => match &row["payload_hex"].as_str().unwrap()[..2] {
+                        "01" => ON.into(),
+                        "00" => OFF.into(),
+                        other => format!("OP_AUTO_ATTACK {other}"),
+                    },
+                    _ => name,
                 };
                 *out.entry(name).or_default() += 1;
             }
@@ -196,9 +218,10 @@ fn expect(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
 /// one. A stop always sends one rest update.
 ///
 /// MUTATION CHECKS: drop the `!forced && !self.auto_attack` guard in `drain_combat` → RED at
-/// "zone entry" (implicit offs reach the wire); drop the zone-epoch reset → RED at "zone change"
+/// "zone entry" (implicit offs reach the wire with attack off); drop the zone-epoch reset → RED at "zone change"
 /// (an off for attack the new zone never had); route `attack_off` through the implicit write → RED
-/// at "explicit off while off"; delete the rest flush → RED at "move".
+/// at "explicit off while off"; delete the rest flush → RED at "move"; send byte 1 for every
+/// attack packet → RED at "lease expiry".
 #[tokio::test]
 async fn census_of_a_scripted_session() {
     let mut s = Census::new().await;
@@ -214,7 +237,7 @@ async fn census_of_a_scripted_session() {
     s.ticks(30).await;
     let moved = s.phase("move");
     assert!(count(&moved, MOVING) >= 1, "moving updates while moving: {moved:?}");
-    assert_eq!(count(&moved, REST), 1, "one rest update per stop: {moved:?}");
+    assert_eq!(count(&moved, "OP_CLIENT_UPDATE rest (move)"), 1, "one stop flush per stop: {moved:?}");
     assert_eq!(commanded(&moved), expect(&[]));
 
     // Target, attack on, renew, lease expiry.
@@ -223,9 +246,9 @@ async fn census_of_a_scripted_session() {
     assert_eq!(commanded(&s.phase("target")), expect(&[("OP_TARGET_MOUSE", 1), ("OP_CONSIDER", 1)]));
     s.put("attack", json!({"kind":"attack","lease_ms":200})).await;
     s.ticks(3).await;
-    assert_eq!(commanded(&s.phase("attack on")), expect(&[("OP_AUTO_ATTACK", 1)]));
+    assert_eq!(commanded(&s.phase("attack on")), expect(&[(ON, 1)]));
     s.ticks(15).await;
-    assert_eq!(commanded(&s.phase("lease expiry")), expect(&[("OP_AUTO_ATTACK", 1)]),
+    assert_eq!(commanded(&s.phase("lease expiry")), expect(&[(OFF, 1)]),
         "expiry sends attack-off once");
     s.ticks(5).await;
     assert_eq!(commanded(&s.phase("after expiry")), expect(&[]));
@@ -233,7 +256,7 @@ async fn census_of_a_scripted_session() {
     // Explicit off while off is always sent; sit and camp with attack off send no attack-off.
     s.put("off", json!({"kind":"attack_off"})).await;
     s.ticks(2).await;
-    assert_eq!(commanded(&s.phase("explicit off while off")), expect(&[("OP_AUTO_ATTACK", 1)]));
+    assert_eq!(commanded(&s.phase("explicit off while off")), expect(&[(OFF, 1)]));
     assert_eq!(s.host.control.command("off").unwrap().status, Status::AppliedLocal);
     s.put("sit", json!({"kind":"sit"})).await;
     s.ticks(2).await;
@@ -245,18 +268,18 @@ async fn census_of_a_scripted_session() {
     // Zone change with attack on: the new zone's server has attack off, so nothing is sent.
     s.put("attack2", json!({"kind":"attack","lease_ms":5000})).await;
     s.ticks(3).await;
-    assert_eq!(commanded(&s.phase("attack on again")), expect(&[("OP_AUTO_ATTACK", 1)]));
+    assert_eq!(commanded(&s.phase("attack on again")), expect(&[(ON, 1)]));
     s.enter_zone("qeynos").await;
     assert_eq!(commanded(&s.phase("zone change with attack on")), expect(&[]));
 
     // Death with attack on: one off at the readiness loss, none on the respawn zone-in.
     s.put("attack3", json!({"kind":"attack","lease_ms":5000})).await;
     s.ticks(3).await;
-    assert_eq!(commanded(&s.phase("attack on in new zone")), expect(&[("OP_AUTO_ATTACK", 1)]));
+    assert_eq!(commanded(&s.phase("attack on in new zone")), expect(&[(ON, 1)]));
     s.gs.player_dead_since = Some(Instant::now());
     s.gs.cur_hp = 0;
     s.ticks(10).await;
-    assert_eq!(commanded(&s.phase("death")), expect(&[("OP_AUTO_ATTACK", 1)]),
+    assert_eq!(commanded(&s.phase("death")), expect(&[(OFF, 1)]),
         "one attack-off at death, not one per not-ready tick");
     s.gs.player_dead_since = None;
     s.enter_zone("qeynos2").await;
