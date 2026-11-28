@@ -6,7 +6,26 @@
 //! were (the HTTP handler and `ActionLoop::tick`). No behavior change — just one typed surface.
 
 use super::actions::TracedRequest;
-use eqoxide_ipc::ExplicitAttackOff;
+use eqoxide_ipc::{AttackOffOutcome, AttackOffSettled, ExplicitAttackOff};
+
+/// Explicit offs sent per network drain at most.
+pub const EXPLICIT_OFFS_PER_DRAIN: usize = 8;
+
+/// What the host abandons when it reads explicit-off outcomes.
+#[derive(Clone, Copy, Debug)]
+pub enum Abandon {
+    None,
+    OtherZones(u64),
+    All,
+}
+
+/// Remove the explicit offs accepted in a zone other than `current`.
+fn drain_stale(offs: &mut Vec<ExplicitAttackOff>, current: u64) -> Vec<ExplicitAttackOff> {
+    let (stale, live) = std::mem::take(offs).into_iter()
+        .partition(|off| off.zone_epoch.is_some_and(|epoch| epoch != current));
+    *offs = live;
+    stale
+}
 
 /// One drained attack request; see [`CommandState::take_attack_request`].
 #[derive(Debug)]
@@ -125,21 +144,69 @@ impl CommandState {
 
     /// Drain a pending auto-attack toggle. `Some(true)` = engage, `Some(false)` = disengage.
     pub fn take_attack(&self) -> Option<bool> {
-        self.take_attack_request().map(|drain| drain.on)
+        self.take_attack_request(None).map(|drain| drain.on)
     }
 
     pub fn take_attack_with_command(&self) -> Option<TracedRequest<bool>> {
-        self.take_attack_request().map(|drain| (drain.on, drain.command))
+        self.take_attack_request(None).map(|drain| (drain.on, drain.command))
     }
 
     /// Drain the attack slot: the payload, the implicit packet attribution, and every explicit off
-    /// queued with it, all taken under the slot lock so they belong to this payload.
-    pub fn take_attack_request(&self) -> Option<AttackDrain> {
+    /// queued with it, all taken under the slot lock so they belong to this payload. With
+    /// `zone_epoch`, an explicit off accepted in another zone is not returned: it is settled as
+    /// not sent, under the same lock, so the host can publish its receipt.
+    pub fn take_attack_request(&self, zone_epoch: Option<u64>) -> Option<AttackDrain> {
         let mut slot = self.combat.attack.lock().unwrap();
         let on = slot.take()?;
-        let explicit = std::mem::take(&mut *self.combat.attack_off_explicit.lock().unwrap());
+        let mut explicit = std::mem::take(&mut *self.combat.attack_off_explicit.lock().unwrap());
+        if let Some(current) = zone_epoch {
+            let stale = drain_stale(&mut explicit, current);
+            self.settle_attack_offs(stale, AttackOffOutcome::ZoneEnded);
+        }
+        // A burst of explicit offs goes out a few per network tick, so the transport processes
+        // acknowledgements between them; the rest stay queued with the off still in the slot.
+        if explicit.len() > EXPLICIT_OFFS_PER_DRAIN {
+            let rest = explicit.split_off(EXPLICIT_OFFS_PER_DRAIN);
+            *self.combat.attack_off_explicit.lock().unwrap() = rest;
+            *slot = Some(on);
+            return Some(AttackDrain { on, command: None, explicit });
+        }
         let command = self.actions.drain(std::sync::Arc::as_ptr(&self.combat.attack) as usize).ok()?;
         Some(AttackDrain { on, command, explicit })
+    }
+
+    /// Record that the network owner put this explicit off on the wire.
+    pub fn attack_off_sent(&self, command: &std::sync::Arc<str>) {
+        self.combat.attack_off_settled.lock().unwrap()
+            .push(AttackOffSettled { command: command.clone(), outcome: AttackOffOutcome::Sent });
+    }
+
+    /// The host's read of explicit-off outcomes, once per tick before its fences. Under the slot
+    /// lock, so no drain can send what is settled here as not sent:
+    /// - `Abandon::OtherZones(epoch)`: the host has just seen the zone change to `epoch`; every
+    ///   explicit off still queued from an earlier zone is settled as `ZoneEnded`.
+    /// - `Abandon::All`: the session has ended; every queued explicit off is `SessionEnded`.
+    pub fn take_attack_off_settlements(&self, abandon: Abandon) -> Vec<AttackOffSettled> {
+        let _slot = self.combat.attack.lock().unwrap();
+        let mut queued = self.combat.attack_off_explicit.lock().unwrap();
+        match abandon {
+            Abandon::None => {}
+            Abandon::OtherZones(current) => {
+                let stale = drain_stale(&mut queued, current);
+                self.settle_attack_offs(stale, AttackOffOutcome::ZoneEnded);
+            }
+            Abandon::All => {
+                let all = std::mem::take(&mut *queued);
+                self.settle_attack_offs(all, AttackOffOutcome::SessionEnded);
+            }
+        }
+        drop(queued);
+        std::mem::take(&mut *self.combat.attack_off_settled.lock().unwrap())
+    }
+
+    fn settle_attack_offs(&self, offs: Vec<ExplicitAttackOff>, outcome: AttackOffOutcome) {
+        let mut settled = self.combat.attack_off_settled.lock().unwrap();
+        settled.extend(offs.into_iter().filter_map(|off| off.command).map(|command| AttackOffSettled { command, outcome }));
     }
 
     /// Drain a pending consider request.

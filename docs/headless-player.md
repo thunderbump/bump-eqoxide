@@ -108,7 +108,11 @@ Stop, attack-off, death, connection loss, shutdown and a new zone entry stop app
 Attack-off on the wire.
 
 - **Implicit stops.** These are lease expiry, readiness loss, death, zone entry, `sit` and `camp`. They send `OP_AutoAttack 0` only while the last attack packet the client sent was on; with attack already off, they send nothing, as a real client does. A zone entry resets that state to off, because the new zone's server starts with attack off.
-- **Explicit `attack_off`.** It always sends its own `OP_AutoAttack 0`, attributed to it in `/v2/player/packets?command=<id>`, even when the client believes attack is off. Two explicit offs accepted before one send are two packets. An explicit off accepted in a zone that ends before it is sent is not sent into the next zone; its receipt stays `applied_local`.
+- **Explicit `attack_off`.** It always sends its own `OP_AutoAttack 0`, attributed to it in `/v2/player/packets?command=<id>`, even when the client believes attack is off. Two explicit offs accepted before one send are two packets. Its receipt stays `accepted` until the network owner settles it, normally within one network tick:
+  - `applied_local` with evidence `{"kind":"attack_off_sent"}` once its packet reached the transport;
+  - `refused` with reason `stale_zone_epoch_before_dispatch` and evidence `{"kind":"attack_off_not_sent","packets":[]}` when the zone it was accepted in ended first. Such an off is not sent into the next zone.
+
+  A readiness drop (death, link loss, geometry loading) does not fence an `attack_off`: it is the safety stop for that moment. When the session ends, a queued off that no network owner will send ends `refused` with reason `not_ready` and the same not-sent evidence. A burst of explicit offs goes out at most 8 per network tick, in order.
 - **An implicit stop queued with an explicit off** adds no packet.
 - **v1 and UI requests.** v1 `DELETE /v1/combat/attack` and UI toggles also always send, but they carry no packet attribution and no zone.
 

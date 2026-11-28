@@ -63,6 +63,16 @@ impl Session {
     }
 
     async fn dispatch(&mut self, id: &str, operation: Value) {
+        self.admit(id, operation).await;
+        let commands = self.host.control.drain_actions();
+        assert_eq!(commands.len(), 1);
+        for command in commands {
+            self.host.dispatch(command, &self.gs, true, Instant::now()).await;
+        }
+    }
+
+    /// Admit without dispatching, as when the command waits for the next host tick.
+    async fn admit(&mut self, id: &str, operation: Value) {
         let response = self.host.control.router().oneshot(
             Request::put(format!("/v2/player/commands/{id}"))
                 .header("authorization", "Bearer test-credential")
@@ -77,11 +87,6 @@ impl Session {
                 .unwrap(),
         ).await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let commands = self.host.control.drain_actions();
-        assert_eq!(commands.len(), 1);
-        for command in commands {
-            self.host.dispatch(command, &self.gs, true, Instant::now()).await;
-        }
     }
 
     /// Turn attack on the way a UI toggle does, outside the journal, and put it on the wire, so the
@@ -588,6 +593,46 @@ async fn an_explicit_off_from_a_departed_zone_is_not_sent() {
     let trace = session.packets("").await;
     assert_eq!(trace["packets"].as_array().unwrap().iter()
         .filter(|row| row["opcode"] == OP_AUTO_ATTACK).count(), 1, "only the engage: {trace}");
+    // The network owner took it and dropped it: the receipt says nothing was sent.
+    session.host.settle_attack_offs(&session.gs);
+    assert_not_sent(&session, "off");
+}
+
+fn assert_not_sent(session: &Session, id: &str) {
+    let receipt = session.host.control.command(id).unwrap();
+    assert_eq!(receipt.status, Status::Refused, "{receipt:?}");
+    assert_eq!(receipt.reason.as_deref(), Some("stale_zone_epoch_before_dispatch"));
+    assert_eq!(receipt.evidence, Some(json!({"kind":"attack_off_not_sent","packets":[]})));
+}
+
+/// The host sees the zone change while the off is still queued: it settles the off as not sent
+/// before its zone fence, and no later drain can send it. Fencing first ends it `unknown`.
+#[tokio::test]
+async fn a_queued_explicit_off_is_refused_when_the_host_sees_the_zone_end() {
+    let mut session = Session::new().await;
+    session.engage();
+    session.dispatch("off", json!({"kind":"attack_off"})).await;
+    session.gs.zone_epoch += 1;
+    session.host.settle_attack_offs(&session.gs);
+    assert_not_sent(&session, "off");
+    session.drain();
+    session.assert_packets("off", &[]).await;
+}
+
+/// An explicit off stays `accepted` until its packet reaches the transport, then becomes
+/// `applied_local` with evidence that it was sent.
+#[tokio::test]
+async fn an_explicit_off_is_applied_once_sent() {
+    let mut session = Session::new().await;
+    session.dispatch("off", json!({"kind":"attack_off"})).await;
+    session.host.settle_attack_offs(&session.gs);
+    assert_eq!(session.host.control.command("off").unwrap().status, Status::Accepted);
+    session.drain();
+    session.host.settle_attack_offs(&session.gs);
+    let receipt = session.host.control.command("off").unwrap();
+    assert_eq!(receipt.status, Status::AppliedLocal);
+    assert_eq!(receipt.evidence, Some(json!({"kind":"attack_off_sent","server_confirmed":false})));
+    session.assert_packets("off", &[OP_AUTO_ATTACK]).await;
 }
 
 /// Two explicit offs accepted before one drain each own one packet. Coalescing them into one
@@ -623,5 +668,75 @@ async fn take_attack_takes_the_explicit_offs_with_it() {
     assert!(session.host.command.request_attack(false));
     assert_eq!(session.host.command.take_attack(), Some(false));
     session.host.command.overwrite_attack_off(None);
-    assert!(session.host.command.take_attack_request().unwrap().explicit.is_empty());
+    assert!(session.host.command.take_attack_request(None).unwrap().explicit.is_empty());
+}
+
+/// A readiness drop (death) between admission and dispatch must not cancel `attack_off`: it is the
+/// safety stop for that moment. Fencing it with the rest refuses it and nothing is sent.
+#[tokio::test]
+async fn a_readiness_drop_before_dispatch_keeps_attack_off() {
+    let mut session = Session::new().await;
+    session.engage();
+    session.admit("off", json!({"kind":"attack_off"})).await;
+    session.host.control.set_ready(false);
+    let commands = session.host.control.drain_actions();
+    assert_eq!(commands.len(), 1, "attack_off survives the readiness fence");
+    for command in commands {
+        session.host.dispatch(command, &session.gs, false, Instant::now()).await;
+    }
+    session.drain();
+    session.host.settle_attack_offs(&session.gs);
+    session.assert_packets("off", &[OP_AUTO_ATTACK]).await;
+    assert_eq!(session.host.control.command("off").unwrap().status, Status::AppliedLocal);
+}
+
+/// A dispatched `attack_off` still queued for the network owner is not ended by a readiness drop:
+/// its packet follows, and the receipt says so.
+#[tokio::test]
+async fn a_readiness_drop_after_dispatch_keeps_attack_off() {
+    let mut session = Session::new().await;
+    session.dispatch("off", json!({"kind":"attack_off"})).await;
+    session.host.control.set_ready(false);
+    assert_eq!(session.host.control.command("off").unwrap().status, Status::Accepted);
+    session.drain();
+    session.host.settle_attack_offs(&session.gs);
+    assert_eq!(session.host.control.command("off").unwrap().status, Status::AppliedLocal);
+}
+
+/// When the session ends, a queued `attack_off` that no network owner will send ends `refused`,
+/// not sent, and nothing stays live.
+#[tokio::test]
+async fn session_end_refuses_a_queued_attack_off() {
+    let mut session = Session::new().await;
+    session.dispatch("off", json!({"kind":"attack_off"})).await;
+    session.host.abandon_attack_offs();
+    session.host.control.end_session("not_ready");
+    let receipt = session.host.control.command("off").unwrap();
+    assert_eq!((receipt.status, receipt.reason.as_deref()), (Status::Refused, Some("not_ready")));
+    assert_eq!(receipt.evidence, Some(json!({"kind":"attack_off_not_sent","packets":[]})));
+    session.drain();
+    session.assert_packets("off", &[]).await;
+}
+
+/// A burst of explicit offs goes out a few per network tick, never all in one, so the transport
+/// can take acknowledgements between them. Every off is still sent, in order, under its own ID.
+#[tokio::test]
+async fn an_explicit_off_burst_is_spread_across_drains() {
+    let mut session = Session::new().await;
+    let ids: Vec<String> = (0..20).map(|n| format!("off{n}")).collect();
+    for id in &ids {
+        session.host.command.force_attack_off(Some(id), Some(session.gs.zone_epoch));
+    }
+    let per = eqoxide_command::EXPLICIT_OFFS_PER_DRAIN;
+    let mut sent = Vec::new();
+    for _ in 0..3 {
+        let before = session.packets("").await["packets"].as_array().unwrap().len();
+        session.drain();
+        let page = session.packets("").await;
+        let rows = page["packets"].as_array().unwrap();
+        assert!(rows.len() - before <= per, "at most {per} offs per drain: {page}");
+        sent.extend(rows[before..].iter().filter(|r| r["opcode"] == OP_AUTO_ATTACK)
+            .map(|r| r["command_id"].as_str().unwrap().to_string()));
+    }
+    assert_eq!(sent, ids, "every off, in order, under its own ID");
 }

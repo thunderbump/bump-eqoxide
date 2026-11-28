@@ -2057,6 +2057,23 @@ pub struct ExplicitAttackOff {
     pub zone_epoch: Option<u64>,
 }
 
+/// The end of one attributed explicit attack-off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttackOffSettled {
+    pub command: Arc<str>,
+    pub outcome: AttackOffOutcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttackOffOutcome {
+    /// `OP_AutoAttack 0` reached the transport.
+    Sent,
+    /// Not sent: the zone it was accepted in ended first.
+    ZoneEnded,
+    /// Not sent: the session ended first.
+    SessionEnded,
+}
+
 /// `/v1/combat/*`: targeting, auto-attack, consider, spell scribe/memorize/cast, and the one
 /// `/v1/pet/command` slot (small enough on its own that a dedicated `PetSlots` would just be
 /// noise — it rides along with the other "act on a target" verbs).
@@ -2068,6 +2085,9 @@ pub struct CombatSlots {
     /// drain sends one `OP_AutoAttack 0` per entry still in its zone, even when it believes attack
     /// is already off; an implicit safety off is sent only while attack is on.
     pub attack_off_explicit: Arc<Mutex<Vec<ExplicitAttackOff>>>,
+    /// How each attributed explicit off ended, for the host to publish as its receipt: sent, or
+    /// dropped because its zone ended first. Lock order: `attack`, then this.
+    pub attack_off_settled: Arc<Mutex<Vec<AttackOffSettled>>>,
     pub cast:     CastReq,
     /// The honest awaited-cast slot (A3 Migration 3, #448) — sibling of `cast`. See [`CastAwaitReq`].
     pub cast_await: CastAwaitReq,

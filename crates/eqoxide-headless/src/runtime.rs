@@ -164,6 +164,36 @@ impl Host {
         }
         applied
     }
+    /// Publish how each explicit `attack_off` ended: `applied_local` once its packet reached the
+    /// transport, or `refused` with `stale_zone_epoch_before_dispatch` when its zone ended first
+    /// and nothing was sent. Runs before the zone fence, which would otherwise end a queued off as
+    /// `unknown` even though no packet can follow.
+    fn settle_attack_offs(&self, gs: &GameState) {
+        let abandon = if gs.zone_epoch != self.epoch {
+            eqoxide_command::Abandon::OtherZones(gs.zone_epoch)
+        } else {
+            eqoxide_command::Abandon::None
+        };
+        self.publish_attack_offs(abandon);
+    }
+    /// The session has ended: every explicit off still queued will never be sent.
+    fn abandon_attack_offs(&self) {
+        self.publish_attack_offs(eqoxide_command::Abandon::All);
+    }
+    fn publish_attack_offs(&self, abandon: eqoxide_command::Abandon) {
+        use eqoxide_ipc::AttackOffOutcome;
+        for settled in self.command.take_attack_off_settlements(abandon) {
+            let not_sent = Some(json!({"kind":"attack_off_not_sent","packets":[]}));
+            match settled.outcome {
+                AttackOffOutcome::Sent => self.outcome(&settled.command, Status::AppliedLocal, None,
+                    Some(json!({"kind":"attack_off_sent","server_confirmed":false}))),
+                AttackOffOutcome::ZoneEnded => self.outcome(&settled.command, Status::Refused,
+                    Some("stale_zone_epoch_before_dispatch"), not_sent),
+                AttackOffOutcome::SessionEnded => self.outcome(&settled.command, Status::Refused,
+                    Some("not_ready"), not_sent),
+            }
+        }
+    }
     fn outcome(&self, id: &str, status: Status, reason: Option<&str>, evidence: Option<Value>) {
         let _ = self
             .control
@@ -460,13 +490,9 @@ impl Host {
             }
             Operation::AttackOff => {
                 self.attack_until = None;
-                self.command.force_attack_off(Some(&id), Some(self.epoch)); // LAST-WINS, always sent in its zone: explicit safety request
-                self.outcome(
-                    &id,
-                    Status::AppliedLocal,
-                    None,
-                    Some(json!({"kind":"attack_off_queued","server_confirmed":false})),
-                );
+                // LAST-WINS, always sent in its zone: explicit safety request. The receipt stays
+                // `accepted` until the network owner settles it (`settle_attack_offs`).
+                self.command.force_attack_off(Some(&id), Some(self.epoch));
             }
             Operation::MerchantOpen { entity_id } => {
                 if !observed_entity(gs, me, entity_id as u32, 30.0) {
@@ -882,6 +908,7 @@ impl Host {
         load: &mut dyn FnMut(&str) -> Result<(Arc<Collision>, Value), String>,
     ) -> Result<bool, String> {
         let Frame { col, loaded_zone, geometry, publish_at } = frame;
+        self.settle_attack_offs(gs);
         if gs.zone_epoch != self.epoch {
             self.drain_completions();
             self.halt("zone_entry", None);
@@ -1100,6 +1127,14 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 control.set_ready(false);
                 control.publish_event(json!({"kind":"session_ended","reason":terminal}));
             }
+        }
+        if terminal.is_some() {
+            // No network owner is left: settle what it already reported, then end every explicit
+            // off still queued as not sent, and fence anything else still live, every tick, since
+            // safety commands are still admitted.
+            host.settle_attack_offs(&gs);
+            host.abandon_attack_offs();
+            control.end_session("not_ready");
         }
         let link = || {
             let health = wiring.health.lock().unwrap();

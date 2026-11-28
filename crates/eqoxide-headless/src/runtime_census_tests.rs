@@ -3,19 +3,20 @@
 //! the session trace by opcode. A handoff's "wire impact" statement cites this test's output.
 //!
 //! Timing. The host runs on a virtual clock, 20 ms per tick, so leases and movement durations end
-//! on a fixed tick whatever the scheduler does. The network loop ticks twice per host tick, as it
-//! does live (10 ms and 20 ms), and not at all during a zone handshake: production resumes gameplay
-//! drains only after `OP_NewZone` and the zone-in exchange that follows, so the fixture holds them
-//! through the geometry load too. Position streaming keeps the real wall clock.
+//! on a fixed tick whatever the scheduler does. Live, they end on elapsed wall time, so a stalled
+//! host ends them on its next tick; the census trades that for determinism. The network loop ticks
+//! twice per host tick, as it does live (10 ms and 20 ms), and not at all during a zone handshake.
+//! Production resumes gameplay drains when the zone-in exchange after `OP_NewZone` finishes, which
+//! can be before or after the host has loaded geometry, so the session runs under both orderings.
+//! Position streaming keeps the real wall clock.
 //!
 //! Classification.
 //! - `OP_AutoAttack` rows are split by their on/off byte and named with their command ID.
-//! - `OP_ClientUpdate` rows are moving (non-zero delta or animation) or rest (zero delta and
-//!   animation 0). A rest row attributed to a command is that command's stop flush. An
-//!   unattributed rest row at least the 1300 ms keepalive interval after the previous update is a
-//!   keepalive. Any other rest row is unexplained.
-//! - Moving rows and keepalives follow the wall clock and are not asserted exactly; stop flushes
-//!   and unexplained rest rows are.
+//! - `OP_ClientUpdate` rows are named by the reason the network owner recorded for that sequence
+//!   (`ControllerView::last_position_send`, read after every network tick), and a rest row also by
+//!   its command ID. Every row must have a recorded reason.
+//! - Moving rows and keepalives follow the wall clock and are not asserted exactly; rest and
+//!   correction rows are.
 //!
 //! Print the census with `cargo test -p eqoxide-headless census -- --nocapture`.
 
@@ -36,11 +37,9 @@ use tower::ServiceExt;
 
 const MOVING: &str = "OP_CLIENT_UPDATE moving";
 const KEEPALIVE: &str = "OP_CLIENT_UPDATE keepalive";
-const UNEXPLAINED_REST: &str = "OP_CLIENT_UPDATE rest (unexplained)";
+const UNATTRIBUTED_REST: &str = "OP_CLIENT_UPDATE rest";
 const ON: &str = "OP_AUTO_ATTACK on";
 const OFF: &str = "OP_AUTO_ATTACK off";
-/// `POS_SEND_KEEPALIVE_MS` in the network owner.
-const KEEPALIVE_MS: u64 = 1300;
 const TICK: Duration = Duration::from_millis(20);
 
 struct Census {
@@ -56,15 +55,17 @@ struct Census {
     started: Instant,
     clock: Instant,
     read: u64,
-    last_update_ms: Option<u64>,
+    /// The reason the network owner recorded for each position-update sequence it sent.
+    reasons: std::collections::HashMap<u16, eqoxide_core::game_state::PositionSendReason>,
     ready: bool,
     net_running: bool,
+    resume: Resume,
     _peer: UdpSocket,
 }
 
 impl Census {
     /// The host as `run` builds it: no body, epoch 0, nothing published.
-    async fn new() -> Self {
+    async fn new(resume: Resume) -> Self {
         let wiring = Wiring::new("/unused".into());
         let mut host = host_with_wiring(&wiring);
         host.body = None;
@@ -87,9 +88,10 @@ impl Census {
             started,
             clock: started,
             read: 0,
-            last_update_ms: None,
+            reasons: Default::default(),
             ready: false,
             net_running: true,
+            resume,
             _peer: peer,
         }
     }
@@ -102,6 +104,10 @@ impl Census {
                 drain_gameplay_commands(
                     &mut self.action_loop, &mut self.stream, &mut self.gs, &self.lifecycle,
                 );
+                // At most one position update per network tick, so the last send is this tick's.
+                if let Some(sent) = self.controller.controller_view.lock().unwrap().last_position_send {
+                    self.reasons.insert(sent.seq, sent.reason);
+                }
             }
         }
         self.clock += TICK;
@@ -131,7 +137,8 @@ impl Census {
 
     /// A zone entry in the order native sends it: the network owner begins the zone-in, the self
     /// spawn arrives, the handshake runs, `OP_NewZone` arrives, and the zone-in exchange finishes
-    /// while the host loads geometry. Only then do gameplay drains resume.
+    /// either at once (`Resume::AtNewZone`) or after the host has loaded geometry
+    /// (`Resume::AfterGeometry`). Only then do gameplay drains resume.
     async fn enter_zone(&mut self, zone: &str) {
         self.net_running = false;
         self.controller.begin_zone_in(&mut self.gs);
@@ -146,7 +153,10 @@ impl Census {
         self.gs.world.new_zone_applied = true;
         self.gs.upsert_entity(make_entity(7, "a rat", 5.0, 0.0, 0.0, true));
         self.gs.target_id = Some(7);
-        // Geometry loads and the body appears with drains still held.
+        if self.resume == Resume::AtNewZone {
+            self.net_running = true;
+        }
+        // Geometry loads and the body appears.
         self.ticks(5).await;
         self.net_running = true;
         self.ticks(10).await;
@@ -188,16 +198,16 @@ impl Census {
                 let name = row["opcode_name"].as_str().unwrap().to_string();
                 let name = match name.as_str() {
                     "OP_CLIENT_UPDATE" => {
-                        let at = row["at_ms"].as_u64().unwrap();
-                        let gap = self.last_update_ms.replace(at).map(|last| at - last);
-                        let fields = &row["fields"];
-                        let still = fields["delta"].as_array().unwrap().iter().all(|d| d.as_f64() == Some(0.0))
-                            && fields["animation"] == 0;
-                        match (still, command) {
-                            (false, _) => MOVING.into(),
-                            (true, Some(id)) => format!("OP_CLIENT_UPDATE rest ({id})"),
-                            (true, None) if gap.is_some_and(|gap| gap >= KEEPALIVE_MS) => KEEPALIVE.into(),
-                            (true, None) => UNEXPLAINED_REST.into(),
+                        use eqoxide_core::game_state::PositionSendReason as Reason;
+                        let seq = row["fields"]["sequence"].as_u64().unwrap() as u16;
+                        let reason = *self.reasons.get(&seq)
+                            .unwrap_or_else(|| panic!("no recorded reason for position update {row}"));
+                        match (reason, command) {
+                            (Reason::Moving, _) => MOVING.into(),
+                            (Reason::Keepalive, _) => KEEPALIVE.into(),
+                            (Reason::Rest, Some(id)) => format!("OP_CLIENT_UPDATE rest ({id})"),
+                            (Reason::Rest, None) => UNATTRIBUTED_REST.into(),
+                            (Reason::Correction, _) => "OP_CLIENT_UPDATE correction".into(),
                         }
                     }
                     "OP_AUTO_ATTACK" => {
@@ -247,14 +257,30 @@ fn expect(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
 /// a readiness gap, or when attack was never on; with attack on, each implicit stop sends exactly
 /// one; an explicit off is sent and owned by its command. A stop sends exactly one rest update.
 ///
-/// MUTATION CHECKS (each RED): drop the `self.auto_attack` condition for an implicit off in
+/// MUTATION CHECKS (each RED in at least one ordering): drop the `self.auto_attack` condition for an implicit off in
 /// `drain_combat` → "zone entry"; drop the zone-epoch reset → "zone change"; drop the explicit
 /// off's zone check → "zone change"; route `attack_off` through the implicit write → "explicit off
 /// while off"; delete the rest flush → "move"; send a second rest update after the flush → "move";
 /// send byte 1 for every attack packet → "lease expiry".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Resume {
+    AtNewZone,
+    AfterGeometry,
+}
+
 #[tokio::test]
-async fn census_of_a_scripted_session() {
-    let mut s = Census::new().await;
+async fn census_when_drains_resume_at_new_zone() {
+    scripted_session(Resume::AtNewZone).await;
+}
+
+#[tokio::test]
+async fn census_when_drains_resume_after_geometry() {
+    scripted_session(Resume::AfterGeometry).await;
+}
+
+async fn scripted_session(resume: Resume) {
+    println!("census ordering: {resume:?}");
+    let mut s = Census::new(resume).await;
 
     s.enter_zone("qeynos2").await;
     assert_eq!(exact(&s.phase("zone entry")), expect(&[]), "zone entry sends nothing exact");
@@ -315,7 +341,10 @@ async fn census_of_a_scripted_session() {
     s.enter_zone("qeynos").await;
     // central-okgn: the first update in the new zone reads as motion, and the rest that follows is
     // unattributed. Both predate the attack-off change; this pins today's behaviour.
-    assert_eq!(exact(&s.phase("zone change with attack on")), expect(&[(UNEXPLAINED_REST, 1)]));
+    assert_eq!(exact(&s.phase("zone change with attack on")), expect(&[(UNATTRIBUTED_REST, 1)]));
+    let departing = s.host.control.command("off-departing").unwrap();
+    assert_eq!((departing.status, departing.reason.as_deref()),
+        (Status::Refused, Some("stale_zone_epoch_before_dispatch")), "nothing was sent: {departing:?}");
 
     // Death with attack on: one off at the readiness loss, none on the respawn zone-in.
     s.put("attack3", json!({"kind":"attack","lease_ms":5000})).await;

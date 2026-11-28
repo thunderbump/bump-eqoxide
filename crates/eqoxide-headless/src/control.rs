@@ -363,7 +363,7 @@ impl Control {
             return Err("zone epoch cannot decrease".into());
         }
         if zone_epoch != journal.zone_epoch {
-            self.fence_locked(&mut journal, "zone_epoch_changed");
+            self.fence_locked(&mut journal, "zone_epoch_changed", false);
             journal.zone_epoch = zone_epoch;
         }
         journal.state = state;
@@ -372,12 +372,22 @@ impl Control {
     }
 
     /// The host gates ordinary admission on real session readiness. Safety verbs bypass this gate.
+    /// A readiness drop (death, a stale link, geometry loading) does not fence `attack_off`: it is
+    /// the safety stop for exactly that moment (design A2.5), and the network owner settles it.
     pub fn set_ready(&self, ready: bool) {
         let mut journal = self.shared.journal.lock().unwrap();
         if journal.ready && !ready {
-            self.fence_locked(&mut journal, "not_ready");
+            self.fence_locked(&mut journal, "not_ready", true);
         }
         journal.ready = ready;
+    }
+
+    /// The session is over: fence everything still live, `attack_off` included, since no network
+    /// owner is left to settle it.
+    pub fn end_session(&self, reason: &str) {
+        let mut journal = self.shared.journal.lock().unwrap();
+        self.fence_locked(&mut journal, reason, false);
+        journal.ready = false;
     }
 
     pub fn state(&self) -> Value {
@@ -583,8 +593,16 @@ impl Control {
 
     /// Fences touch only non-terminal receipts (design A2.2). Never-dispatched work is refused;
     /// dispatched work is unknown.
-    fn fence_locked(&self, journal: &mut Journal, reason: &str) {
-        journal.priority.clear();
+    fn fence_locked(&self, journal: &mut Journal, reason: &str, spare_attack_off: bool) {
+        let spared = |entry: &Entry| {
+            spare_attack_off
+                && entry.request.as_ref().is_some_and(|r| matches!(r.operation, Operation::AttackOff))
+        };
+        let priority = std::mem::take(&mut journal.priority);
+        journal.priority = priority
+            .into_iter()
+            .filter(|id| journal.entries.get(id).is_some_and(|entry| spared(entry)))
+            .collect();
         journal.ordinary.clear();
         let now_ms = self.now_ms();
         let mut live: Vec<String> = journal.live.iter().cloned().collect();
@@ -592,6 +610,9 @@ impl Control {
         let mut changes = Vec::new();
         for id in live {
             let Some(entry) = journal.entries.get_mut(&id) else { continue };
+            if spared(entry) {
+                continue;
+            }
             entry.receipt.status = if entry.receipt.status == CommandStatus::Accepted && !entry.dispatched {
                 CommandStatus::Refused
             } else {

@@ -1931,19 +1931,20 @@ impl ActionLoop {
             self.auto_attack = false;
             gs.auto_attack = false;
         }
-        let Some(drain) = self.command.take_attack_request() else { return; };
+        let Some(drain) = self.command.take_attack_request(Some(gs.zone_epoch)) else { return; };
         if drain.on {
             self.send_auto_attack(stream, gs, true, drain.command.as_ref());
             return;
         }
         // An explicit off is always sent, one packet per request and attributed to it, unless the
-        // zone it was accepted in has ended: the new zone's server starts with attack off.
-        let explicit: Vec<_> = drain.explicit.into_iter()
-            .filter(|off| off.zone_epoch.is_none_or(|epoch| epoch == gs.zone_epoch))
-            .collect();
-        if !explicit.is_empty() {
-            for off in explicit {
+        // zone it was accepted in has ended (`take_attack_request` settled those as not sent): the
+        // new zone's server starts with attack off.
+        if !drain.explicit.is_empty() {
+            for off in drain.explicit {
                 self.send_auto_attack(stream, gs, false, off.command.as_ref());
+                if let Some(command) = &off.command {
+                    self.command.attack_off_sent(command);
+                }
             }
         } else if self.auto_attack {
             self.send_auto_attack(stream, gs, false, drain.command.as_ref());
