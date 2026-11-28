@@ -52,12 +52,23 @@ impl CommandState {
     /// Toggle auto-attack (POST/DELETE /v1/combat/attack, the Attack button). `on` = engage.
     /// An off here is explicit: it is sent even if the client believes attack is already off. It
     /// carries no packet attribution (packet command IDs are v2 command IDs) and no zone.
+    ///
+    /// An off is also accepted over a queued off (an implicit one from a halt, or another explicit
+    /// one): it adds its own explicit entry, so a v1 `DELETE` during zoning is not refused as busy.
+    /// Anything else over a queued request is refused, as for every single-slot mailbox.
     pub fn request_attack(&self, on: bool) -> bool {
-        self.enqueue_after(&self.combat.attack, on, false, Action::CombatAttack, || {
-            if !on {
+        let key = std::sync::Arc::as_ptr(&self.combat.attack) as usize;
+        let mut slot = self.combat.attack.lock().unwrap();
+        match (*slot, on) {
+            (Some(false), false) | (None, false) => {
                 self.combat.attack_off_explicit.lock().unwrap().push(ExplicitAttackOff::default());
+                *slot = Some(false);
             }
-        })
+            (None, true) => *slot = Some(true),
+            (Some(_), _) => return false,
+        }
+        self.actions.accept(key, false, Action::CombatAttack);
+        true
     }
 
     /// Implicit safety off (a halt, lease expiry, sit, camp), last-wins over a queued on. The
@@ -171,7 +182,13 @@ impl CommandState {
             *slot = Some(on);
             return Some(AttackDrain { on, command: None, explicit });
         }
-        let command = self.actions.drain(std::sync::Arc::as_ptr(&self.combat.attack) as usize).ok()?;
+        // A stale zone fence belongs to the request that set it; explicit offs carry their own zone
+        // and are sent regardless.
+        let command = match self.actions.drain(std::sync::Arc::as_ptr(&self.combat.attack) as usize) {
+            Ok(command) => command,
+            Err(()) if !explicit.is_empty() => None,
+            Err(()) => return None,
+        };
         Some(AttackDrain { on, command, explicit })
     }
 

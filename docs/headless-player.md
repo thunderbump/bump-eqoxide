@@ -114,7 +114,7 @@ Attack-off on the wire.
 
   A readiness drop (death, link loss, geometry loading) does not fence an `attack_off`: it is the safety stop for that moment. When the session ends, a queued off that no network owner will send ends `refused` with reason `not_ready` and the same not-sent evidence. A burst of explicit offs goes out at most 8 per network tick, in order.
 - **An implicit stop queued with an explicit off** adds no packet.
-- **v1 and UI requests.** v1 `DELETE /v1/combat/attack` and UI toggles also always send, but they carry no packet attribution and no zone.
+- **v1 and UI requests.** v1 `DELETE /v1/combat/attack` and UI toggles also always send, even over a queued off, but they carry no packet attribution and no zone.
 
 | Operation kind | Fields / limits |
 | --- | --- |

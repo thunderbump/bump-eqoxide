@@ -740,3 +740,57 @@ async fn an_explicit_off_burst_is_spread_across_drains() {
     }
     assert_eq!(sent, ids, "every off, in order, under its own ID");
 }
+
+fn attack_rows(page: &Value) -> Vec<Value> {
+    page["packets"].as_array().unwrap().iter()
+        .filter(|row| row["opcode"] == OP_AUTO_ATTACK).cloned().collect()
+}
+
+/// With attack on, an explicit off is the one off: the implicit off it subsumes adds no second,
+/// unattributed packet.
+#[tokio::test]
+async fn an_explicit_off_with_attack_on_is_the_only_off() {
+    let mut session = Session::new().await;
+    session.engage();
+    session.host.halt("not_ready", None);
+    session.dispatch("off", json!({"kind":"attack_off"})).await;
+    session.drain();
+    let rows = attack_rows(&session.packets("").await);
+    assert_eq!(rows.len(), 2, "the engage and one off: {rows:?}");
+    assert_eq!(rows[1]["command_id"], "off");
+}
+
+/// The new zone's server starts with attack off, so state and the HUD must too.
+#[tokio::test]
+async fn a_zone_change_shows_attack_off() {
+    let mut session = Session::new().await;
+    session.engage();
+    session.gs.zone_epoch += 1;
+    session.drain();
+    assert!(!session.gs.auto_attack, "attack_on must follow the new zone's server");
+}
+
+/// A queued attack-on that a safety off overwrites is never sent, and its receipt says so.
+#[tokio::test]
+async fn a_queued_attack_overwritten_by_a_halt_is_superseded() {
+    let mut session = Session::new().await;
+    session.dispatch("attack", json!({"kind":"attack","lease_ms":1000})).await;
+    session.host.halt("not_ready", None);
+    session.drain();
+    session.host.update_knowledge(&session.gs);
+    let receipt = session.host.control.command("attack").unwrap();
+    assert_eq!((receipt.status, receipt.reason.as_deref()),
+        (Status::Refused, Some("superseded_by_safety_command")), "{receipt:?}");
+    session.assert_packets("attack", &[]).await;
+}
+
+/// A v1 or UI off over a queued implicit off is accepted, not refused as busy, and is sent even
+/// though attack is off.
+#[tokio::test]
+async fn a_v1_off_over_a_queued_halt_is_accepted_and_sent() {
+    let mut session = Session::new().await;
+    session.host.halt("not_ready", None);
+    assert!(session.host.command.request_attack(false), "a v1 off is never refused by a queued off");
+    session.drain();
+    assert_eq!(attack_rows(&session.packets("").await).len(), 1);
+}
