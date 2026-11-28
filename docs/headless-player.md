@@ -307,8 +307,8 @@ Headings use the raw protocol units.
 | `OP_DELETE_SPAWN` (0x7280) | Inbound | `entity` |
 
 Outbound `OP_CLIENT_UPDATE` `reason` is why the client sent it: `moving` (the 280 ms throttle
-while moving), `keepalive` (1300 ms without another send), `rest` (the stop flush, zero delta and
-animation 0) or `correction` (re-streaming a server correction). It is the sender's own record and
+while moving), `keepalive` (1300 ms without another send), `rest` (owed when the body comes to rest
+after moving or turning in place: zero delta and animation 0) or `correction` (re-streaming a server correction). It is the sender's own record and
 is not on the wire; it matches `self.last_position_send.reason` for the same `sequence`.
 Outbound `OP_CLIENT_UPDATE` uses the payload's own 16-bit `sequence` counter.
 Its unreliable transport `wire_seq` is null. The `OP_NEW_SPAWN` `npc` byte uses
