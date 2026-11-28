@@ -781,13 +781,16 @@ async fn await_outcome<T: serde::Serialize>(
             Some(json!({"kind":kind,"receipt":receipt})),
         ),
         // The server's refusal is prose; the receipt's reason is a code (design A2.7).
+        // A local claim refusal arrives as its code (`stale_zone_epoch_before_dispatch`); a
+        // server's refusal is prose, which goes to `detail` under the code `server_refused`.
         Ok(Ok(ipc::CommandResult::Refused(text))) => {
-            return Completion { id, status: Status::Refused, reason: Some("server_refused".into()),
-                detail: Some(text), evidence: None, transaction };
+            let is_code = !text.is_empty() && text.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+            let (reason, detail) = if is_code { (text, None) } else { ("server_refused".to_owned(), Some(text)) };
+            return Completion { id, status: Status::Refused, reason: Some(reason), detail, evidence: None, transaction };
         }
         _ => (
             Status::Unknown,
-            Some("no_correlated_server_receipt_relog_before_another_transaction".into()),
+            Some("no_server_evidence_within_window".into()),
             None,
         ),
     };
@@ -1013,6 +1016,10 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             && host_ready(&gs, &host, col.is_some(), tick_age, link_age, dropped);
         host.step(&gs, col.as_deref(), ready, now, dt);
         host.update_knowledge(&gs);
+        // A completion that arrived during this tick is applied before the publish, after the fences.
+        if host.drain_completions() {
+            publish_at = now;
+        }
         if now >= publish_at {
             let position = host.body.as_ref().map(|body| body.pos);
             host.published_position = position;
@@ -1044,9 +1051,6 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             publish_at = now + Duration::from_millis(100);
         }
         control.set_ready(ready);
-        if host.drain_completions() {
-            publish_at = now;
-        }
         for command in control.drain_actions() {
             host.dispatch(command, &gs, ready, now).await;
         }
@@ -1668,6 +1672,11 @@ mod execution_claim_tests {
         let receipt = host.control.command("buy").unwrap();
         assert_eq!((receipt.status, receipt.reason.as_deref(), receipt.detail.as_deref()),
             (Status::Refused, Some("server_refused"), Some("merchant refused")));
+        let (tx, rx) = tokio::sync::oneshot::channel::<ipc::CommandResult<Value>>();
+        tx.send(ipc::CommandResult::Refused("stale_zone_epoch_before_dispatch".into())).unwrap();
+        let done = await_outcome("x".into(), rx, "server_buy_receipt", true).await;
+        assert_eq!((done.reason.as_deref(), done.detail), (Some("stale_zone_epoch_before_dispatch"), None),
+            "a local claim refusal keeps its own code");
     }
 
     /// Review of PR #6: the same holds once the fenced receipt has been evicted.
