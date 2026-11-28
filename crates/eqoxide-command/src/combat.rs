@@ -180,6 +180,9 @@ impl CommandState {
             let rest = explicit.split_off(EXPLICIT_OFFS_PER_DRAIN);
             *self.combat.attack_off_explicit.lock().unwrap() = rest;
             *slot = Some(on);
+            // Let tracked requests already in this batch report now; the slot's packet command
+            // matters only for an implicit off, which is not sent while explicit ones remain.
+            let _ = self.actions.drain(std::sync::Arc::as_ptr(&self.combat.attack) as usize);
             return Some(AttackDrain { on, command: None, explicit });
         }
         // A stale zone fence belongs to the request that set it; explicit offs carry their own zone

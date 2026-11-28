@@ -1980,6 +1980,9 @@ impl GameState {
         // own line because `clear_target()` deliberately does NOT touch it (it is spawn-scoped, not
         // target-scoped), which is how the clear stayed missing from #336 to #883.
         self.last_consider = None;
+        // The new zone's server starts with attack off (`Client::Client`, bump-EQEmu cd66dd0a6
+        // zone/client.cpp:227), and state published during the handshake must say so.
+        self.auto_attack = false;
         self.world.new_zone_applied = false;
         // #683 review (F2): the previous zone's advertised zone points are meaningless — and
         // actively dangerous — in the new zone. Left in place they persist through the

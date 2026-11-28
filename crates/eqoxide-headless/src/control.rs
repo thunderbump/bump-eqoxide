@@ -215,6 +215,11 @@ impl Entry {
     }
 }
 
+/// Evidence on every refused `attack_off`: no `OP_AutoAttack 0` was sent for it.
+pub fn attack_off_not_sent() -> Value {
+    json!({"kind":"attack_off_not_sent","packets":[]})
+}
+
 /// An evicted receipt keeps only enough to answer a replay: its identity never becomes reusable.
 struct Tombstone {
     payload: [u8; 16],
@@ -225,6 +230,8 @@ struct Tombstone {
 struct Journal {
     zone_epoch: u64,
     ready: bool,
+    /// The session is over: nothing is admitted, safety commands included.
+    closed: bool,
     revision: u64,
     state: Value,
     entries: HashMap<String, Entry>,
@@ -317,6 +324,7 @@ impl Control {
                     identities: 0,
                     stop_reserve_used: 0,
                     attack_off_reserve_used: 0,
+                    closed: false,
                     priority: VecDeque::new(),
                     ordinary: VecDeque::new(),
                     sequence: 0,
@@ -383,11 +391,12 @@ impl Control {
     }
 
     /// The session is over: fence everything still live, `attack_off` included, since no network
-    /// owner is left to settle it.
+    /// owner is left to settle it, and refuse every later command at admission.
     pub fn end_session(&self, reason: &str) {
         let mut journal = self.shared.journal.lock().unwrap();
         self.fence_locked(&mut journal, reason, false);
         journal.ready = false;
+        journal.closed = true;
     }
 
     pub fn state(&self) -> Value {
@@ -613,6 +622,7 @@ impl Control {
             if spared(entry) {
                 continue;
             }
+            let attack_off = entry.request.as_ref().is_some_and(|r| matches!(r.operation, Operation::AttackOff));
             entry.receipt.status = if entry.receipt.status == CommandStatus::Accepted && !entry.dispatched {
                 CommandStatus::Refused
             } else {
@@ -621,6 +631,9 @@ impl Control {
             entry.receipt.terminal = true;
             entry.receipt.reason = Some(reason.into());
             entry.receipt.updated_at_ms = now_ms;
+            if attack_off && entry.receipt.status == CommandStatus::Refused {
+                entry.receipt.evidence = Some(attack_off_not_sent());
+            }
             changes.push(entry.receipt.clone());
             self.retire_locked(journal, &id);
         }
@@ -704,7 +717,7 @@ impl Control {
         } else if let Err(prose) = request.operation.validate() {
             detail = Some(prose.to_owned());
             Some("invalid_operation".to_owned())
-        } else if !safety && !journal.ready {
+        } else if journal.closed || (!safety && !journal.ready) {
             Some("not_ready".to_owned())
         } else if !safety
             && journal.live.iter().any(|live| {
@@ -724,9 +737,10 @@ impl Control {
             id: id.clone(),
             status,
             terminal: status.terminal(),
+            evidence: (refusal.is_some() && matches!(request.operation, Operation::AttackOff))
+                .then(attack_off_not_sent),
             reason: refusal,
             detail,
-            evidence: None,
             accepted_at_ms: now_ms,
             updated_at_ms: now_ms,
             admitted: (status == CommandStatus::Refused).then_some(false),

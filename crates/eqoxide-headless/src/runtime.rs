@@ -176,6 +176,14 @@ impl Host {
         };
         self.publish_attack_offs(abandon);
     }
+    /// No network owner will drain again: publish what it already settled, end every explicit off
+    /// still queued as not sent, fence the rest, and close admission. Called on every exit path
+    /// and on every tick after a terminal network outcome.
+    fn finish_session(&self, gs: &GameState) {
+        self.settle_attack_offs(gs);
+        self.abandon_attack_offs();
+        self.control.end_session("not_ready");
+    }
     /// The session has ended: every explicit off still queued will never be sent.
     fn abandon_attack_offs(&self) {
         self.publish_attack_offs(eqoxide_command::Abandon::All);
@@ -183,8 +191,10 @@ impl Host {
     fn publish_attack_offs(&self, abandon: eqoxide_command::Abandon) {
         use eqoxide_ipc::AttackOffOutcome;
         for settled in self.command.take_attack_off_settlements(abandon) {
-            let not_sent = Some(json!({"kind":"attack_off_not_sent","packets":[]}));
+            let not_sent = Some(crate::control::attack_off_not_sent());
             match settled.outcome {
+                // Queued into the reliable window, which retransmits it until acknowledged (design
+                // A2.1 `sent`); the trace row's ack fields show acknowledgement.
                 AttackOffOutcome::Sent => self.outcome(&settled.command, Status::AppliedLocal, None,
                     Some(json!({"kind":"attack_off_sent","server_confirmed":false}))),
                 AttackOffOutcome::ZoneEnded => self.outcome(&settled.command, Status::Refused,
@@ -408,12 +418,13 @@ impl Host {
         let req = command.request;
         let me = self.published_position;
         if req.zone_epoch != self.epoch || (!ready && !req.operation.is_priority()) {
-            self.outcome(
-                &id,
-                Status::Refused,
-                Some("session_or_zone_not_ready"),
-                None,
-            );
+            if matches!(req.operation, Operation::AttackOff) {
+                // Only a zone change can stop a safety off here; nothing was sent for it.
+                self.outcome(&id, Status::Refused, Some("stale_zone_epoch_before_dispatch"),
+                    Some(crate::control::attack_off_not_sent()));
+            } else {
+                self.outcome(&id, Status::Refused, Some("session_or_zone_not_ready"), None);
+            }
             return;
         }
         // Claim under the journal lock before any side effect. A priority command may have
@@ -1129,12 +1140,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             }
         }
         if terminal.is_some() {
-            // No network owner is left: settle what it already reported, then end every explicit
-            // off still queued as not sent, and fence anything else still live, every tick, since
-            // safety commands are still admitted.
-            host.settle_attack_offs(&gs);
-            host.abandon_attack_offs();
-            control.end_session("not_ready");
+            host.finish_session(&gs);
         }
         let link = || {
             let health = wiring.health.lock().unwrap();
@@ -1163,14 +1169,19 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         if wiring.shutdown.load(Ordering::Acquire) {
             let started = shutdown_started.get_or_insert(now);
             if terminal.is_some() {
+                host.finish_session(&gs);
                 break;
             }
             if now.duration_since(*started) >= Duration::from_secs(8) {
+                // The network owner may be parked (a kick sets shutdown and waits): no one will
+                // send what is still queued.
+                host.finish_session(&gs);
                 api.abort();
                 return Err("logout completion deadline exceeded; session outcome unknown".into());
             }
         }
         if api.is_finished() {
+            host.finish_session(&gs);
             host.halt("http_server_ended", None);
             wiring.shutdown.store(true, Ordering::Release);
             return Err("control HTTP server ended".into());

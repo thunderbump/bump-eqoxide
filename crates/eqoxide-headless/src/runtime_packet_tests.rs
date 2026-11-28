@@ -709,8 +709,7 @@ async fn a_readiness_drop_after_dispatch_keeps_attack_off() {
 async fn session_end_refuses_a_queued_attack_off() {
     let mut session = Session::new().await;
     session.dispatch("off", json!({"kind":"attack_off"})).await;
-    session.host.abandon_attack_offs();
-    session.host.control.end_session("not_ready");
+    session.host.finish_session(&session.gs);
     let receipt = session.host.control.command("off").unwrap();
     assert_eq!((receipt.status, receipt.reason.as_deref()), (Status::Refused, Some("not_ready")));
     assert_eq!(receipt.evidence, Some(json!({"kind":"attack_off_not_sent","packets":[]})));
@@ -793,4 +792,67 @@ async fn a_v1_off_over_a_queued_halt_is_accepted_and_sent() {
     assert!(session.host.command.request_attack(false), "a v1 off is never refused by a queued off");
     session.drain();
     assert_eq!(attack_rows(&session.packets("").await).len(), 1);
+}
+
+async fn put_raw(session: &Session, id: &str, operation: Value) -> StatusCode {
+    session.host.control.router().oneshot(
+        Request::put(format!("/v2/player/commands/{id}"))
+            .header("authorization", "Bearer test-credential")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({
+                "session": "test-session", "zone_epoch": session.host.epoch, "operation": operation,
+            }).to_string()))
+            .unwrap(),
+    ).await.unwrap().status()
+}
+
+fn assert_refused_not_sent(session: &Session, id: &str, reason: &str) {
+    let receipt = session.host.control.command(id).unwrap();
+    assert_eq!((receipt.status, receipt.reason.as_deref()), (Status::Refused, Some(reason)), "{receipt:?}");
+    assert_eq!(receipt.evidence, Some(json!({"kind":"attack_off_not_sent","packets":[]})), "{receipt:?}");
+}
+
+/// After the session ends, an `attack_off` is refused at admission, not left `accepted` with no
+/// network owner to send it.
+#[tokio::test]
+async fn attack_off_after_session_end_is_refused_at_admission() {
+    let session = Session::new().await;
+    session.host.finish_session(&session.gs);
+    put_raw(&session, "late", json!({"kind":"attack_off"})).await;
+    assert_refused_not_sent(&session, "late", "not_ready");
+    assert!(session.host.control.drain_actions().is_empty());
+}
+
+/// An `attack_off` admitted but not yet dispatched when the zone changes is refused by the zone
+/// fence, with the same not-sent evidence as one dropped by the network owner.
+#[tokio::test]
+async fn attack_off_fenced_before_dispatch_says_not_sent() {
+    let mut session = Session::new().await;
+    session.admit("off", json!({"kind":"attack_off"})).await;
+    session.host.control.publish_state(session.host.epoch + 1, json!({})).unwrap();
+    assert_refused_not_sent(&session, "off", "zone_epoch_changed");
+}
+
+/// The host has moved to the new zone before the journal publishes it: dispatch refuses the old
+/// zone's `attack_off` as not sent.
+#[tokio::test]
+async fn attack_off_dispatched_after_the_host_changed_zone_says_not_sent() {
+    let mut session = Session::new().await;
+    session.admit("off", json!({"kind":"attack_off"})).await;
+    session.host.epoch += 1;
+    for command in session.host.control.drain_actions() {
+        session.host.dispatch(command, &session.gs, false, Instant::now()).await;
+    }
+    assert_refused_not_sent(&session, "off", "stale_zone_epoch_before_dispatch");
+    session.drain();
+    session.assert_packets("off", &[]).await;
+}
+
+/// State published during a zone handshake, before any gameplay drain, already shows attack off.
+#[tokio::test]
+async fn zone_in_clears_attack_on_before_any_drain() {
+    let mut session = Session::new().await;
+    session.engage();
+    session.gs.begin_zone_in();
+    assert!(!session.gs.auto_attack);
 }
