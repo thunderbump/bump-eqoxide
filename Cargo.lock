@@ -1000,6 +1000,7 @@ dependencies = [
  "eqoxide-net",
  "eqoxide-physics",
  "eqoxide-zone-geometry",
+ "mime",
  "serde",
  "serde_json",
  "sha2",

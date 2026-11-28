@@ -18,6 +18,8 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
+# Parses Content-Type exactly as axum's Json extractor does (it depends on the same crate).
+mime = "0.3"
 
 [dev-dependencies]
 eqoxide-net = { path = "../eqoxide-net", features = ["test-fixtures"] }
