@@ -579,10 +579,6 @@ impl Control {
         let mut changes = Vec::new();
         for id in live {
             let Some(entry) = journal.entries.get_mut(&id) else { continue };
-            // `camp` spans the readiness drop it causes (design A2.2): it settles by its own path.
-            if entry.dispatched && entry.request.as_ref().is_some_and(|r| matches!(r.operation, Operation::Camp)) {
-                continue;
-            }
             entry.receipt.status = if entry.receipt.status == CommandStatus::Accepted && !entry.dispatched {
                 CommandStatus::Refused
             } else {
@@ -883,14 +879,18 @@ async fn get_command(
 async fn put_command(
     State(control): State<Control>,
     Path(id): Path<String>,
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    request: Request<axum::body::Body>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    // The ID is checked before the body (design A3): an invalid ID is 400 whatever follows.
+    // The ID is checked before the body is read (design A3): an invalid ID gets a prompt 400,
+    // even from a client that sent headers and then stalled.
     if !valid_command_id(&id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_command_id".into(), None));
     }
+    let bytes = axum::body::to_bytes(request.into_body(), 16 * 1024).await.map_err(|_| {
+        ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid_command_payload".into(), None)
+    })?;
     // A body that is not JSON is the same 422 as a payload of the wrong shape.
-    let Json(body) = body.map_err(|_| {
+    let body: Value = serde_json::from_slice(&bytes).map_err(|_| {
         ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid_command_payload".into(), None)
     })?;
     let (code, receipt, cursor) = control.admit(id, body)?;

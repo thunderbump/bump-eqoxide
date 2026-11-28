@@ -935,19 +935,24 @@ fn one_hour_at_five_commands_per_second_keeps_admitting_and_loses_no_receipt() {
     control.publish_state(4, json!({"phase":"ready"})).unwrap();
     control.set_ready(true);
     let mut cursor = 0u64;
-    let mut seen: std::collections::HashMap<String, (bool, bool)> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<String, (u32, u32)> = std::collections::HashMap::new();
     const COMMANDS: usize = 70_000;
+    // Design A4 load: about 60 events/s at 5 commands/s, i.e. 12 per command including the two
+    // receipt events. The reader falls the promised 120 s (600 commands, 7200 events) behind.
+    const EXTRA_EVENTS: usize = 10;
+    const READ_EVERY: usize = 600;
     for n in 0..COMMANDS {
         let id = format!("cmd-{n}");
         let (code, _, _) = control.admit(id.clone(), movement()).unwrap();
         assert_eq!(code, StatusCode::ACCEPTED, "command {n} was not admitted");
         assert_eq!(control.drain_actions().len(), 1);
-        control.publish_event(json!({"kind":"combat","n":n}));
-        control.publish_event(json!({"kind":"received_game_event","n":n}));
+        for k in 0..EXTRA_EVENTS {
+            control.publish_event(json!({"kind":"combat","n":n,"k":k}));
+        }
         control
             .publish_outcome(&id, CommandStatus::AppliedLocal, None, Some(json!({"kind":"controller_intent"})))
             .unwrap();
-        if n % 1000 == 999 {
+        if n % READ_EVERY == READ_EVERY - 1 || n == COMMANDS - 1 {
             let batch = control.event_batch(cursor).unwrap();
             assert!(!batch.gap, "the reader lost events at command {n}");
             let mut expected = cursor + 1;
@@ -959,8 +964,8 @@ fn one_hour_at_five_commands_per_second_keeps_admitting_and_loses_no_receipt() {
                 let receipt = &event.event["command"];
                 let entry = seen.entry(receipt["id"].as_str().unwrap().to_owned()).or_default();
                 match receipt["status"].as_str().unwrap() {
-                    "accepted" => entry.0 = true,
-                    "applied_local" => entry.1 = true,
+                    "accepted" => entry.0 += 1,
+                    "applied_local" => entry.1 += 1,
                     other => panic!("unexpected status {other}"),
                 }
             }
@@ -968,8 +973,8 @@ fn one_hour_at_five_commands_per_second_keeps_admitting_and_loses_no_receipt() {
         }
     }
     assert_eq!(seen.len(), COMMANDS);
-    assert!(seen.values().all(|(admitted, terminal)| *admitted && *terminal),
-        "every command has its admission and its terminal event");
+    assert!(seen.values().all(|counts| *counts == (1, 1)),
+        "every command has exactly one admission and one terminal event");
     assert!(control.command("cmd-0").is_none(), "the oldest receipts were evicted");
 }
 
@@ -1095,24 +1100,3 @@ fn fences_supersessions_and_refusals_all_retire() {
         "exactly the retention bound is kept");
 }
 
-/// Design A2.2: a dispatched `camp` spans the readiness drop and zone change it causes; an
-/// undispatched one is still refused by the fence.
-#[test]
-fn a_dispatched_camp_spans_fences() {
-    let control = control(10, 100);
-    control.admit("camp".into(), request(json!({"kind":"camp"}))).unwrap();
-    control.drain_actions();
-    control.mark_dispatched("camp").unwrap();
-    control.set_ready(false);
-    control.publish_state(5, json!({})).unwrap();
-    let camp = control.command("camp").unwrap();
-    assert_eq!((camp.status, camp.terminal), (CommandStatus::Accepted, false));
-    control.publish_state(6, json!({})).unwrap();
-    control.set_ready(true);
-    let mut queued = request(json!({"kind":"camp"}));
-    queued["zone_epoch"] = json!(6);
-    control.admit("camp-2".into(), queued).unwrap();
-    control.set_ready(false);
-    assert_eq!(control.command("camp-2").unwrap().status, CommandStatus::Refused,
-        "an undispatched camp is still fenced");
-}

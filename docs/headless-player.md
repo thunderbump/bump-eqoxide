@@ -118,8 +118,7 @@ Each receipt carries `terminal`, `accepted_at_ms` and `updated_at_ms` on the hos
 always a snake_case code; a validation failure is `invalid_operation`, with prose in `detail`. Only
 `accepted` and `sent` are non-terminal, and a terminal receipt never changes. A readiness drop or
 zone change fences only non-terminal receipts: never-dispatched work becomes `refused`, and
-dispatched work becomes `unknown`. A dispatched `camp` is exempt: it spans the readiness drop it
-causes. Late server evidence for a fenced receipt is not applied.
+dispatched work becomes `unknown`. Late server evidence for a fenced receipt is not applied.
 This host leaves queued network work accepted until an actual drain outcome or correlated reply;
 it does not manufacture a send receipt. Buy and merchant-open confirmation comes from the real
 server echo. Most other network commands can report `unknown` after dispatch because the protocol
