@@ -6,6 +6,36 @@
 //! were (the HTTP handler and `ActionLoop::tick`). No behavior change — just one typed surface.
 
 use super::actions::TracedRequest;
+use eqoxide_ipc::{AttackOffOutcome, AttackOffSettled, ExplicitAttackOff};
+
+/// Explicit offs sent per network drain at most.
+pub const EXPLICIT_OFFS_PER_DRAIN: usize = 8;
+
+/// What the host abandons when it reads explicit-off outcomes.
+#[derive(Clone, Copy, Debug)]
+pub enum Abandon {
+    None,
+    OtherZones(u64),
+    All,
+}
+
+/// Remove the explicit offs accepted in a zone other than `current`.
+fn drain_stale(offs: &mut Vec<ExplicitAttackOff>, current: u64) -> Vec<ExplicitAttackOff> {
+    let (stale, live) = std::mem::take(offs).into_iter()
+        .partition(|off| off.zone_epoch.is_some_and(|epoch| epoch != current));
+    *offs = live;
+    stale
+}
+
+/// One drained attack request; see [`CommandState::take_attack_request`].
+#[derive(Debug)]
+pub struct AttackDrain {
+    pub on: bool,
+    /// Attribution for an implicit off, or for an on.
+    pub command: Option<std::sync::Arc<str>>,
+    /// Explicit offs, in request order. Non-empty only when `on` is false.
+    pub explicit: Vec<ExplicitAttackOff>,
+}
 use super::{Action, CommandState};
 use eqoxide_ipc::{CastEnd, CastRequest, CommandResult};
 use tokio::sync::oneshot;
@@ -20,15 +50,69 @@ impl CommandState {
     }
 
     /// Toggle auto-attack (POST/DELETE /v1/combat/attack, the Attack button). `on` = engage.
+    /// An off here is explicit: it is sent even if the client believes attack is already off. It
+    /// carries no packet attribution (packet command IDs are v2 command IDs) and no zone.
+    ///
+    /// An off is accepted over anything queued: over a queued on it replaces it, and over a queued
+    /// off (an implicit one from a halt, or another explicit one) it adds its own explicit entry,
+    /// so a v1 `DELETE` is never refused as busy. An on over a queued request is refused, as for
+    /// every single-slot mailbox.
     pub fn request_attack(&self, on: bool) -> bool {
-        self.enqueue(&self.combat.attack, on, false, Action::CombatAttack)
+        let key = std::sync::Arc::as_ptr(&self.combat.attack) as usize;
+        let mut slot = self.combat.attack.lock().unwrap();
+        match (*slot, on) {
+            (Some(true), false) => {
+                // An off replaces a queued on, which is never sent.
+                self.actions.replace_with_safety(key, None);
+                self.combat.attack_off_explicit.lock().unwrap().push(ExplicitAttackOff::default());
+                *slot = Some(false);
+            }
+            (Some(false), false) | (None, false) => {
+                self.combat.attack_off_explicit.lock().unwrap().push(ExplicitAttackOff::default());
+                *slot = Some(false);
+            }
+            (None, true) => *slot = Some(true),
+            (Some(_), _) => return false,
+        }
+        self.actions.accept(key, false, Action::CombatAttack);
+        true
     }
 
-    /// Safety-off is last-wins. An overwritten attack must never lend its ID to the off packet.
+    /// Implicit safety off (a halt, lease expiry, sit, camp), last-wins over a queued on. The
+    /// network owner sends it only while attack is on; with attack off it is drained and nothing
+    /// goes on the wire. An overwritten attack must never lend its ID to the off packet.
+    ///
+    /// Over a queued off it changes no payload. With an explicit off queued it does nothing: that
+    /// off goes out and owns its packet. Over an implicit off, a command ID (`sit`, `camp`) takes
+    /// the packet's attribution, and no ID (a halt) never erases one.
     pub fn overwrite_attack_off(&self, command: Option<&str>) {
+        let key = std::sync::Arc::as_ptr(&self.combat.attack) as usize;
         let mut slot = self.combat.attack.lock().unwrap();
+        if *slot == Some(false) {
+            if command.is_some() && self.combat.attack_off_explicit.lock().unwrap().is_empty() {
+                self.actions.set_packet_command(key, command);
+            }
+            return;
+        }
         *slot = Some(false);
-        self.actions.set_packet_command(std::sync::Arc::as_ptr(&self.combat.attack) as usize, command);
+        self.actions.replace_with_safety(key, command);
+    }
+
+    /// Explicit off (the `attack_off` command), last-wins over a queued on, and always sent while
+    /// its zone lasts: it is a script's safety stop and a tester's way to send a redundant off.
+    /// Each call is its own packet, attributed to `command`. An off accepted in zone `zone_epoch`
+    /// and drained after that zone ended is dropped: the new zone's server starts with attack off.
+    pub fn force_attack_off(&self, command: Option<&str>, zone_epoch: Option<u64>) {
+        let key = std::sync::Arc::as_ptr(&self.combat.attack) as usize;
+        let mut slot = self.combat.attack.lock().unwrap();
+        if *slot != Some(false) {
+            *slot = Some(false);
+            self.actions.replace_with_safety(key, None);
+        }
+        self.combat.attack_off_explicit.lock().unwrap().push(ExplicitAttackOff {
+            command: command.map(std::sync::Arc::from),
+            zone_epoch,
+        });
     }
 
     /// Consider a spawn (POST /v1/combat/consider, the Consider button) — con color/faction reply.
@@ -78,11 +162,77 @@ impl CommandState {
 
     /// Drain a pending auto-attack toggle. `Some(true)` = engage, `Some(false)` = disengage.
     pub fn take_attack(&self) -> Option<bool> {
-        self.dequeue(&self.combat.attack)
+        self.take_attack_request(None).map(|drain| drain.on)
     }
 
     pub fn take_attack_with_command(&self) -> Option<TracedRequest<bool>> {
-        self.dequeue_with_command(&self.combat.attack)
+        self.take_attack_request(None).map(|drain| (drain.on, drain.command))
+    }
+
+    /// Drain the attack slot: the payload, the implicit packet attribution, and every explicit off
+    /// queued with it, all taken under the slot lock so they belong to this payload. With
+    /// `zone_epoch`, an explicit off accepted in another zone is not returned: it is settled as
+    /// not sent, under the same lock, so the host can publish its receipt.
+    pub fn take_attack_request(&self, zone_epoch: Option<u64>) -> Option<AttackDrain> {
+        let mut slot = self.combat.attack.lock().unwrap();
+        let on = slot.take()?;
+        let mut explicit = std::mem::take(&mut *self.combat.attack_off_explicit.lock().unwrap());
+        if let Some(current) = zone_epoch {
+            let stale = drain_stale(&mut explicit, current);
+            self.settle_attack_offs(stale, AttackOffOutcome::ZoneEnded);
+        }
+        // A burst of explicit offs goes out a few per network tick, so the transport processes
+        // acknowledgements between them; the rest stay queued with the off still in the slot.
+        if explicit.len() > EXPLICIT_OFFS_PER_DRAIN {
+            let rest = explicit.split_off(EXPLICIT_OFFS_PER_DRAIN);
+            *self.combat.attack_off_explicit.lock().unwrap() = rest;
+            *slot = Some(on);
+            // The tracker is drained only with the last batch: a v1 request's entry may be in the
+            // remainder, and it must not report processed before its packet goes out.
+            return Some(AttackDrain { on, command: None, explicit });
+        }
+        // A stale zone fence belongs to the request that set it; explicit offs carry their own zone
+        // and are sent regardless.
+        let command = match self.actions.drain(std::sync::Arc::as_ptr(&self.combat.attack) as usize) {
+            Ok(command) => command,
+            Err(()) if !explicit.is_empty() => None,
+            Err(()) => return None,
+        };
+        Some(AttackDrain { on, command, explicit })
+    }
+
+    /// Record that the network owner put this explicit off on the wire.
+    pub fn attack_off_sent(&self, command: &std::sync::Arc<str>) {
+        self.combat.attack_off_settled.lock().unwrap()
+            .push(AttackOffSettled { command: command.clone(), outcome: AttackOffOutcome::Sent });
+    }
+
+    /// The host's read of explicit-off outcomes, once per tick before its fences. Under the slot
+    /// lock, so no drain can send what is settled here as not sent:
+    /// - `Abandon::OtherZones(epoch)`: the host has just seen the zone change to `epoch`; every
+    ///   explicit off still queued from an earlier zone is settled as `ZoneEnded`.
+    /// - `Abandon::All`: the session has ended; every queued explicit off is `SessionEnded`.
+    pub fn take_attack_off_settlements(&self, abandon: Abandon) -> Vec<AttackOffSettled> {
+        let _slot = self.combat.attack.lock().unwrap();
+        let mut queued = self.combat.attack_off_explicit.lock().unwrap();
+        match abandon {
+            Abandon::None => {}
+            Abandon::OtherZones(current) => {
+                let stale = drain_stale(&mut queued, current);
+                self.settle_attack_offs(stale, AttackOffOutcome::ZoneEnded);
+            }
+            Abandon::All => {
+                let all = std::mem::take(&mut *queued);
+                self.settle_attack_offs(all, AttackOffOutcome::SessionEnded);
+            }
+        }
+        drop(queued);
+        std::mem::take(&mut *self.combat.attack_off_settled.lock().unwrap())
+    }
+
+    fn settle_attack_offs(&self, offs: Vec<ExplicitAttackOff>, outcome: AttackOffOutcome) {
+        let mut settled = self.combat.attack_off_settled.lock().unwrap();
+        settled.extend(offs.into_iter().filter_map(|off| off.command).map(|command| AttackOffSettled { command, outcome }));
     }
 
     /// Drain a pending consider request.

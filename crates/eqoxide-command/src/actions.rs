@@ -179,6 +179,21 @@ impl ActionTracker {
         Self::replace_packet_command(&mut self.0.lock().unwrap(), key, command.map(Arc::from));
     }
 
+    /// A last-wins safety write replaces the queued payload outright: its attribution becomes
+    /// `command`, and whatever it replaced loses its zone fence and is finished as superseded, since
+    /// it will never be sent. Without this, a safety off over a queued request from an earlier zone
+    /// inherits that request's stale fence and is dropped at the drain.
+    pub(crate) fn replace_with_safety(&self, key: usize, command: Option<&str>) {
+        let mut state = self.0.lock().unwrap();
+        state.fences.remove(&key);
+        let replaced = state.queued.remove(&key).unwrap_or_default();
+        Self::replace_packet_command(&mut state, key, command.map(Arc::from));
+        drop(state);
+        for id in replaced {
+            self.finish(id, "refused", "superseded_by_safety_command");
+        }
+    }
+
     pub(crate) fn take_packet_command(&self, key: usize) -> PacketCommand {
         self.0.lock().unwrap().packet_commands.remove(&key)
     }
@@ -205,7 +220,7 @@ impl ActionTracker {
         for id in stale {self.finish(id,"refused","stale_zone_epoch_before_dispatch");}
         keep
     }
-    fn drain(&self, key: usize) -> Result<PacketCommand, ()> {
+    pub(crate) fn drain(&self, key: usize) -> Result<PacketCommand, ()> {
         let mut state = self.0.lock().unwrap();
         let command = state.packet_commands.remove(&key);
         if let Some((expected, id)) = state.fences.remove(&key) {

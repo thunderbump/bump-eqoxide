@@ -197,7 +197,8 @@ mod tests {
         }
 
         case!("request_target", |c| c.request_target(11), |c| c.request_target(22), |c| c.take_target(), Some(11));
-        case!("request_attack", |c| c.request_attack(true), |c| c.request_attack(false), |c| c.take_attack(), Some(true));
+        // An off is a safety stop and is accepted over anything queued (PR #7); an on is not.
+        case!("request_attack", |c| c.request_attack(false), |c| c.request_attack(true), |c| c.take_attack(), Some(false));
         case!("request_consider", |c| c.request_consider(11), |c| c.request_consider(22), |c| c.take_consider(), Some(11));
         case!("request_cast",
             |c| c.request_cast(CastRequest { gem: 1, target_id: None, item_slot: None }),

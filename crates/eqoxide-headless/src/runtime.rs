@@ -156,13 +156,53 @@ impl Host {
     /// Apply awaited outcomes on the host loop, so no fence can run between settling the latch
     /// and publishing the receipt. Returns whether anything was applied, so the caller can
     /// publish state at once.
-    fn drain_completions(&mut self, _snapshot: &Arc<GameState>) -> bool {
+    fn drain_completions(&mut self) -> bool {
         let mut applied = false;
         while let Ok(done) = self.completions.1.try_recv() {
             self.apply_completion(done);
             applied = true;
         }
         applied
+    }
+    /// Publish how each explicit `attack_off` ended: `applied_local` once its packet reached the
+    /// transport, or `refused` with `stale_zone_epoch_before_dispatch` when its zone ended first
+    /// and nothing was sent. Runs before the zone fence, which would otherwise end a queued off as
+    /// `unknown` even though no packet can follow.
+    fn settle_attack_offs(&self, gs: &GameState) {
+        let abandon = if gs.zone_epoch != self.epoch {
+            eqoxide_command::Abandon::OtherZones(gs.zone_epoch)
+        } else {
+            eqoxide_command::Abandon::None
+        };
+        self.publish_attack_offs(abandon);
+    }
+    /// No network owner will drain again: publish what it already settled, end every explicit off
+    /// still queued as not sent, fence the rest, and close admission. Called on every exit path
+    /// and on every tick after a terminal network outcome.
+    fn finish_session(&self, gs: &GameState) {
+        self.settle_attack_offs(gs);
+        self.abandon_attack_offs();
+        self.control.end_session("not_ready");
+    }
+    /// The session has ended: every explicit off still queued will never be sent.
+    fn abandon_attack_offs(&self) {
+        self.publish_attack_offs(eqoxide_command::Abandon::All);
+    }
+    fn publish_attack_offs(&self, abandon: eqoxide_command::Abandon) {
+        use eqoxide_ipc::AttackOffOutcome;
+        for settled in self.command.take_attack_off_settlements(abandon) {
+            let not_sent = Some(crate::control::attack_off_not_sent());
+            match settled.outcome {
+                // Queued into the reliable window, which retransmits it until acknowledged (design
+                // A2.1 `sent`); the trace row's ack fields show acknowledgement.
+                AttackOffOutcome::Sent => self.outcome(&settled.command, Status::AppliedLocal, None,
+                    Some(json!({"kind":"attack_off_sent","server_confirmed":false}))),
+                AttackOffOutcome::ZoneEnded => self.outcome(&settled.command, Status::Refused,
+                    Some("stale_zone_epoch_before_dispatch"), not_sent),
+                AttackOffOutcome::SessionEnded => self.outcome(&settled.command, Status::Refused,
+                    Some("not_ready"), not_sent),
+            }
+        }
     }
     fn outcome(&self, id: &str, status: Status, reason: Option<&str>, evidence: Option<Value>) {
         let _ = self
@@ -378,12 +418,13 @@ impl Host {
         let req = command.request;
         let me = self.published_position;
         if req.zone_epoch != self.epoch || (!ready && !req.operation.is_priority()) {
-            self.outcome(
-                &id,
-                Status::Refused,
-                Some("session_or_zone_not_ready"),
-                None,
-            );
+            if matches!(req.operation, Operation::AttackOff) {
+                // Only a zone change can stop a safety off here; nothing was sent for it.
+                self.outcome(&id, Status::Refused, Some("stale_zone_epoch_before_dispatch"),
+                    Some(crate::control::attack_off_not_sent()));
+            } else {
+                self.outcome(&id, Status::Refused, Some("session_or_zone_not_ready"), None);
+            }
             return;
         }
         // Claim under the journal lock before any side effect. A priority command may have
@@ -460,13 +501,9 @@ impl Host {
             }
             Operation::AttackOff => {
                 self.attack_until = None;
-                self.command.overwrite_attack_off(Some(&id)); // LAST-WINS: safety request
-                self.outcome(
-                    &id,
-                    Status::AppliedLocal,
-                    None,
-                    Some(json!({"kind":"attack_off_queued","server_confirmed":false})),
-                );
+                // LAST-WINS, always sent in its zone: explicit safety request. The receipt stays
+                // `accepted` until the network owner settles it (`settle_attack_offs`).
+                self.command.force_attack_off(Some(&id), Some(self.epoch));
             }
             Operation::MerchantOpen { entity_id } => {
                 if !observed_entity(gs, me, entity_id as u32, 30.0) {
@@ -838,6 +875,165 @@ fn load_collision(dir: &std::path::Path, zone: &str) -> Result<(Arc<Collision>, 
     ))
 }
 
+/// Run-loop state that outlives one tick.
+struct Frame {
+    col: Option<Arc<Collision>>,
+    loaded_zone: String,
+    geometry: Value,
+    publish_at: Instant,
+}
+impl Frame {
+    fn new(now: Instant) -> Self {
+        Self {
+            col: None,
+            loaded_zone: String::new(),
+            geometry: json!({"status":"unavailable","reason":"waiting_for_real_zone_entry"}),
+            publish_at: now,
+        }
+    }
+}
+/// The network link's ages, read once per tick.
+#[derive(Clone, Copy)]
+struct Link {
+    tick_age: u64,
+    inbound_age: u64,
+    link_age: u64,
+    dropped: bool,
+}
+impl Host {
+    /// One run-loop tick after the network-end check and before command dispatch: the zone and
+    /// geometry fences, body creation, the physics step, events and state publication. It is a
+    /// method so a scripted session can drive exactly this code (`runtime_census_tests`).
+    #[allow(clippy::too_many_arguments)]
+    fn frame(
+        &mut self,
+        gs: &GameState,
+        frame: &mut Frame,
+        terminal: &Option<String>,
+        shutdown: &dyn Fn() -> bool,
+        link: &dyn Fn() -> Link,
+        now: Instant,
+        dt: f32,
+        started: Instant,
+        shared_collision: &SharedCollision,
+        load: &mut dyn FnMut(&str) -> Result<(Arc<Collision>, Value), String>,
+    ) -> Result<bool, String> {
+        let Frame { col, loaded_zone, geometry, publish_at } = frame;
+        // Read once, so the admission decision and readiness agree within the frame.
+        let shutdown = shutdown();
+        if terminal.is_some() || shutdown {
+            // A kick parks the network owner with shutdown set and no terminal outcome: admit
+            // nothing that could wait for a send that may never come.
+            self.control.close_admission();
+        }
+        self.settle_attack_offs(gs);
+        if gs.zone_epoch != self.epoch {
+            self.drain_completions();
+            self.halt("zone_entry", None);
+            self.control.set_ready(false);
+            self.body = None;
+            self.epoch = gs.zone_epoch;
+            self.published_position = None;
+            self.zone_in = ZoneIn::default();
+            *col = None;
+            loaded_zone.clear();
+            *shared_collision.write().unwrap() = None;
+            let mut view = self.controller_slots.controller_view.lock().unwrap();
+            view.initialized = false;
+            view.zone_epoch = Some(gs.zone_epoch);
+            view.landed_fall_height = None;
+            view.relocated = None;
+            drop(view);
+            // Publish this tick: the publication fences the departed zone's commands with their
+            // own reason, before anything later in the frame can end them otherwise.
+            *publish_at = now;
+        }
+        // Native sends the destination's self spawn before OP_NewZone, so the position can be
+        // known while `zone_name` still names the zone being left. Wait for the new zone itself.
+        if gs.player_id != 0
+            && gs.player_pos_known
+            && gs.world.new_zone_applied
+            && !gs.world.zone_name.is_empty()
+            && *loaded_zone != gs.world.zone_name
+        {
+            self.control.set_ready(false);
+            self.halt("loading_geometry", None);
+            *loaded_zone = gs.world.zone_name.clone();
+            match load(loaded_zone) {
+                Ok((collision, metadata)) => {
+                    *shared_collision.write().unwrap() = Some(collision.clone());
+                    *col = Some(collision);
+                    *geometry = metadata;
+                }
+                Err(reason) => {
+                    *geometry = json!({"status":"unavailable","reason":reason});
+                }
+            }
+        }
+        if self.body.is_none()
+            && gs.player_id != 0
+            && gs.player_pos_known
+            && gs.world.new_zone_applied
+            && col.is_some()
+        {
+            let pos = [gs.player_x, gs.player_y, gs.player_z];
+            if pos.iter().all(|v| v.is_finite()) {
+                self.body = Some(CharacterController::new(pos));
+                self.heading = gs.player_heading;
+            }
+        }
+        // Read after the fences and the synchronous geometry load, as the network owner may have
+        // refreshed its health during the load.
+        let Link { tick_age, inbound_age, link_age, dropped } = link();
+        let ready = terminal.is_none()
+            && !shutdown
+            && host_ready(gs, self, col.is_some(), tick_age, link_age, dropped);
+        self.step(&gs, col.as_deref(), ready, now, dt);
+        self.update_knowledge(&gs);
+        // A completion that arrived during this tick is applied before the publish, after the fences.
+        if self.drain_completions() {
+            *publish_at = now;
+        }
+        if now >= *publish_at {
+            let position = self.body.as_ref().map(|body| body.pos);
+            self.published_position = position;
+            let last_send = self.controller_slots.controller_view.lock().unwrap().last_position_send;
+            // Read the clock after the record, so `sent_at_ms` can never exceed `clock_ms`.
+            let state_now = Instant::now();
+            let (nearby, truncated) = roster(&gs, position);
+            let entities:Vec<_>=nearby.iter().map(|(distance,entity)|json!({"id":entity.spawn_id,"class_id":entity.class_id,"name":entity.name,"npc":entity.is_npc,"dead":entity.dead,
+                "position":[entity.x,entity.y,entity.z],"distance":distance,"heading":entity.heading,"equipment":entity.equipment,"hp_pct":entity.hp_pct,"level":entity.level,
+                "los":position.zip(col.as_ref()).map(|(p,c)|c.line_clear([p[0],p[1],p[2]+5.0],[entity.x,entity.y,entity.z+5.0],0.0)),"los_source":"local_native_static_geometry"})).collect();
+            let mut state = json!({"clock_ms":clock_ms(started,state_now),"phase":if terminal.is_some(){"failed"}else if ready{"ready"}else{"not_ready"},"failure":terminal,
+                "freshness":{"network_tick_age_ms":tick_age,"inbound_age_ms":inbound_age,"link_age_ms":link_age},
+                "zone":{"id":gs.world.zone_id,"name":gs.world.zone_name,"instance_id":Value::Null},"geometry":geometry,
+                "self":{"id":gs.player_id,"name":gs.player_name,"position":position,"position_source":"local_prediction_from_received_self_spawn",
+                    "heading":self.heading,"on_ground":self.body.as_ref().map(|b|b.on_ground),"in_water":self.body.as_ref().map(|b|b.in_water),
+                    "hp":{"value":gs.cur_hp,"max":gs.max_hp,"known":gs.max_hp>0,"confirmed":gs.hp_confirmed},"sitting":gs.sitting,
+                    "last_position_send":position_send_json(last_send,started,state_now),
+                    "target_id":gs.target_id,"attack_on":gs.auto_attack,"motion_active":self.motion.is_some(),"hold":gs.player_hold.map(|hold|json!({"reason":hold.reason.as_str(),"seconds":hold.secs}))},
+                "nearby":{"available":position.is_some(),"complete":false,"scope":"received_roster_within_radius","radius":500,"limit":256,"truncated":truncated,"entities":entities},
+                "inventory":{"known":gs.inventory_received,"revision":self.inventory_revision,"items":gs.inventory,"source":"received_with_local_prediction","coin":gs.coin,"coin_confirmed":gs.coin_confirmed},
+                "merchant":{"known":gs.merchant_open.is_some(),"catalog_complete":false,"revision":self.merchant_revision,"open":gs.merchant_open,"items":gs.merchant_items},
+                "policy":{"loot":"explicit_only","automatic_zone_crossing":false},
+                "transactions_blocked_until_relog":self.transaction_uncertain.load(Ordering::Acquire)
+            });
+            if let Some(me) = state["self"].as_object_mut() {
+                me.extend(server_self_fields(&gs, started));
+            }
+            self.control.publish_state(self.epoch, state)?;
+            *publish_at = now + Duration::from_millis(100);
+        }
+        self.control.set_ready(ready);
+        if terminal.is_some() {
+            // No network owner is left. After the publication, so a zone that ended first has
+            // already fenced its commands with its own reason, and on every tick after, since a
+            // command admitted before admission closed still needs an end.
+            self.finish_session(gs);
+        }
+        Ok(ready)
+    }
+}
 pub async fn run(profile: Profile) -> Result<(), String> {
     // Bind before opening any gameplay connection: a busy control port fails without logging in.
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, profile.api_port))
@@ -929,10 +1125,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
     let mut interval = tokio::time::interval(Duration::from_millis(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut previous = Instant::now();
-    let mut geometry = json!({"status":"unavailable","reason":"waiting_for_real_zone_entry"});
-    let mut col: Option<Arc<Collision>> = None;
-    let mut loaded_zone = String::new();
-    let mut publish_at = Instant::now();
+    let mut frame = Frame::new(Instant::now());
     let mut terminal: Option<String> = None;
     let mut shutdown_started: Option<Instant> = None;
     loop {
@@ -940,8 +1133,8 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         let gs = wiring.snapshot.load_full();
         // Outcomes the server already settled are applied before any fence this tick can run,
         // so a readiness drop or zone change cannot turn a settled buy into `unknown`.
-        if host.drain_completions(&gs) {
-            publish_at = Instant::now();
+        if host.drain_completions() {
+            frame.publish_at = Instant::now();
         }
         let now = Instant::now();
         let dt = (now - previous).as_secs_f32().min(0.05);
@@ -957,123 +1150,56 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
             if terminal.is_some() {
-                host.drain_completions(&gs);
+                control.close_admission();
+                host.drain_completions();
                 host.halt("network_ended", None);
                 control.set_ready(false);
                 control.publish_event(json!({"kind":"session_ended","reason":terminal}));
             }
         }
-        if gs.zone_epoch != host.epoch {
-            host.drain_completions(&gs);
-            host.halt("zone_entry", None);
-            control.set_ready(false);
-            host.body = None;
-            host.epoch = gs.zone_epoch;
-            host.published_position = None;
-            host.zone_in = ZoneIn::default();
-            col = None;
-            loaded_zone.clear();
-            *wiring.collision.write().unwrap() = None;
-            let mut view = host.controller_slots.controller_view.lock().unwrap();
-            view.initialized = false;
-            view.zone_epoch = Some(gs.zone_epoch);
-            view.landed_fall_height = None;
-            view.relocated = None;
-        }
-        // Native sends the destination's self spawn before OP_NewZone, so the position can be
-        // known while `zone_name` still names the zone being left. Wait for the new zone itself.
-        if gs.player_id != 0
-            && gs.player_pos_known
-            && gs.world.new_zone_applied
-            && !gs.world.zone_name.is_empty()
-            && loaded_zone != gs.world.zone_name
-        {
-            control.set_ready(false);
-            host.halt("loading_geometry", None);
-            loaded_zone = gs.world.zone_name.clone();
-            match load_collision(&profile.maps_dir, &loaded_zone) {
-                Ok((collision, metadata)) => {
-                    *wiring.collision.write().unwrap() = Some(collision.clone());
-                    col = Some(collision);
-                    geometry = metadata;
-                }
-                Err(reason) => {
-                    geometry = json!({"status":"unavailable","reason":reason});
-                }
+        // The network owner may have published a newer state just before it ended; this tick's
+        // fences and settlement must see it.
+        let gs = if terminal.is_some() { wiring.snapshot.load_full() } else { gs };
+        let link = || {
+            let health = wiring.health.lock().unwrap();
+            Link {
+                tick_age: health.last_tick.elapsed().as_millis() as u64,
+                inbound_age: health.last_packet.elapsed().as_millis() as u64,
+                link_age: health.last_datagram.elapsed().as_millis() as u64,
+                dropped: health.session_drop.is_some(),
             }
-        }
-        if host.body.is_none()
-            && gs.player_id != 0
-            && gs.player_pos_known
-            && gs.world.new_zone_applied
-            && col.is_some()
-        {
-            let pos = [gs.player_x, gs.player_y, gs.player_z];
-            if pos.iter().all(|v| v.is_finite()) {
-                host.body = Some(CharacterController::new(pos));
-                host.heading = gs.player_heading;
-            }
-        }
-        let health = wiring.health.lock().unwrap();
-        let tick_age = health.last_tick.elapsed().as_millis() as u64;
-        let inbound_age = health.last_packet.elapsed().as_millis() as u64;
-        let link_age = health.last_datagram.elapsed().as_millis() as u64;
-        let dropped = health.session_drop.is_some();
-        drop(health);
-        let ready = terminal.is_none()
-            && !wiring.shutdown.load(Ordering::Acquire)
-            && host_ready(&gs, &host, col.is_some(), tick_age, link_age, dropped);
-        host.step(&gs, col.as_deref(), ready, now, dt);
-        host.update_knowledge(&gs);
-        // A completion that arrived during this tick is applied before the publish, after the fences.
-        if host.drain_completions(&gs) {
-            publish_at = now;
-        }
-        if now >= publish_at {
-            let position = host.body.as_ref().map(|body| body.pos);
-            host.published_position = position;
-            let last_send = host.controller_slots.controller_view.lock().unwrap().last_position_send;
-            // Read the clock after the record, so `sent_at_ms` can never exceed `clock_ms`.
-            let state_now = Instant::now();
-            let (nearby, truncated) = roster(&gs, position);
-            let entities:Vec<_>=nearby.iter().map(|(distance,entity)|json!({"id":entity.spawn_id,"class_id":entity.class_id,"name":entity.name,"npc":entity.is_npc,"dead":entity.dead,
-                "position":[entity.x,entity.y,entity.z],"distance":distance,"heading":entity.heading,"equipment":entity.equipment,"hp_pct":entity.hp_pct,"level":entity.level,
-                "los":position.zip(col.as_ref()).map(|(p,c)|c.line_clear([p[0],p[1],p[2]+5.0],[entity.x,entity.y,entity.z+5.0],0.0)),"los_source":"local_native_static_geometry"})).collect();
-            let mut state = json!({"clock_ms":clock_ms(started,state_now),"phase":if terminal.is_some(){"failed"}else if ready{"ready"}else{"not_ready"},"failure":terminal,
-                "freshness":{"network_tick_age_ms":tick_age,"inbound_age_ms":inbound_age,"link_age_ms":link_age},
-                "zone":{"id":gs.world.zone_id,"name":gs.world.zone_name,"instance_id":Value::Null},"geometry":geometry,
-                "self":{"id":gs.player_id,"name":gs.player_name,"position":position,"position_source":"local_prediction_from_received_self_spawn",
-                    "heading":host.heading,"on_ground":host.body.as_ref().map(|b|b.on_ground),"in_water":host.body.as_ref().map(|b|b.in_water),
-                    "hp":{"value":gs.cur_hp,"max":gs.max_hp,"known":gs.max_hp>0,"confirmed":gs.hp_confirmed},"sitting":gs.sitting,
-                    "last_position_send":position_send_json(last_send,started,state_now),
-                    "target_id":gs.target_id,"attack_on":gs.auto_attack,"motion_active":host.motion.is_some(),"hold":gs.player_hold.map(|hold|json!({"reason":hold.reason.as_str(),"seconds":hold.secs}))},
-                "nearby":{"available":position.is_some(),"complete":false,"scope":"received_roster_within_radius","radius":500,"limit":256,"truncated":truncated,"entities":entities},
-                "inventory":{"known":gs.inventory_received,"revision":host.inventory_revision,"items":gs.inventory,"source":"received_with_local_prediction","coin":gs.coin,"coin_confirmed":gs.coin_confirmed},
-                "merchant":{"known":gs.merchant_open.is_some(),"catalog_complete":false,"revision":host.merchant_revision,"open":gs.merchant_open,"items":gs.merchant_items},
-                "policy":{"loot":"explicit_only","automatic_zone_crossing":false},
-                "transactions_blocked_until_relog":host.transaction_uncertain.load(Ordering::Acquire)
-            });
-            if let Some(me) = state["self"].as_object_mut() {
-                me.extend(server_self_fields(&gs, started));
-            }
-            control.publish_state(host.epoch, state)?;
-            publish_at = now + Duration::from_millis(100);
-        }
-        control.set_ready(ready);
+        };
+        let ready = host.frame(
+            &gs,
+            &mut frame,
+            &terminal,
+            &|| wiring.shutdown.load(Ordering::Acquire),
+            &link,
+            now,
+            dt,
+            started,
+            &wiring.collision,
+            &mut |zone| load_collision(&profile.maps_dir, zone),
+        )?;
         for command in control.drain_actions() {
             host.dispatch(command, &gs, ready, now).await;
         }
         if wiring.shutdown.load(Ordering::Acquire) {
             let started = shutdown_started.get_or_insert(now);
             if terminal.is_some() {
+                host.finish_session(&gs);
                 break;
             }
             if now.duration_since(*started) >= Duration::from_secs(8) {
+                // The network owner may be parked (a kick sets shutdown and waits): no one will
+                // send what is still queued.
+                host.finish_session(&gs);
                 api.abort();
                 return Err("logout completion deadline exceeded; session outcome unknown".into());
             }
         }
         if api.is_finished() {
+            host.finish_session(&gs);
             host.halt("http_server_ended", None);
             wiring.shutdown.store(true, Ordering::Release);
             return Err("control HTTP server ended".into());
@@ -1661,7 +1787,7 @@ mod execution_claim_tests {
         host.completions.0.send(done).unwrap();
         assert_eq!(host.control.command("buy").unwrap().status, Status::Accepted,
             "not visible until the host loop applies it");
-        host.drain_completions(&Arc::new(GameState::new()));
+        host.drain_completions();
         assert_eq!(host.control.command("buy").unwrap().status, Status::Confirmed);
         assert!(!host.transaction_uncertain.load(Ordering::Acquire), "and the latch cleared with it");
     }
@@ -1762,3 +1888,7 @@ mod execution_claim_tests {
 #[cfg(test)]
 #[path = "runtime_packet_tests.rs"]
 mod packet_tests;
+
+#[cfg(test)]
+#[path = "runtime_census_tests.rs"]
+mod census_tests;

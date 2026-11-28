@@ -215,6 +215,11 @@ impl Entry {
     }
 }
 
+/// Evidence on every refused `attack_off`: no `OP_AutoAttack 0` was sent for it.
+pub fn attack_off_not_sent() -> Value {
+    json!({"kind":"attack_off_not_sent","packets":[]})
+}
+
 /// An evicted receipt keeps only enough to answer a replay: its identity never becomes reusable.
 struct Tombstone {
     payload: [u8; 16],
@@ -225,6 +230,8 @@ struct Tombstone {
 struct Journal {
     zone_epoch: u64,
     ready: bool,
+    /// The session is over: nothing is admitted, safety commands included.
+    closed: bool,
     revision: u64,
     state: Value,
     entries: HashMap<String, Entry>,
@@ -317,6 +324,7 @@ impl Control {
                     identities: 0,
                     stop_reserve_used: 0,
                     attack_off_reserve_used: 0,
+                    closed: false,
                     priority: VecDeque::new(),
                     ordinary: VecDeque::new(),
                     sequence: 0,
@@ -363,7 +371,7 @@ impl Control {
             return Err("zone epoch cannot decrease".into());
         }
         if zone_epoch != journal.zone_epoch {
-            self.fence_locked(&mut journal, "zone_epoch_changed");
+            self.fence_locked(&mut journal, "zone_epoch_changed", false);
             journal.zone_epoch = zone_epoch;
         }
         journal.state = state;
@@ -372,12 +380,29 @@ impl Control {
     }
 
     /// The host gates ordinary admission on real session readiness. Safety verbs bypass this gate.
+    /// A readiness drop (death, a stale link, geometry loading) does not fence `attack_off`: it is
+    /// the safety stop for exactly that moment (design A2.5), and the network owner settles it.
     pub fn set_ready(&self, ready: bool) {
         let mut journal = self.shared.journal.lock().unwrap();
         if journal.ready && !ready {
-            self.fence_locked(&mut journal, "not_ready");
+            self.fence_locked(&mut journal, "not_ready", true);
         }
         journal.ready = ready;
+    }
+
+    /// Shutdown has begun: admit nothing more, safety commands included. Live commands are left to
+    /// their owners; `end_session` ends what remains.
+    pub fn close_admission(&self) {
+        self.shared.journal.lock().unwrap().closed = true;
+    }
+
+    /// The session is over: fence everything still live, `attack_off` included, since no network
+    /// owner is left to settle it, and refuse every later command at admission.
+    pub fn end_session(&self, reason: &str) {
+        let mut journal = self.shared.journal.lock().unwrap();
+        self.fence_locked(&mut journal, reason, false);
+        journal.ready = false;
+        journal.closed = true;
     }
 
     pub fn state(&self) -> Value {
@@ -583,8 +608,16 @@ impl Control {
 
     /// Fences touch only non-terminal receipts (design A2.2). Never-dispatched work is refused;
     /// dispatched work is unknown.
-    fn fence_locked(&self, journal: &mut Journal, reason: &str) {
-        journal.priority.clear();
+    fn fence_locked(&self, journal: &mut Journal, reason: &str, spare_attack_off: bool) {
+        let spared = |entry: &Entry| {
+            spare_attack_off
+                && entry.request.as_ref().is_some_and(|r| matches!(r.operation, Operation::AttackOff))
+        };
+        let priority = std::mem::take(&mut journal.priority);
+        journal.priority = priority
+            .into_iter()
+            .filter(|id| journal.entries.get(id).is_some_and(|entry| spared(entry)))
+            .collect();
         journal.ordinary.clear();
         let now_ms = self.now_ms();
         let mut live: Vec<String> = journal.live.iter().cloned().collect();
@@ -592,6 +625,10 @@ impl Control {
         let mut changes = Vec::new();
         for id in live {
             let Some(entry) = journal.entries.get_mut(&id) else { continue };
+            if spared(entry) {
+                continue;
+            }
+            let attack_off = entry.request.as_ref().is_some_and(|r| matches!(r.operation, Operation::AttackOff));
             entry.receipt.status = if entry.receipt.status == CommandStatus::Accepted && !entry.dispatched {
                 CommandStatus::Refused
             } else {
@@ -600,6 +637,13 @@ impl Control {
             entry.receipt.terminal = true;
             entry.receipt.reason = Some(reason.into());
             entry.receipt.updated_at_ms = now_ms;
+            if attack_off && entry.receipt.status == CommandStatus::Refused {
+                // One shape for an off whose zone ended before it was sent, wherever it stopped.
+                if reason == "zone_epoch_changed" {
+                    entry.receipt.reason = Some("stale_zone_epoch_before_dispatch".into());
+                }
+                entry.receipt.evidence = Some(attack_off_not_sent());
+            }
             changes.push(entry.receipt.clone());
             self.retire_locked(journal, &id);
         }
@@ -683,7 +727,7 @@ impl Control {
         } else if let Err(prose) = request.operation.validate() {
             detail = Some(prose.to_owned());
             Some("invalid_operation".to_owned())
-        } else if !safety && !journal.ready {
+        } else if journal.closed || (!safety && !journal.ready) {
             Some("not_ready".to_owned())
         } else if !safety
             && journal.live.iter().any(|live| {
@@ -703,9 +747,10 @@ impl Control {
             id: id.clone(),
             status,
             terminal: status.terminal(),
+            evidence: (refusal.is_some() && matches!(request.operation, Operation::AttackOff))
+                .then(attack_off_not_sent),
             reason: refusal,
             detail,
-            evidence: None,
             accepted_at_ms: now_ms,
             updated_at_ms: now_ms,
             admitted: (status == CommandStatus::Refused).then_some(false),

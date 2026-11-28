@@ -82,6 +82,7 @@ mod actions;
 // `Action` is public because `refuse_drained`'s callers live in eqoxide-net — see `actions.rs`.
 pub use actions::{Action, ActionTracker, ActionContext, ActionRecord};
 mod combat;
+pub use combat::{Abandon, AttackDrain, EXPLICIT_OFFS_PER_DRAIN};
 mod slot;
 /// A3 Migration 1 (#448): the reusable Command-with-result infra. `CommandResult<T>` is the honest
 /// three-way outcome (Resolved/Refused/Unconfirmed) an HTTP handler awaits so it reports the TRUE

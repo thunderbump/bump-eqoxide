@@ -554,9 +554,13 @@ pub struct ActionLoop {
     same_zone_cross_at: Option<Instant>,
     position_seq:     u16,
     last_tick:        Instant,
-    /// Whether auto-attack is currently engaged (set by the /attack toggle). While true, the pet
-    /// attacks the current target.
+    /// The last `OP_AutoAttack` state this client put on the wire in the current zone. While true,
+    /// the pet attacks the current target. The server's flag starts false in every zone process
+    /// (`Client::Client`, eqemu:zone/client.cpp@5dc093fe5:227) and only our `OP_AutoAttack 1` sets
+    /// it (eqemu:zone/client_packet.cpp@9a0579f37:3538), so this mirrors the server's flag exactly.
     auto_attack:      bool,
+    /// The zone epoch `auto_attack` belongs to. A new zone resets it, as the new zone's Client does.
+    auto_attack_epoch: u64,
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
     last_pet_target:  Option<u32>,
@@ -705,6 +709,7 @@ impl ActionLoop {
             position_seq: 0,
             last_tick: Instant::now(),
             auto_attack: false,
+            auto_attack_epoch: 0,
             last_pet_target: None,
             controller,
             guild_slots,
@@ -1921,14 +1926,43 @@ impl ActionLoop {
     fn drain_combat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Check attack request — send OP_AUTO_ATTACK(1) to start, OP_AUTO_ATTACK(0) to stop.
         // Server expects exactly 4 bytes; byte[0]=1 enables, byte[0]=0 disables.
-        let attack_req = self.command.take_attack_with_command();
-        if let Some((on, command_id)) = attack_req {
-            self.auto_attack = on;
-            let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
-            stream.send_app_packet_with_command(OP_AUTO_ATTACK, &payload, command_id.as_ref());
-            gs.auto_attack = on;
-            tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
+        if gs.zone_epoch != self.auto_attack_epoch {
+            self.auto_attack_epoch = gs.zone_epoch;
+            self.auto_attack = false;
+            gs.auto_attack = false;
         }
+        let Some(drain) = self.command.take_attack_request(Some(gs.zone_epoch)) else { return; };
+        if drain.on {
+            self.send_auto_attack(stream, gs, true, drain.command.as_ref());
+            return;
+        }
+        // An explicit off is always sent, one packet per request and attributed to it, unless the
+        // zone it was accepted in has ended (`take_attack_request` settled those as not sent): the
+        // new zone's server starts with attack off.
+        if !drain.explicit.is_empty() {
+            for off in drain.explicit {
+                self.send_auto_attack(stream, gs, false, off.command.as_ref());
+                if let Some(command) = &off.command {
+                    self.command.attack_off_sent(command);
+                }
+            }
+        } else if self.auto_attack {
+            self.send_auto_attack(stream, gs, false, drain.command.as_ref());
+        } else {
+            // An implicit off while the server's flag is already off changes nothing there, and a
+            // real client never sends one. Every safety stop (zone entry, readiness loss, lease
+            // expiry, sit, camp) writes off unconditionally; this is where it becomes a packet
+            // only if attack is actually on.
+            tracing::debug!("EQ: auto-attack already off; nothing sent");
+        }
+    }
+
+    fn send_auto_attack(&mut self, stream: &mut EqStream, gs: &mut GameState, on: bool, command: Option<&std::sync::Arc<str>>) {
+        self.auto_attack = on;
+        let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
+        stream.send_app_packet_with_command(OP_AUTO_ATTACK, &payload, command);
+        gs.auto_attack = on;
+        tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
     }
 
     fn drain_pet(&mut self, stream: &mut EqStream, gs: &mut GameState) {
@@ -5728,7 +5762,7 @@ mod tests {
         tell.scope(async { nav.command.request_chat_send(message("tracked")) }).await;
         let attack = tracker.begin_for_zone("attack", 1).with_packet_command("attack");
         assert!(attack.scope(async { nav.command.request_attack(true) }).await);
-        nav.command.overwrite_attack_off(Some("off"));
+        nav.command.force_attack_off(Some("off"), None);
 
         nav.drain_target(&mut stream, &mut gs);
         nav.drain_merchant(&mut stream, &mut gs);

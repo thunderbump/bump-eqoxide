@@ -105,15 +105,34 @@ intent and real collision; a local result does not prove the server accepted the
 Stop, attack-off, death, connection loss, shutdown and a new zone entry stop applicable control.
 `stop` stops movement; use `attack_off` separately to stop attacking.
 
+Attack-off on the wire.
+
+- **Implicit stops.** These are lease expiry, readiness loss, death, zone entry, `sit` and `camp`. They send `OP_AutoAttack 0` only while the last attack packet the client sent was on; with attack already off, they send nothing, as a real client does. A zone entry resets that state to off, because the new zone's server starts with attack off.
+- **Explicit `attack_off`.** It always sends its own `OP_AutoAttack 0`, attributed to it in `/v2/player/packets?command=<id>`, even when the client believes attack is off. Two explicit offs accepted before one send are two packets. Its receipt stays `accepted` until the network owner settles it, normally within one network tick:
+  - `applied_local` with evidence `{"kind":"attack_off_sent"}` once its packet is queued into the reliable window, which retransmits it until acknowledged (the trace row's `acked_at_ms` shows acknowledgement);
+  - `refused` with reason `stale_zone_epoch_before_dispatch` and evidence `{"kind":"attack_off_not_sent","packets":[]}` when the zone it was accepted in ended first. Such an off is not sent into the next zone.
+
+  A readiness drop (death, link loss, geometry loading) does not fence an `attack_off`: it is the safety stop for that moment. When the session ends (including a kick or a logout deadline), a queued off that no network owner will send ends `refused` with reason `not_ready`, or `stale_zone_epoch_before_dispatch` if its zone had already ended. From the moment shutdown begins, `attack_off` commands are refused at admission. Every refused `attack_off` carries the `attack_off_not_sent` evidence, whichever step refused it. A burst of explicit offs goes out at most 8 per network tick, in order.
+- **An implicit stop queued with an explicit off** adds no packet.
+- **Known windows, until central-6ly1.7's claim slot.** In this build an `attack_off` receipt can settle wrongly, or late, in these cases. The packet trace (`/v2/player/packets?command=<id>`) is the authority for what was actually sent.
+  - **Kick or other parked shutdown.** An off admitted and dispatched just before shutdown can stay `accepted` for up to 8 s. It is then `refused` / `not_ready` as the API closes.
+  - **Host exit with the off already claimed.** If the network owner has taken an off but not yet sent it when the host exits (logout deadline, HTTP end), the receipt is `unknown` with no evidence.
+  - **Same-iteration terminal and zone change.** The network owner can publish a new zone and end in the same host iteration. The host rereads its snapshot so the zone's reason wins, but that ordering is not under test.
+  - **v1 backlog.** A v1 or UI off reports its outcome only when the whole explicit-off backlog has been sent, 8 per network tick.
+  - **Failed zone handoff.** A zone crossing whose world reconnect fails ends a queued off `refused` / `not_ready`, not as a zone end.
+  - **Lease event after a v1 off.** A v1 or UI off over a queued v2 `attack` can still be followed by an `attack_lease_expired` event; nothing is sent.
+  - **Host-side failures.** A failed state publication, or the control server ending, can leave a queued off `accepted`, or settle it from a stale zone.
+- **v1 and UI requests.** v1 `DELETE /v1/combat/attack` and UI toggles also always send, even over a queued off or a queued on (which they replace), but they carry no packet attribution and no zone.
+
 | Operation kind | Fields / limits |
 | --- | --- |
 | `move_for` | `east`, `north` in [-1,1], `duration_ms` 1–2000; normalized direction, stand first |
 | `stop` | none; priority movement stop |
 | `target` | `entity_id` from the current received roster |
 | `attack` | `lease_ms` 1–5000; live received NPC target within 30 units |
-| `attack_off` | none; priority attack stop |
+| `attack_off` | none; priority attack stop; always sends its own `OP_AutoAttack 0` while its zone lasts |
 | `loot` | `entity_id` of a received dead NPC within 20 units; ordinary loot protocol |
-| `sit`, `stand` | none; sit stops movement and attack |
+| `sit`, `stand` | none; sit stops movement and attack (attack-off only if attack is on) |
 | `say` | `text`, maximum 512 bytes |
 | `tell` | `recipient`, `text` |
 | `merchant_open` | `entity_id`, received within 30 units |
