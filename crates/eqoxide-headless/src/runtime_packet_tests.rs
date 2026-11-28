@@ -45,7 +45,11 @@ impl Session {
         host.update_knowledge(&gs);
         let trace = SessionTrace::new(Instant::now());
         host.control = host.control.with_packet_trace(trace.clone());
-        host.control.publish_state(host.epoch, json!({"phase":"ready"})).unwrap();
+        let position = host.body.as_ref().unwrap().pos;
+        host.control.publish_state(
+            host.epoch, json!({"phase":"ready","self":{"position":position}}),
+        ).unwrap();
+        host.published_position = Some(position);
         host.control.set_ready(true);
         let (stream, _, peer, _) = with_packet_trace(trace, test_stream_with_peer(wiring.health)).await;
         Self {
@@ -455,4 +459,45 @@ async fn expiring_turn_owns_rest_without_a_prior_moving_send() {
     assert_eq!(view.last_position_send.unwrap().reason, PositionSendReason::Rest);
     drop(view);
     session.assert_packets("turn", &[OP_CLIENT_UPDATE]).await;
+}
+
+
+/// Clearing the ending ID on adoption drops the rest tag when the turn expires on that step.
+#[tokio::test]
+async fn turn_expiring_on_correction_adoption_owns_rest_update() {
+    use eqoxide_core::game_state::PositionSendReason;
+
+    let mut session = Session::new().await;
+    let floor = floor();
+    session.gs.world.zone_name = "synthetic".into();
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.02);
+    session.drain();
+
+    session.dispatch("turn", json!({"kind":"move_for","east":1,"north":0,"duration_ms":1})).await;
+    session.gs.player_x = 30.0;
+    session.drain();
+    let slots = session.host.controller_slots.clone();
+    assert!(slots.pos_correction.lock().unwrap().is_some());
+    assert_eq!(
+        slots.controller_view.lock().unwrap().last_position_send.unwrap().reason,
+        PositionSendReason::Correction,
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    session.host.step(&session.gs, Some(&floor), true, Instant::now(), 0.02);
+    assert!(session.host.motion.is_none());
+    assert!(slots.pos_correction.lock().unwrap().is_none());
+    session.drain();
+    assert_eq!(
+        slots.controller_view.lock().unwrap().last_position_send.unwrap().reason,
+        PositionSendReason::Rest,
+    );
+
+    session.assert_packets("turn", &[OP_CLIENT_UPDATE]).await;
+    let trace = session.packets("opcode=OP_CLIENT_UPDATE").await;
+    let rows = trace["packets"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["command_id"], Value::Null);
+    assert_eq!(rows[0]["fields"]["heading"], 0);
+    assert_eq!(rows[1]["fields"]["heading"], 512);
 }

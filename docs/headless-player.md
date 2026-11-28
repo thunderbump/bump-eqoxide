@@ -210,9 +210,10 @@ assigned when the client reads the datagram from the socket, before reordering. 
 from the same combined datagram share these values. Fragmented rows use the arrival of
 the completing fragment. A retransmit or duplicate of an inbound reliable packet
 does not create a second row. A datagram carrying a duplicate still consumes an
-arrival index. If the sequence is still buffered, the delivered row retains the first copy's
-`arrival_n` and `arrived_at_ms`. Socket reads that produce no zone row also consume
-indices. Outbound rows have null arrival fields. Page by `n` and read `arrival_n`
+arrival index. If the sequence is still buffered, a duplicate can replace the
+buffered payload. When the copies differ, the delivered row pairs the later bytes
+with the first copy's `arrival_n` and `arrived_at_ms`. Socket reads that produce no
+zone row also consume indices. Outbound rows have null arrival fields. Page by `n` and read `arrival_n`
 to recover datagram arrival order.
 
 For an inbound reliable row, `acked_at_ms` records when the socket accepts the first

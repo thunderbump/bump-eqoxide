@@ -229,7 +229,6 @@ impl Host {
             // An old physics step can publish after the net owner's snapshot and before it
             // issues this correction. Replace that provenance before recording the adopted step.
             view.position_commands = ipc::PositionCommands::None;
-            self.ending_motion = None;
             // Zone entry can settle a later correction while this step runs.
             view.correction_adopted = view.correction_adopted.max(issued);
         }
