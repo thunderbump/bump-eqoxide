@@ -119,6 +119,8 @@ Attack-off on the wire.
   - **Host exit with the off already claimed.** If the network owner has taken an off but not yet sent it when the host exits (logout deadline, HTTP end), the receipt is `unknown` with no evidence.
   - **Same-iteration terminal and zone change.** The network owner can publish a new zone and end in the same host iteration. The host rereads its snapshot so the zone's reason wins, but that ordering is not under test.
   - **v1 backlog.** A v1 or UI off reports its outcome only when the whole explicit-off backlog has been sent, 8 per network tick.
+  - **Failed zone handoff.** A zone crossing whose world reconnect fails ends a queued off `refused` / `not_ready`, not as a zone end.
+  - **Host-side failures.** A failed state publication, or the control server ending, can leave a queued off `accepted`, or settle it from a stale zone.
 - **v1 and UI requests.** v1 `DELETE /v1/combat/attack` and UI toggles also always send, even over a queued off or a queued on (which they replace), but they carry no packet attribution and no zone.
 
 | Operation kind | Fields / limits |

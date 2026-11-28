@@ -246,9 +246,11 @@ impl Census {
                         }
                     }
                     "OP_AUTO_ATTACK" => {
-                        let state = match &row["payload_hex"].as_str().unwrap()[..2] {
-                            "01" => ON.to_string(),
-                            "00" => OFF.to_string(),
+                        // The whole payload: native rejects anything but exactly 4 bytes
+                        // (eqemu:zone/client_packet.cpp@9a0579f37:3518).
+                        let state = match row["payload_hex"].as_str().unwrap() {
+                            "01000000" => ON.to_string(),
+                            "00000000" => OFF.to_string(),
                             other => format!("OP_AUTO_ATTACK {other}"),
                         };
                         match command {
