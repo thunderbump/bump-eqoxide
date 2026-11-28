@@ -265,9 +265,10 @@ Retention:
 - `state_changed` is gone. An idle long-poll waits its full `wait`.
 - Each event is wrapped as `{"cursor","at_ms","event"}`.
 - The buffer holds 32 768 events.
-  - Supported load: 5 commands per second at up to 4 receipt events each, and 20 combat swings per
-    second, each producing a structured event and the existing text event. That is about 60 events
-    per second, so the buffer covers more than 9 minutes.
+  - Supported load: about 60 events per second, for example 5 commands per second at up to 4
+    receipt events each plus 40 game and combat events per second. The buffer covers more than 9
+    minutes. Combat text stays in the client log; each swing reaches the API as one structured
+    `combat` event.
   - A reader that falls at most 120 s behind loses nothing.
 - The host forwards game events from `GameState` once per 20 ms tick. Those source queues hold 200
   chat events and 512 combat records. If a source queue overflowed between two ticks, the host
