@@ -871,3 +871,20 @@ async fn a_v1_off_is_accepted_by_the_tracker() {
         assert!(tracker.is_accepted(context.id()), "queued off before: {queued}");
     }
 }
+
+/// A v1 off held over to a later batch must not report processed before its packet is sent.
+#[tokio::test]
+async fn a_v1_off_in_a_later_batch_reports_only_after_it_is_sent() {
+    let mut session = Session::new().await;
+    for n in 0..eqoxide_command::EXPLICIT_OFFS_PER_DRAIN {
+        session.host.command.force_attack_off(Some(&format!("off{n}")), Some(session.gs.zone_epoch));
+    }
+    let tracker = session.host.command.actions();
+    let context = tracker.begin("v1_attack_off");
+    assert!(context.scope(async { session.host.command.request_attack(false) }).await);
+    session.drain();
+    assert!(tracker.take_events().is_empty(), "the v1 off has not been sent yet");
+    assert_eq!(attack_rows(&session.packets("").await).len(), eqoxide_command::EXPLICIT_OFFS_PER_DRAIN);
+    session.drain();
+    assert_eq!(attack_rows(&session.packets("").await).len(), eqoxide_command::EXPLICIT_OFFS_PER_DRAIN + 1);
+}
