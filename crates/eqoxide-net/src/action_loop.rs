@@ -3037,8 +3037,8 @@ impl ActionLoop {
         // server's idea of where we are has stopped tracking ours. Not escalated further here — the
         // next update ~50ms later supersedes this one, and aborting the loop on a transient
         // WouldBlock would be worse than the drop.
-        if let Err(e) = stream.send_app_packet_unreliable_with_command(
-            OP_CLIENT_UPDATE, &buf, commands.command_id(),
+        if let Err(e) = stream.send_app_packet_unreliable_with_reason(
+            OP_CLIENT_UPDATE, &buf, commands.command_id(), Some(reason.as_str()),
         ) {
             tracing::debug!("NET: position update seq {} did not reach the wire ({:?}) — no \
                              retransmit; the next update supersedes it (#612)",

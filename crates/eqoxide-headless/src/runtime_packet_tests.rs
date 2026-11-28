@@ -394,6 +394,11 @@ async fn move_for_owns_moving_and_rest_updates() {
         PositionSendReason::Rest,
     );
     session.assert_packets("move", &[OP_CLIENT_UPDATE, OP_CLIENT_UPDATE]).await;
+    // Each row carries the sender's reason, so a reader needs no state sampling to tell them apart.
+    let trace = session.packets("command=move").await;
+    let reasons: Vec<_> = trace["packets"].as_array().unwrap().iter()
+        .map(|row| row["fields"]["reason"].clone()).collect();
+    assert_eq!(reasons, [json!("moving"), json!("rest")], "{trace}");
 }
 
 /// A stationary active command owns a keepalive, while a correction re-stream stays untagged.
@@ -420,6 +425,9 @@ async fn active_motion_owns_keepalive_but_not_correction() {
     let trace = session.packets("opcode=OP_CLIENT_UPDATE").await;
     assert_eq!(trace["packets"].as_array().unwrap().len(), 2);
     assert_eq!(trace["packets"][1]["command_id"], Value::Null);
+    let reasons: Vec<_> = trace["packets"].as_array().unwrap().iter()
+        .map(|row| row["fields"]["reason"].clone()).collect();
+    assert_eq!(reasons, [json!("keepalive"), json!("correction")], "{trace}");
     session.assert_packets("wait-move", &[OP_CLIENT_UPDATE]).await;
 }
 
