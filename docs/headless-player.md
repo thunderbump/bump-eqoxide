@@ -105,13 +105,12 @@ intent and real collision; a local result does not prove the server accepted the
 Stop, attack-off, death, connection loss, shutdown and a new zone entry stop applicable control.
 `stop` stops movement; use `attack_off` separately to stop attacking.
 
-Attack-off on the wire. The client sends `OP_AutoAttack 0` for an implicit stop (lease expiry,
-readiness loss, death, zone entry, `sit`, `camp`) only while the last attack packet it sent was
-on. With attack already off, such a stop sends nothing, as a real client does. A zone entry resets
-that state to off, because the new zone's server starts with attack off. An explicit `attack_off`
-(and v1 `DELETE /v1/combat/attack`) always sends `OP_AutoAttack 0`, even when the client believes
-attack is off, so a script can always force a stop. The packet is attributed to the command in
-`/v2/player/packets?command=<id>`.
+Attack-off on the wire.
+
+- **Implicit stops.** These are lease expiry, readiness loss, death, zone entry, `sit` and `camp`. They send `OP_AutoAttack 0` only while the last attack packet the client sent was on; with attack already off, they send nothing, as a real client does. A zone entry resets that state to off, because the new zone's server starts with attack off.
+- **Explicit `attack_off`.** It always sends its own `OP_AutoAttack 0`, attributed to it in `/v2/player/packets?command=<id>`, even when the client believes attack is off. Two explicit offs accepted before one send are two packets. An explicit off accepted in a zone that ends before it is sent is not sent into the next zone; its receipt stays `applied_local`.
+- **An implicit stop queued with an explicit off** adds no packet.
+- **v1 and UI requests.** v1 `DELETE /v1/combat/attack` and UI toggles also always send, but they carry no packet attribution and no zone.
 
 | Operation kind | Fields / limits |
 | --- | --- |
@@ -119,7 +118,7 @@ attack is off, so a script can always force a stop. The packet is attributed to 
 | `stop` | none; priority movement stop |
 | `target` | `entity_id` from the current received roster |
 | `attack` | `lease_ms` 1–5000; live received NPC target within 30 units |
-| `attack_off` | none; priority attack stop; always sends `OP_AutoAttack 0` |
+| `attack_off` | none; priority attack stop; always sends its own `OP_AutoAttack 0` while its zone lasts |
 | `loot` | `entity_id` of a received dead NPC within 20 units; ordinary loot protocol |
 | `sit`, `stand` | none; sit stops movement and attack (attack-off only if attack is on) |
 | `say` | `text`, maximum 512 bytes |

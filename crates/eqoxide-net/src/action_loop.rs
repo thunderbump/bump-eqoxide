@@ -1931,23 +1931,37 @@ impl ActionLoop {
             self.auto_attack = false;
             gs.auto_attack = false;
         }
-        let attack_req = self.command.take_attack_request();
-        if let Some((on, command_id, forced)) = attack_req {
-            // An implicit off while the server's flag is already off changes nothing there, and a
-            // real client never sends one: drain it and send nothing. Every safety stop (zone
-            // entry, readiness loss, lease expiry, sit, camp) writes off unconditionally; this is
-            // where it becomes a packet only if attack is actually on. An explicit off (`forced`)
-            // is always sent: it is a script's safety stop, and this belief can be wrong.
-            if !on && !forced && !self.auto_attack {
-                tracing::debug!("EQ: auto-attack already off; nothing sent");
-                return;
-            }
-            self.auto_attack = on;
-            let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
-            stream.send_app_packet_with_command(OP_AUTO_ATTACK, &payload, command_id.as_ref());
-            gs.auto_attack = on;
-            tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
+        let Some(drain) = self.command.take_attack_request() else { return; };
+        if drain.on {
+            self.send_auto_attack(stream, gs, true, drain.command.as_ref());
+            return;
         }
+        // An explicit off is always sent, one packet per request and attributed to it, unless the
+        // zone it was accepted in has ended: the new zone's server starts with attack off.
+        let explicit: Vec<_> = drain.explicit.into_iter()
+            .filter(|off| off.zone_epoch.is_none_or(|epoch| epoch == gs.zone_epoch))
+            .collect();
+        if !explicit.is_empty() {
+            for off in explicit {
+                self.send_auto_attack(stream, gs, false, off.command.as_ref());
+            }
+        } else if self.auto_attack {
+            self.send_auto_attack(stream, gs, false, drain.command.as_ref());
+        } else {
+            // An implicit off while the server's flag is already off changes nothing there, and a
+            // real client never sends one. Every safety stop (zone entry, readiness loss, lease
+            // expiry, sit, camp) writes off unconditionally; this is where it becomes a packet
+            // only if attack is actually on.
+            tracing::debug!("EQ: auto-attack already off; nothing sent");
+        }
+    }
+
+    fn send_auto_attack(&mut self, stream: &mut EqStream, gs: &mut GameState, on: bool, command: Option<&std::sync::Arc<str>>) {
+        self.auto_attack = on;
+        let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
+        stream.send_app_packet_with_command(OP_AUTO_ATTACK, &payload, command);
+        gs.auto_attack = on;
+        tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
     }
 
     fn drain_pet(&mut self, stream: &mut EqStream, gs: &mut GameState) {
@@ -5747,7 +5761,7 @@ mod tests {
         tell.scope(async { nav.command.request_chat_send(message("tracked")) }).await;
         let attack = tracker.begin_for_zone("attack", 1).with_packet_command("attack");
         assert!(attack.scope(async { nav.command.request_attack(true) }).await);
-        nav.command.force_attack_off(Some("off"));
+        nav.command.force_attack_off(Some("off"), None);
 
         nav.drain_target(&mut stream, &mut gs);
         nav.drain_merchant(&mut stream, &mut gs);

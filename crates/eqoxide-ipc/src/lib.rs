@@ -2049,16 +2049,25 @@ pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 // fresh channel) into each consumer — see `ActionLoop::new` and `http::mod::spawn_camera_server`.
 // `Default`-constructing it a second time compiles and silently severs the channel.
 
+/// One explicit attack-off request: the v2 command that owns its packet, and the zone epoch it was
+/// accepted in. A v1 or UI request has neither and is sent in whatever zone drains it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExplicitAttackOff {
+    pub command: Option<Arc<str>>,
+    pub zone_epoch: Option<u64>,
+}
+
 /// `/v1/combat/*`: targeting, auto-attack, consider, spell scribe/memorize/cast, and the one
 /// `/v1/pet/command` slot (small enough on its own that a dedicated `PetSlots` would just be
 /// noise — it rides along with the other "act on a target" verbs).
 #[derive(Clone, Default)]
 pub struct CombatSlots {
     pub attack:   AttackReq,
-    /// Set, under the `attack` lock, when an off was asked for explicitly (`attack_off`, v1
-    /// `DELETE /v1/combat/attack`, a UI toggle). The drain sends an explicit off even when it
-    /// believes attack is already off; an implicit safety off is sent only while attack is on.
-    pub attack_off_forced: Arc<std::sync::atomic::AtomicBool>,
+    /// Explicit offs (`attack_off`, v1 `DELETE /v1/combat/attack`, a UI toggle) waiting for the
+    /// network owner, one per request, written under the `attack` lock while it holds an off. The
+    /// drain sends one `OP_AutoAttack 0` per entry still in its zone, even when it believes attack
+    /// is already off; an implicit safety off is sent only while attack is on.
+    pub attack_off_explicit: Arc<Mutex<Vec<ExplicitAttackOff>>>,
     pub cast:     CastReq,
     /// The honest awaited-cast slot (A3 Migration 3, #448) — sibling of `cast`. See [`CastAwaitReq`].
     pub cast_await: CastAwaitReq,

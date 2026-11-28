@@ -255,7 +255,7 @@ fn main() {
     };
     let combat = ipc::CombatSlots {
         attack:     Arc::new(Mutex::new(None)),
-        attack_off_forced: Default::default(),
+        attack_off_explicit: Default::default(),
         cast:       Arc::new(Mutex::new(None)),
         cast_await: Arc::new(Mutex::new(None)),
         mem_spell: Arc::new(Mutex::new(None)),

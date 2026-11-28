@@ -460,7 +460,7 @@ impl Host {
             }
             Operation::AttackOff => {
                 self.attack_until = None;
-                self.command.force_attack_off(Some(&id)); // LAST-WINS, always sent: explicit safety request
+                self.command.force_attack_off(Some(&id), Some(self.epoch)); // LAST-WINS, always sent in its zone: explicit safety request
                 self.outcome(
                     &id,
                     Status::AppliedLocal,

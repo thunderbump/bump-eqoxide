@@ -561,15 +561,67 @@ async fn sit_after_an_explicit_off_does_not_take_its_packet() {
     session.assert_packets("sit", &[OP_SPAWN_APPEARANCE]).await;
 }
 
-/// An explicit off written over an attack-on queued in a departed zone must not inherit that
-/// request's zone fence: the off is still sent and attributed, and the attack-on is never sent.
+/// An explicit off accepted in the current zone, written over an attack-on queued in the zone
+/// before, must not inherit that request's zone fence: the off is sent and attributed, and the
+/// attack-on is never sent.
 #[tokio::test]
 async fn an_explicit_off_over_a_stale_attack_is_still_sent() {
     let mut session = Session::new().await;
     session.dispatch("attack", json!({"kind":"attack","lease_ms":1000})).await;
     session.gs.zone_epoch += 1;
-    session.host.command.force_attack_off(Some("off"));
+    session.host.command.force_attack_off(Some("off"), Some(session.gs.zone_epoch));
     session.drain();
     session.assert_packets("off", &[OP_AUTO_ATTACK]).await;
     session.assert_packets("attack", &[]).await;
+}
+
+/// An explicit off accepted in a zone that ends before the drain is not sent into the next zone,
+/// whose server starts with attack off. Dropping the zone check turns this red.
+#[tokio::test]
+async fn an_explicit_off_from_a_departed_zone_is_not_sent() {
+    let mut session = Session::new().await;
+    session.engage();
+    session.dispatch("off", json!({"kind":"attack_off"})).await;
+    session.gs.zone_epoch += 1;
+    session.drain();
+    session.assert_packets("off", &[]).await;
+    let trace = session.packets("").await;
+    assert_eq!(trace["packets"].as_array().unwrap().iter()
+        .filter(|row| row["opcode"] == OP_AUTO_ATTACK).count(), 1, "only the engage: {trace}");
+}
+
+/// Two explicit offs accepted before one drain each own one packet. Coalescing them into one
+/// last-wins write leaves the first with none.
+#[tokio::test]
+async fn each_explicit_off_owns_its_own_packet() {
+    let mut session = Session::new().await;
+    session.dispatch("off1", json!({"kind":"attack_off"})).await;
+    session.dispatch("off2", json!({"kind":"attack_off"})).await;
+    session.drain();
+    session.assert_packets("off1", &[OP_AUTO_ATTACK]).await;
+    session.assert_packets("off2", &[OP_AUTO_ATTACK]).await;
+}
+
+/// A lease-expiry off (no command) queued before `sit` must not take the sit's attack-off: a
+/// command ID claims an implicit off, and no ID never erases one.
+#[tokio::test]
+async fn sit_claims_a_queued_lease_expiry_off() {
+    let mut session = Session::new().await;
+    session.engage();
+    session.host.command.overwrite_attack_off(None);
+    session.dispatch("sit", json!({"kind":"sit"})).await;
+    session.host.command.overwrite_attack_off(None);
+    session.drain();
+    session.assert_packets("sit", &[OP_AUTO_ATTACK, OP_SPAWN_APPEARANCE]).await;
+}
+
+/// Draining through `take_attack` must take the explicit offs with the payload, or a stale one
+/// would force the next implicit off onto the wire.
+#[tokio::test]
+async fn take_attack_takes_the_explicit_offs_with_it() {
+    let session = Session::new().await;
+    assert!(session.host.command.request_attack(false));
+    assert_eq!(session.host.command.take_attack(), Some(false));
+    session.host.command.overwrite_attack_off(None);
+    assert!(session.host.command.take_attack_request().unwrap().explicit.is_empty());
 }
