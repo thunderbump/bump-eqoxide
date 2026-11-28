@@ -67,8 +67,36 @@ Content-Type: application/json
 
 Query `GET /v2/player/commands/walk-1`; repeat the identical PUT after losing a response.
 An identical retry returns the retained result and never renews movement. A changed payload under
-the same ID conflicts. IDs remain retained for the process lifetime; the journal rejects new work
-at capacity, with one additional reserved identity each for `stop` and `attack_off`.
+the same ID conflicts (409). A PUT response also carries `event_cursor`, the newest event cursor
+once the command was recorded; pass it as `after` to wait for that command's events.
+
+A command ID is never reusable in a session, including an ID refused at admission:
+- The newest 65 536 terminal receipts are kept in full.
+- An older ID answers GET and an identical PUT with 410 `command_id_expired` and its final
+  `status` and `reason`. It never runs again.
+- A session issues at most 1 048 576 identities. Past that, a new ID gets 503
+  `session_id_space_exhausted`. `stop` and `attack_off` each keep a reserve of 1024 more, then get
+  503 `safety_reserve_exhausted`.
+- A 503 consumes no identity, so the same ID can be retried.
+- A refusal at admission returns 409 with the receipt and `"admitted": false`.
+- A body sent without `Content-Type: application/json` is 415 and consumes nothing.
+- A server's refusal of an awaited command (merchant open, buy) has reason `server_refused`, with
+  the server's text in `detail`.
+- An awaited command's receipt can be visible shortly before state shows the inventory or merchant
+  revision it changed: the network owner resolves the request before it publishes the new state.
+  Applying the outcome forces a state publication. Before the next transaction, wait until state
+  shows the changed revision (central-6ly1.7 will close this window).
+- An awaited outcome still pending when the session becomes not ready or changes zone ends
+  `unknown`, and transactions stay blocked until relog.
+- A `Content-Type` of `application/json` or `application/*+json` is accepted.
+- A malformed body consumes nothing and returns 422 `invalid_command_payload`. That covers a body
+  that is not JSON, a payload of the wrong shape, and a unit operation such as `stop` with extra
+  fields.
+- While 64 or more receipts are live (non-terminal), ordinary commands get 503
+  `live_command_limit`. `stop` and `attack_off` are still admitted, and count toward the 64.
+- Payloads compare as parsed JSON values, the same way before and after eviction: `-0.0` equals
+  `0.0`, but `1` and `1.0` differ.
+
 Do not retry an uncertain transaction under a new ID.
 
 The CPU owner expires movement after 1–2000ms and attack after a 1–5000ms lease independently of
@@ -96,6 +124,11 @@ Stop, attack-off, death, connection loss, shutdown and a new zone entry stop app
 | `camp` | none; ordinary camp and process shutdown |
 
 Receipts distinguish `accepted`, `sent`, `applied_local`, `confirmed`, `refused`, `unknown`.
+Each receipt carries `terminal`, `accepted_at_ms` and `updated_at_ms` on the host clock. `reason` is
+always a snake_case code; a validation failure is `invalid_operation`, with prose in `detail`. Only
+`accepted` and `sent` are non-terminal, and a terminal receipt never changes. A readiness drop or
+zone change fences only non-terminal receipts: never-dispatched work becomes `refused`, and
+dispatched work becomes `unknown`. Late server evidence for a fenced receipt is not applied.
 This host leaves queued network work accepted until an actual drain outcome or correlated reply;
 it does not manufacture a send receipt. Buy and merchant-open confirmation comes from the real
 server echo. Most other network commands can report `unknown` after dispatch because the protocol
@@ -154,9 +187,13 @@ arrived, null if unknown then), `amount` (the damage on a `hit`, else 0), `spell
 `invulnerable`, `rune`, `landed` (a spell action with zero damage) or `other`. A death of self is
 published once as `died`, with the same `killer` and the session's `death_count`.
 
-When combat records or deaths arrive faster than the host forwards them (more than 512 records, or
-two deaths, between 20 ms host ticks), the host publishes `source_events_dropped` with `source`
-(`combat` or `death`) and `count`, so no loss is silent.
+Anything lost before the host forwards it is reported as `source_events_dropped` with `source` and
+`count`, so no loss is silent. The host forwards every 20 ms tick, and the sources are bounded as
+follows:
+- `game_event`: 200 events;
+- `self_echo`: 32 echoes;
+- `combat`: 512 records;
+- `death`: reported when two deaths fall between two ticks.
 
 ### Self-position updates
 
@@ -182,6 +219,9 @@ port is bound; every
 
 `GET /v2/player/events?after=SESSION:CURSOR&wait=5` long-polls for at most 5 seconds. Use the
 state's `event_cursor` verbatim. Gaps are explicit; reread state and outstanding commands after one.
+Each event is `{cursor, at_ms, event}`, and the buffer keeps the newest 32 768. State publication is
+not an event, so an idle long-poll waits its full timeout. Read state with `GET /v2/player/state`.
+State's `clock_ms` is read when the state is read, so no `*_at_ms` is newer than it.
 Received chat (including NPC say) carries packet provenance; other game events are labeled client events.
 Outbound local messages are not receipt evidence. `received_self_echo` records a server-returned
 self message with channel/sender/text and `recipient_delivery_confirmed:false`; it does not confirm

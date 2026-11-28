@@ -128,6 +128,7 @@ struct Host {
     merchant_value: Value,
     last_event: u64,
     last_echo: u64,
+    completions: Completions,
     /// The last `CombatRecord::id` and death instant published as events (central-6ly1.8).
     last_combat: u64,
     last_death_count: u32,
@@ -136,6 +137,33 @@ struct Host {
     published_position: Option<[f32; 3]>,
 }
 impl Host {
+    /// Publish an awaited outcome and settle the latch from the receipt as it stands: late
+    /// evidence for a fenced `unknown` is not applied, so it cannot reopen transactions either.
+    fn apply_completion(&self, done: Completion) {
+        if done.transaction {
+            // The latch first, then the receipt, so a script that sees `confirmed` can send its
+            // next transaction at once. Both run on the host loop, so no fence falls between them.
+            // A receipt already terminal (fenced to `unknown`) keeps its status, and so the latch.
+            let settled = match self.control.settled_status(&done.id) {
+                Some(status) if status.terminal() => status,
+                _ => done.status,
+            };
+            self.transaction_uncertain
+                .store(!matches!(settled, Status::Confirmed | Status::Refused), Ordering::Release);
+        }
+        let _ = self.control.publish_outcome_with_detail(&done.id, done.status, done.reason, done.detail, done.evidence);
+    }
+    /// Apply awaited outcomes on the host loop, so no fence can run between settling the latch
+    /// and publishing the receipt. Returns whether anything was applied, so the caller can
+    /// publish state at once.
+    fn drain_completions(&mut self, _snapshot: &Arc<GameState>) -> bool {
+        let mut applied = false;
+        while let Ok(done) = self.completions.1.try_recv() {
+            self.apply_completion(done);
+            applied = true;
+        }
+        applied
+    }
     fn outcome(&self, id: &str, status: Status, reason: Option<&str>, evidence: Option<Value>) {
         let _ = self
             .control
@@ -261,6 +289,20 @@ impl Host {
             self.merchant_revision += 1;
             self.merchant_value = merchant;
         }
+        // The source queues are bounded (200 events, 32 echoes): anything evicted before this tick
+        // saw it is reported, never silently lost (design A4).
+        if let Some(first) = gs.chat_events.front() {
+            if first.id > self.last_event + 1 {
+                self.control.publish_event(json!({"kind":"source_events_dropped","source":"game_event",
+                    "count":first.id - self.last_event - 1}));
+            }
+        }
+        if let Some(first) = gs.received_self_echoes.front() {
+            if first.id > self.last_echo + 1 {
+                self.control.publish_event(json!({"kind":"source_events_dropped","source":"self_echo",
+                    "count":first.id - self.last_echo - 1}));
+            }
+        }
         for event in gs.chat_events.iter().filter(|e| e.id > self.last_event) {
             self.control.publish_event(json!({"kind":"received_game_event","source":if event.category=="chat" {"received_packet"} else {"client_game_event"},"event_id":event.id,
                 "category":event.category,"event_kind":event.kind,"from":event.from,"directed":event.directed,"text":event.text}));
@@ -313,12 +355,15 @@ impl Host {
                     "refused" => Status::Refused,
                     _ => Status::Unknown,
                 };
-                if transaction {
-                    self.transaction_uncertain
-                        .store(status == Status::Unknown, Ordering::Release);
-                }
                 let evidence = (status==Status::Confirmed).then(||json!({"kind":"server_action_receipt","action":event.kind,"detail":event.reason}));
-                self.outcome(&id, status, Some(&event.reason), evidence);
+                let _ = self.control.publish_outcome(&id, status, Some(event.reason.clone()), evidence);
+                if transaction {
+                    // The receipt as it stands, not this report: a fenced `unknown` stays unknown,
+                    // and so does the latch, whatever arrives later.
+                    let settled = self.control.settled_status(&id).unwrap_or(status);
+                    self.transaction_uncertain.store(
+                        !matches!(settled, Status::Confirmed | Status::Refused), Ordering::Release);
+                }
             }
         }
     }
@@ -446,9 +491,9 @@ impl Host {
                     self.outcome(&id, Status::Refused, Some("network_mailbox_busy"), None);
                     return;
                 }
-                let control = self.control.clone();
+                let done = self.completions.0.clone();
                 tokio::spawn(async move {
-                    complete_await(control, id, rx, "server_merchant_open", None).await;
+                    let _ = done.send(await_outcome(id, rx, "server_merchant_open", false).await);
                 });
             }
             Operation::Buy { slot, quantity: _ } => {
@@ -482,11 +527,10 @@ impl Host {
                     self.outcome(&id, Status::Refused, Some("network_mailbox_busy"), None);
                     return;
                 }
-                let control = self.control.clone();
-                let uncertain = self.transaction_uncertain.clone();
-                uncertain.store(true, Ordering::Release);
+                self.transaction_uncertain.store(true, Ordering::Release);
+                let done = self.completions.0.clone();
                 tokio::spawn(async move {
-                    complete_await(control, id, rx, "server_buy_receipt", Some(uncertain)).await;
+                    let _ = done.send(await_outcome(id, rx, "server_buy_receipt", true).await);
                 });
             }
             operation => {
@@ -715,31 +759,49 @@ fn within(me: Option<[f32; 3]>, entity: &eqoxide_core::game_state::Entity, radiu
 fn observed_entity(gs: &GameState, me: Option<[f32; 3]>, id: u32, radius: f32) -> bool {
     gs.world.entities.get(&id).is_some_and(|entity| !entity.dead && within(me, entity, radius))
 }
-async fn complete_await<T: serde::Serialize>(
-    control: Control,
+/// An awaited command's outcome, handed back to the host loop. The host publishes it and settles
+/// the transaction latch in one step before it dispatches anything else, so a script that sees the
+/// receipt can never have its next transaction judged against the old latch.
+struct Completion {
+    id: String,
+    status: Status,
+    reason: Option<String>,
+    detail: Option<String>,
+    evidence: Option<Value>,
+    transaction: bool,
+}
+type Completions = (
+    tokio::sync::mpsc::UnboundedSender<Completion>,
+    tokio::sync::mpsc::UnboundedReceiver<Completion>,
+);
+
+async fn await_outcome<T: serde::Serialize>(
     id: String,
     rx: tokio::sync::oneshot::Receiver<ipc::CommandResult<T>>,
     kind: &str,
-    uncertain: Option<Arc<AtomicBool>>,
-) {
+    transaction: bool,
+) -> Completion {
     let (status, reason, evidence) = match tokio::time::timeout(Duration::from_secs(8), rx).await {
         Ok(Ok(ipc::CommandResult::Resolved(receipt))) => (
             Status::Confirmed,
             None,
             Some(json!({"kind":kind,"receipt":receipt})),
         ),
-        Ok(Ok(ipc::CommandResult::Refused(reason))) => (Status::Refused, Some(reason), None),
+        // The server's refusal is prose; the receipt's reason is a code (design A2.7).
+        // A local claim refusal arrives as its code (`stale_zone_epoch_before_dispatch`); a
+        // server's refusal is prose, which goes to `detail` under the code `server_refused`.
+        Ok(Ok(ipc::CommandResult::Refused(text))) => {
+            let is_code = !text.is_empty() && text.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+            let (reason, detail) = if is_code { (text, None) } else { ("server_refused".to_owned(), Some(text)) };
+            return Completion { id, status: Status::Refused, reason: Some(reason), detail, evidence: None, transaction };
+        }
         _ => (
             Status::Unknown,
-            Some("no_correlated_server_receipt_relog_before_another_transaction".into()),
+            Some("no_server_evidence_within_window".into()),
             None,
         ),
     };
-    if let Some(uncertain) = uncertain {
-        // Keep admission closed while a packet is outstanding and after an unknown outcome.
-        uncertain.store(status == Status::Unknown, Ordering::Release);
-    }
-    let _ = control.publish_outcome(&id, status, reason, evidence);
+    Completion { id, status, reason, detail: None, evidence, transaction }
 }
 
 fn load_collision(dir: &std::path::Path, zone: &str) -> Result<(Arc<Collision>, Value), String> {
@@ -789,11 +851,14 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             .map_err(|_| "system clock before epoch")?
             .as_nanos()
     );
-    let started = Instant::now();
     let wiring = Wiring::new(profile.maps_dir.clone());
+    // 65 536 terminal receipts kept in full, 1 048 576 identities, a 32 768-event buffer (design
+    // A3, A4). The control owns the host clock so every `at_ms`, `clock_ms` and packet `at_ms`
+    // share one origin.
+    let control = Control::new(session, profile.control_token.clone(), 65_536, 32_768)?;
+    let started = control.started();
     let trace = eqoxide_net::packet_telemetry::SessionTrace::new(started);
-    let control = Control::new(session, profile.control_token.clone(), 4096, 2048)?
-        .with_packet_trace(trace.clone());
+    let control = control.with_packet_trace(trace.clone());
     let router = control.router();
     let api = tokio::spawn(async move { axum::serve(listener, router).await });
     println!("API_PORT={}", profile.api_port);
@@ -816,6 +881,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         merchant_value: Value::Null,
         last_event: 0,
         last_echo: 0,
+        completions: tokio::sync::mpsc::unbounded_channel(),
         last_combat: 0,
         last_death_count: 0,
         published_position: None,
@@ -871,6 +937,12 @@ pub async fn run(profile: Profile) -> Result<(), String> {
     let mut shutdown_started: Option<Instant> = None;
     loop {
         interval.tick().await;
+        let gs = wiring.snapshot.load_full();
+        // Outcomes the server already settled are applied before any fence this tick can run,
+        // so a readiness drop or zone change cannot turn a settled buy into `unknown`.
+        if host.drain_completions(&gs) {
+            publish_at = Instant::now();
+        }
         let now = Instant::now();
         let dt = (now - previous).as_secs_f32().min(0.05);
         previous = now;
@@ -885,13 +957,14 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
             if terminal.is_some() {
+                host.drain_completions(&gs);
                 host.halt("network_ended", None);
                 control.set_ready(false);
                 control.publish_event(json!({"kind":"session_ended","reason":terminal}));
             }
         }
-        let gs = wiring.snapshot.load_full();
         if gs.zone_epoch != host.epoch {
+            host.drain_completions(&gs);
             host.halt("zone_entry", None);
             control.set_ready(false);
             host.body = None;
@@ -952,6 +1025,10 @@ pub async fn run(profile: Profile) -> Result<(), String> {
             && host_ready(&gs, &host, col.is_some(), tick_age, link_age, dropped);
         host.step(&gs, col.as_deref(), ready, now, dt);
         host.update_knowledge(&gs);
+        // A completion that arrived during this tick is applied before the publish, after the fences.
+        if host.drain_completions(&gs) {
+            publish_at = now;
+        }
         if now >= publish_at {
             let position = host.body.as_ref().map(|body| body.pos);
             host.published_position = position;
@@ -1034,6 +1111,7 @@ mod tests {
             merchant_value: Value::Null,
             last_event: 0,
             last_echo: 0,
+        completions: tokio::sync::mpsc::unbounded_channel(),
         last_combat: 0,
         last_death_count: 0,
         published_position: None,
@@ -1393,6 +1471,7 @@ mod transaction_admission_tests {
             merchant_value: Value::Null,
             last_event: 0,
             last_echo: 0,
+        completions: tokio::sync::mpsc::unbounded_channel(),
         last_combat: 0,
         last_death_count: 0,
         published_position: None,
@@ -1539,16 +1618,144 @@ mod execution_claim_tests {
         host.transaction_uncertain.store(true, Ordering::Release);
         tracker.set_zone_epoch(2);
         assert!(host.command.take_buy_await().is_none());
-        complete_await(
-            host.control.clone(),
-            "buy".into(),
-            rx,
-            "server_buy_receipt",
-            Some(host.transaction_uncertain.clone()),
-        )
-        .await;
+        host.apply_completion(await_outcome("buy".into(), rx, "server_buy_receipt", true).await);
         assert!(!host.transaction_uncertain.load(Ordering::Acquire));
         assert_eq!(host.control.command("buy").unwrap().status, Status::Refused);
+    }
+
+    /// central-6ly1.1 review: a buy fenced to `unknown` keeps transactions blocked even if its
+    /// server receipt arrives later; the receipt is terminal, and so is the uncertainty.
+    #[tokio::test]
+    async fn a_late_receipt_for_a_fenced_buy_keeps_transactions_blocked() {
+        let host = super::tests::host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(&host.control, "buy", json!({"kind":"buy","slot":1,"quantity":1})).await;
+        host.control.drain_actions();
+        host.control.mark_dispatched("buy").unwrap();
+        host.transaction_uncertain.store(true, Ordering::Release);
+        host.control.set_ready(false); // fence: dispatched, so unknown
+        assert_eq!(host.control.command("buy").unwrap().status, Status::Unknown);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(ipc::CommandResult::Resolved(json!({"late":true}))).unwrap();
+        host.apply_completion(await_outcome("buy".into(), rx, "server_buy_receipt", true).await);
+        assert_eq!(host.control.command("buy").unwrap().status, Status::Unknown);
+        assert!(host.transaction_uncertain.load(Ordering::Acquire), "transactions stay blocked");
+    }
+
+    /// Review of PR #6: an awaited outcome becomes visible only when the host applies it, in the
+    /// same step as the latch, so a script that sees `confirmed` can send its next transaction
+    /// without it being judged against the old latch.
+    #[tokio::test]
+    async fn an_awaited_outcome_and_its_latch_settle_together() {
+        let mut host = super::tests::host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(&host.control, "buy", json!({"kind":"buy","slot":1,"quantity":1})).await;
+        host.control.drain_actions();
+        host.control.mark_dispatched("buy").unwrap();
+        host.transaction_uncertain.store(true, Ordering::Release);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(ipc::CommandResult::Resolved(json!({"ok":true}))).unwrap();
+        let done = await_outcome("buy".into(), rx, "server_buy_receipt", true).await;
+        host.completions.0.send(done).unwrap();
+        assert_eq!(host.control.command("buy").unwrap().status, Status::Accepted,
+            "not visible until the host loop applies it");
+        host.drain_completions(&Arc::new(GameState::new()));
+        assert_eq!(host.control.command("buy").unwrap().status, Status::Confirmed);
+        assert!(!host.transaction_uncertain.load(Ordering::Acquire), "and the latch cleared with it");
+    }
+
+    /// Review of PR #6: a server refusal's prose goes to `detail`; `reason` is a code.
+    #[tokio::test]
+    async fn a_server_refusal_has_a_code_and_prose_detail() {
+        let host = super::tests::host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(&host.control, "buy", json!({"kind":"buy","slot":1,"quantity":1})).await;
+        host.control.drain_actions();
+        host.control.mark_dispatched("buy").unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ipc::CommandResult<Value>>();
+        tx.send(ipc::CommandResult::Refused("merchant refused".into())).unwrap();
+        host.apply_completion(await_outcome("buy".into(), rx, "server_buy_receipt", true).await);
+        let receipt = host.control.command("buy").unwrap();
+        assert_eq!((receipt.status, receipt.reason.as_deref(), receipt.detail.as_deref()),
+            (Status::Refused, Some("server_refused"), Some("merchant refused")));
+        let (tx, rx) = tokio::sync::oneshot::channel::<ipc::CommandResult<Value>>();
+        tx.send(ipc::CommandResult::Refused("stale_zone_epoch_before_dispatch".into())).unwrap();
+        let done = await_outcome("x".into(), rx, "server_buy_receipt", true).await;
+        assert_eq!((done.reason.as_deref(), done.detail), (Some("stale_zone_epoch_before_dispatch"), None),
+            "a local claim refusal keeps its own code");
+    }
+
+    /// Review of PR #6: the same holds once the fenced receipt has been evicted.
+    #[tokio::test]
+    async fn a_late_receipt_after_eviction_keeps_transactions_blocked() {
+        let mut host = super::tests::host();
+        host.control = Control::new("test-session".into(), "test-credential".into(), 1, 100).unwrap();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(&host.control, "buy", json!({"kind":"buy","slot":1,"quantity":1})).await;
+        host.control.drain_actions();
+        host.control.mark_dispatched("buy").unwrap();
+        host.transaction_uncertain.store(true, Ordering::Release);
+        host.control.set_ready(false);
+        host.control.set_ready(true);
+        put(&host.control, "walk", json!({"kind":"move_for","east":1,"north":0,"duration_ms":100})).await;
+        host.control.set_ready(false); // a second terminal receipt evicts the buy
+        assert!(host.control.command("buy").is_none(), "premise: the buy was evicted");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(ipc::CommandResult::Resolved(json!({"late":true}))).unwrap();
+        host.apply_completion(await_outcome("buy".into(), rx, "server_buy_receipt", true).await);
+        assert!(host.transaction_uncertain.load(Ordering::Acquire), "an evicted unknown still blocks");
+    }
+
+    /// central-6ly1.1 review: game events and self echoes evicted from their bounded source queues
+    /// before the host saw them are reported.
+    #[test]
+    fn evicted_source_events_are_reported() {
+        let mut host = super::tests::host();
+        host.control = Control::new("test-session".into(), "test-credential".into(), 16, 1000).unwrap();
+        let mut gs = GameState::new();
+        for _ in 0..205 {
+            gs.push_event("chat", "say", "someone", false, "hello");
+        }
+        host.update_knowledge(&gs);
+        let events = host.control.events_after_for_test(0);
+        assert_eq!(events[0], json!({"kind":"source_events_dropped","source":"game_event","count":5}));
+        let mut gs = GameState::new();
+        for n in 0..40u64 {
+            gs.received_self_echoes.push_back(eqoxide_core::game_state::ReceivedSelfEcho {
+                id: n + 1, channel: 8, sender: "Me".into(), text: "hi".into(), truncated: false,
+            });
+        }
+        while gs.received_self_echoes.len() > 32 {
+            gs.received_self_echoes.pop_front();
+        }
+        host.update_knowledge(&gs);
+        let events = host.control.events_after_for_test(0);
+        assert!(events.contains(&json!({"kind":"source_events_dropped","source":"self_echo","count":8})));
+    }
+
+    /// Review of PR #6: the action-tracker path follows the receipt as it stands too.
+    #[tokio::test]
+    async fn a_late_tracker_confirmation_cannot_reopen_transactions() {
+        let mut host = super::tests::host();
+        host.control.publish_state(1, json!({})).unwrap();
+        host.control.set_ready(true);
+        put(&host.control, "sell", json!({"kind":"sell","slot":1,"quantity":1})).await;
+        host.control.drain_actions();
+        host.control.mark_dispatched("sell").unwrap();
+        host.transaction_uncertain.store(true, Ordering::Release);
+        host.control.set_ready(false); // fenced to unknown
+        let tracker = host.command.actions();
+        let context = tracker.begin_for_zone("sell", 1);
+        assert!(context.scope(async { host.command.request_sit(true) }).await, "premise: accepted");
+        host.action_ids.insert(context.id(), ("sell".into(), true));
+        tracker.finish(context.id(), "confirmed", "late");
+        host.update_knowledge(&GameState::new());
+        assert_eq!(host.control.command("sell").unwrap().status, Status::Unknown);
+        assert!(host.transaction_uncertain.load(Ordering::Acquire));
     }
 }
 

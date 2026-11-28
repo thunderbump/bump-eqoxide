@@ -141,10 +141,12 @@ async fn lost_response_retry_returns_receipt_without_dispatching_or_renewing_mot
             Some(json!({"kind":"physical_controller_armed","deadline_ms":300})),
         )
         .unwrap();
-    let (status, body) = authorized(&control, "PUT", path, Some(movement())).await;
+    let (status, mut body) = authorized(&control, "PUT", path, Some(movement())).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "applied_local");
+    assert!(body["event_cursor"].is_string(), "a PUT reports the cursor after admission");
     assert!(control.drain_actions().is_empty());
+    body.as_object_mut().unwrap().remove("event_cursor");
     assert_eq!(authorized(&control, "GET", path, None).await.1, body);
     let mut changed = movement();
     changed["operation"]["duration_ms"] = json!(301);
@@ -161,51 +163,69 @@ async fn lost_response_retry_returns_receipt_without_dispatching_or_renewing_mot
     );
 }
 
-#[test]
-fn journal_never_evicts_and_has_a_separate_reserve_for_each_safety_verb() {
-    let control = control(1, 20);
-    control.admit("walk".into(), movement()).unwrap();
-    assert_eq!(
+/// central-6ly1.1: terminal receipts are evicted past the retention bound, but an evicted ID is
+/// never reusable: a replay answers 410 with its final status, a changed payload 409.
+#[tokio::test]
+async fn terminal_receipts_are_evicted_but_their_ids_never_return() {
+    let control = control(2, 50);
+    for id in ["a", "b", "c"] {
+        control.admit(id.into(), movement()).unwrap();
+        control.drain_actions();
         control
-            .admit("new".into(), request(json!({"kind":"sit"})))
-            .unwrap_err()
-            .0,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-    control
-        .admit("stop".into(), request(json!({"kind":"stop"})))
-        .unwrap();
-    control
-        .admit("off".into(), request(json!({"kind":"attack_off"})))
-        .unwrap();
-    let actions = control.drain_actions();
-    assert_eq!(
-        actions.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-        vec!["stop", "off"]
-    );
-    assert_eq!(
-        control.command("walk").unwrap().status,
-        CommandStatus::Refused
-    );
-    assert_eq!(
-        control
-            .admit("stop-again".into(), request(json!({"kind":"stop"})))
-            .unwrap_err()
-            .0,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-    assert_eq!(
-        control.admit("walk".into(), movement()).unwrap().1.status,
-        CommandStatus::Refused
-    );
-    assert_eq!(
-        control
-            .admit("off".into(), request(json!({"kind":"attack_off"})))
-            .unwrap()
-            .0,
-        StatusCode::OK
-    );
+            .publish_outcome(id, CommandStatus::AppliedLocal, None, Some(json!({"kind":"controller_intent"})))
+            .unwrap();
+    }
+    assert!(control.command("a").is_none(), "the oldest terminal receipt was evicted");
+    assert!(control.command("c").is_some());
+    let (status, body) = authorized(&control, "GET", "/v2/player/commands/a", None).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body, json!({"error":"command_id_expired","status":"applied_local","reason":null}));
+    let (status, _) = authorized(&control, "PUT", "/v2/player/commands/a", Some(movement())).await;
+    assert_eq!(status, StatusCode::GONE, "a replay of an expired ID never runs again");
     assert!(control.drain_actions().is_empty());
+    let mut changed = movement();
+    changed["operation"]["duration_ms"] = json!(301);
+    let (status, body) = authorized(&control, "PUT", "/v2/player/commands/a", Some(changed)).await;
+    assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("command_id_reused_with_changed_payload")));
+}
+
+/// central-6ly1.1: a refusal at admission consumes an identity but no live slot; once the
+/// identity space is gone a 503 consumes nothing, and each safety verb has its own reserve.
+/// central-6ly1.7: a readiness drop or zone change fences only live receipts; an earlier
+/// `applied_local` stays exactly as it was.
+#[test]
+fn fences_never_rewrite_terminal_receipts() {
+    let control = control(10, 50);
+    control.admit("walk".into(), movement()).unwrap();
+    control.drain_actions();
+    control
+        .publish_outcome("walk", CommandStatus::AppliedLocal, None, Some(json!({"kind":"controller_intent"})))
+        .unwrap();
+    let before = control.command("walk").unwrap();
+    control.set_ready(false);
+    control.publish_state(5, json!({})).unwrap();
+    assert_eq!(control.command("walk").unwrap(), before);
+}
+
+#[test]
+fn identity_space_and_safety_reserves() {
+    let control = control(2, 500); // 32 identities, a reserve of one per safety verb
+    for n in 0..32 {
+        let mut stale = movement();
+        stale["session"] = json!("someone-else");
+        let (code, receipt, _) = control.admit(format!("r{n}"), stale).unwrap();
+        assert_eq!((code, receipt.reason.as_deref(), receipt.admitted), (StatusCode::CONFLICT, Some("stale_session"), Some(false)));
+    }
+    let full = control.admit("next".into(), movement()).unwrap_err();
+    assert_eq!((full.0, full.1.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "session_id_space_exhausted"));
+    let again = control.admit("next".into(), movement()).unwrap_err();
+    assert_eq!(again.0, StatusCode::SERVICE_UNAVAILABLE, "the 503 consumed no identity");
+    assert_eq!(control.admit("stop".into(), request(json!({"kind":"stop"}))).unwrap().0, StatusCode::ACCEPTED);
+    assert_eq!(control.admit("off".into(), request(json!({"kind":"attack_off"}))).unwrap().0, StatusCode::ACCEPTED);
+    let spent = control.admit("stop-2".into(), request(json!({"kind":"stop"}))).unwrap_err();
+    assert_eq!((spent.0, spent.1.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "safety_reserve_exhausted"));
+    assert_eq!(control.admit("stop".into(), request(json!({"kind":"stop"}))).unwrap().0, StatusCode::OK,
+        "a known ID is still answered when every limit is reached");
 }
 
 #[test]
@@ -214,7 +234,7 @@ fn busy_refusal_is_retained_and_priority_commands_bypass_busy() {
     control
         .admit("chat".into(), request(json!({"kind":"say","text":"hello"})))
         .unwrap();
-    let (_, receipt) = control
+    let (_, receipt, _) = control
         .admit("sit".into(), request(json!({"kind":"sit"})))
         .unwrap();
     assert_eq!(receipt.status, CommandStatus::Refused);
@@ -390,26 +410,15 @@ fn outcomes_require_evidence_and_cannot_invent_or_regress_success() {
             Some(json!({"kind":"queue_accepted"}))
         )
         .is_err());
-    control
-        .publish_outcome(
-            "move",
-            CommandStatus::Unknown,
-            Some("connection_lost".into()),
-            None,
-        )
-        .unwrap();
-    // Late genuine server evidence can reconcile uncertainty.
-    control
-        .publish_outcome(
-            "move",
-            CommandStatus::Confirmed,
-            None,
-            Some(json!({"kind":"server_position_update"})),
-        )
-        .unwrap();
+    // A terminal receipt never changes (central-6ly1.7): not to unknown, not to confirmed.
     assert!(control
-        .publish_outcome("move", CommandStatus::Unknown, Some("timeout".into()), None)
+        .publish_outcome("move", CommandStatus::Unknown, Some("connection_lost".into()), None)
         .is_err());
+    assert!(control
+        .publish_outcome("move", CommandStatus::Confirmed, None, Some(json!({"kind":"server_position_update"})))
+        .is_err());
+    let receipt = control.command("move").unwrap();
+    assert_eq!((receipt.status, receipt.terminal), (CommandStatus::AppliedLocal, true));
 }
 
 #[test]
@@ -489,6 +498,7 @@ fn revision_fences_are_preserved_for_host_admission_and_command_identity() {
 #[tokio::test]
 async fn event_gaps_and_process_identity_are_explicit() {
     let control = control(10, 2);
+    control.publish_event(json!({"kind":"chat","text":"zeroth"}));
     control.publish_event(json!({"kind":"chat","text":"first"}));
     control.publish_event(json!({"kind":"chat","text":"second"}));
     let (status, batch) =
@@ -498,6 +508,7 @@ async fn event_gaps_and_process_identity_are_explicit() {
     assert_eq!(batch["events"].as_array().unwrap().len(), 2);
     assert_eq!(batch["cursor"], "session-1:3");
     assert_eq!(batch["events"][0]["event"]["text"], "first");
+    assert!(batch["events"][0]["at_ms"].is_u64(), "each event carries the host clock");
     let state = authorized(&control, "GET", "/v2/player/state", None)
         .await
         .1;
@@ -521,14 +532,27 @@ async fn event_gaps_and_process_identity_are_explicit() {
 }
 
 #[tokio::test]
-async fn long_poll_wakes_for_publication_and_returns_empty_on_timeout() {
+async fn long_poll_ignores_state_publication_and_wakes_for_events() {
     let control = control(10, 10);
+    // central-6ly1.1: state publication is not an event. An idle poll waits its full timeout.
+    let started = std::time::Instant::now();
+    let idle = control.clone();
+    let task = tokio::spawn(async move {
+        authorized(&idle, "GET", "/v2/player/events?after=session-1:0&wait=0.3", None).await
+    });
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        control.publish_state(4, json!({"phase":"ready"})).unwrap();
+    }
+    let (_, batch) = task.await.unwrap();
+    assert!(batch["events"].as_array().unwrap().is_empty(), "no state_changed events");
+    assert!(started.elapsed() >= Duration::from_millis(300), "the poll waited its full timeout");
     let waiting = control.clone();
     let task = tokio::spawn(async move {
         authorized(
             &waiting,
             "GET",
-            "/v2/player/events?after=session-1:1&wait=1",
+            "/v2/player/events?after=session-1:0&wait=1",
             None,
         )
         .await
@@ -544,12 +568,12 @@ async fn long_poll_wakes_for_publication_and_returns_empty_on_timeout() {
     let (_, batch) = authorized(
         &control,
         "GET",
-        "/v2/player/events?after=session-1:2&wait=0.001",
+        "/v2/player/events?after=session-1:1&wait=0.001",
         None,
     )
     .await;
     assert!(batch["events"].as_array().unwrap().is_empty());
-    assert_eq!(batch["cursor"], "session-1:2");
+    assert_eq!(batch["cursor"], "session-1:1");
 }
 
 #[tokio::test]
@@ -575,7 +599,7 @@ async fn simultaneous_same_id_admission_enqueues_once() {
 }
 
 #[tokio::test]
-async fn fence_after_dispatch_is_unknown_and_accepts_a_late_server_receipt() {
+async fn fence_after_dispatch_is_unknown_and_a_late_receipt_cannot_change_it() {
     let control = control(8, 16);
     let body = request(json!({"kind":"buy","slot":1,"quantity":1}));
     let (_, receipt) = authorized(&control, "PUT", "/v2/player/commands/buy-1", Some(body)).await;
@@ -587,17 +611,18 @@ async fn fence_after_dispatch_is_unknown_and_accepts_a_late_server_receipt() {
         control.command("buy-1").unwrap().status,
         CommandStatus::Unknown
     );
-    control
+    // central-6ly1.7: the fenced receipt is terminal; late evidence cannot rewrite it.
+    assert!(control
         .publish_outcome(
             "buy-1",
             CommandStatus::Confirmed,
             None,
             Some(json!({"kind":"server_buy_receipt"})),
         )
-        .unwrap();
+        .is_err());
     assert_eq!(
         control.command("buy-1").unwrap().status,
-        CommandStatus::Confirmed
+        CommandStatus::Unknown
     );
 }
 
@@ -900,3 +925,197 @@ async fn assert_inbound_wire_fields(opcode: u16, name: &str, hex: &str, expected
     assert_eq!(rows[0]["payload_hex"], hex);
     assert_eq!(rows[0]["fields"], expected);
 }
+
+/// central-6ly1.1 acceptance: an hour at five commands a second keeps admitting work and loses no
+/// receipt event. Compressed in time, at production capacities, past the 65 536 retention bound so
+/// eviction and tombstones run, with game events interleaved, and checked per command ID.
+#[test]
+fn one_hour_at_five_commands_per_second_keeps_admitting_and_loses_no_receipt() {
+    let control = Control::new("session-1".into(), "private-test-token".into(), 65_536, 32_768).unwrap();
+    control.publish_state(4, json!({"phase":"ready"})).unwrap();
+    control.set_ready(true);
+    let mut cursor = 0u64;
+    let mut seen: std::collections::HashMap<String, (u32, u32)> = std::collections::HashMap::new();
+    const COMMANDS: usize = 70_000;
+    // Design A4 load: about 60 events/s at 5 commands/s, i.e. 12 per command including the two
+    // receipt events. The reader falls the promised 120 s (600 commands, 7200 events) behind.
+    const EXTRA_EVENTS: usize = 10;
+    const READ_EVERY: usize = 600;
+    for n in 0..COMMANDS {
+        let id = format!("cmd-{n}");
+        let (code, _, _) = control.admit(id.clone(), movement()).unwrap();
+        assert_eq!(code, StatusCode::ACCEPTED, "command {n} was not admitted");
+        assert_eq!(control.drain_actions().len(), 1);
+        for k in 0..EXTRA_EVENTS {
+            control.publish_event(json!({"kind":"combat","n":n,"k":k}));
+        }
+        control
+            .publish_outcome(&id, CommandStatus::AppliedLocal, None, Some(json!({"kind":"controller_intent"})))
+            .unwrap();
+        if n % READ_EVERY == READ_EVERY - 1 || n == COMMANDS - 1 {
+            let batch = control.event_batch(cursor).unwrap();
+            assert!(!batch.gap, "the reader lost events at command {n}");
+            let mut expected = cursor + 1;
+            for event in &batch.events {
+                let n: u64 = event.cursor.rsplit_once(':').unwrap().1.parse().unwrap();
+                assert_eq!(n, expected, "cursors are contiguous");
+                expected += 1;
+                if event.event["kind"] != "command" { continue; }
+                let receipt = &event.event["command"];
+                let entry = seen.entry(receipt["id"].as_str().unwrap().to_owned()).or_default();
+                match receipt["status"].as_str().unwrap() {
+                    "accepted" => entry.0 += 1,
+                    "applied_local" => entry.1 += 1,
+                    other => panic!("unexpected status {other}"),
+                }
+            }
+            cursor = batch.cursor.rsplit_once(':').unwrap().1.parse().unwrap();
+        }
+    }
+    assert_eq!(seen.len(), COMMANDS);
+    assert!(seen.values().all(|counts| *counts == (1, 1)),
+        "every command has exactly one admission and one terminal event");
+    assert!(control.command("cmd-0").is_none(), "the oldest receipts were evicted");
+}
+
+/// central-6ly1.1 review: the cursor a PUT returns is the one right after its own admission event,
+/// so a wait from it sees the terminal receipt; a replay returns the same cursor.
+#[tokio::test]
+async fn put_cursor_precedes_the_commands_own_outcome() {
+    let control = control(10, 100);
+    let path = "/v2/player/commands/walk-1";
+    let (_, body) = authorized(&control, "PUT", path, Some(movement())).await;
+    let after = body["event_cursor"].as_str().unwrap().to_owned();
+    control.drain_actions();
+    control
+        .publish_outcome("walk-1", CommandStatus::AppliedLocal, None, Some(json!({"kind":"controller_intent"})))
+        .unwrap();
+    let (_, batch) = authorized(&control, "GET", &format!("/v2/player/events?after={after}"), None).await;
+    assert_eq!(batch["events"][0]["event"]["command"]["status"], "applied_local");
+    let (_, replay) = authorized(&control, "PUT", path, Some(movement())).await;
+    assert_eq!(replay["event_cursor"].as_str(), Some(after.as_str()));
+}
+
+/// central-6ly1.1 review: payload equality is the same before and after eviction (`-0.0` == `0.0`).
+#[tokio::test]
+async fn an_equal_payload_replays_the_same_way_after_eviction() {
+    let control = control(1, 100);
+    let mut negative = movement();
+    negative["operation"]["north"] = json!(-0.0);
+    for (id, body) in [("a", negative.clone()), ("b", movement())] {
+        control.admit(id.into(), body).unwrap();
+        control.drain_actions();
+        control
+            .publish_outcome(id, CommandStatus::AppliedLocal, None, Some(json!({"kind":"controller_intent"})))
+            .unwrap();
+    }
+    assert!(control.command("a").is_none() && control.command("b").is_some(), "one retained: b");
+    let mut positive = movement();
+    positive["operation"]["north"] = json!(0.0);
+    let (status, _) = authorized(&control, "PUT", "/v2/player/commands/a", Some(positive)).await;
+    assert_eq!(status, StatusCode::GONE, "0.0 equals -0.0, so this is a replay of an expired ID");
+}
+
+/// central-6ly1.1 review: the live limit counts every live receipt, safety ones included, while
+/// safety commands themselves stay exempt.
+#[test]
+fn the_live_limit_counts_pending_safety_commands() {
+    let control = control(10, 1000);
+    for n in 0..64 {
+        control.admit(format!("off-{n}"), request(json!({"kind":"attack_off"}))).unwrap();
+    }
+    let blocked = control.admit("walk".into(), movement()).unwrap_err();
+    assert_eq!((blocked.0, blocked.1.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "live_command_limit"));
+    let before = control.identities_for_test();
+    for _ in 0..5 {
+        assert!(control.admit("walk".into(), movement()).is_err());
+    }
+    assert_eq!(control.identities_for_test(), before, "a 503 consumes no identity");
+    assert!(control.command("walk").is_none());
+    assert_eq!(control.admit("off-64".into(), request(json!({"kind":"attack_off"}))).unwrap().0,
+        StatusCode::ACCEPTED, "a safety command is still admitted");
+}
+
+/// central-6ly1.1 review: a body that is not JSON, or a unit operation with extra fields, is 422
+/// and consumes no identity.
+#[tokio::test]
+async fn malformed_bodies_are_422_and_consume_nothing() {
+    let control = control(2, 100);
+    let path = "/v2/player/commands/x";
+    let truncated = Request::builder().method("PUT").uri(path)
+        .header("authorization", "Bearer private-test-token").header("content-type", "application/json")
+        .body(Body::from("{\"session\":")).unwrap();
+    let response = control.router().oneshot(truncated).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let extra = request(json!({"kind":"attack_off","lease_ms":5}));
+    let (status, body) = authorized(&control, "PUT", path, Some(extra)).await;
+    assert_eq!((status, body["error"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_command_payload")));
+    let (status, _) = authorized(&control, "PUT", path,
+        Some(json!(["session-1", 4, null, null, {"kind":"attack_off","lease_ms":5}]))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "a positional array is not a command");
+    let bad_id = Request::builder().method("PUT").uri("/v2/player/commands/bad%20id")
+        .header("authorization", "Bearer private-test-token").header("content-type", "application/json")
+        .body(Body::from("{")).unwrap();
+    assert_eq!(control.router().oneshot(bad_id).await.unwrap().status(), StatusCode::BAD_REQUEST,
+        "the ID is checked before the body");
+    let plain = Request::builder().method("PUT").uri(path)
+        .header("authorization", "Bearer private-test-token").header("content-type", "text/plain")
+        .body(Body::from(movement().to_string())).unwrap();
+    assert_eq!(control.router().oneshot(plain).await.unwrap().status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    for content_type in ["application/json, application/problem+json", "application/json; garbage", "text/x+json"] {
+        let listed = Request::builder().method("PUT").uri(path)
+            .header("authorization", "Bearer private-test-token").header("content-type", content_type)
+            .body(Body::from(movement().to_string())).unwrap();
+        assert_eq!(control.router().oneshot(listed).await.unwrap().status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let vendor = Request::builder().method("PUT").uri("/v2/player/commands/vendor")
+        .header("authorization", "Bearer private-test-token").header("content-type", "application/vnd.eqoxide+json")
+        .body(Body::from(request(json!({"kind":"stop"})).to_string())).unwrap();
+    assert_eq!(control.router().oneshot(vendor).await.unwrap().status(), StatusCode::ACCEPTED);
+    let quoted = Request::builder().method("PUT").uri("/v2/player/commands/quoted")
+        .header("authorization", "Bearer private-test-token").header("content-type", "application/json; profile=\"a,b\"")
+        .body(Body::from(request(json!({"kind":"stop"})).to_string())).unwrap();
+    assert_eq!(control.router().oneshot(quoted).await.unwrap().status(), StatusCode::ACCEPTED,
+        "a quoted parameter containing a comma is one media type");
+    assert_eq!(authorized(&control, "PUT", path, Some(movement())).await.0, StatusCode::ACCEPTED,
+        "the same ID is still free");
+}
+
+/// central-6ly1.1 review: fences, safety supersession and refusals all retire their receipts, so
+/// no amount of them fills the live limit or keeps refusals from eviction.
+#[test]
+fn fences_supersessions_and_refusals_all_retire() {
+    let control = control(16, 2000);
+    for n in 0..70 {
+        control.admit(format!("walk-{n}"), movement()).unwrap();
+        control.set_ready(false); // fences it while still accepted
+        control.set_ready(true);
+    }
+    let fenced = control.command("walk-69").unwrap();
+    assert_eq!((fenced.status, fenced.terminal, fenced.reason.as_deref()), (CommandStatus::Refused, true, Some("not_ready")));
+    for n in 0..70 {
+        control.admit(format!("queued-{n}"), movement()).unwrap();
+        control.admit(format!("stop-{n}"), request(json!({"kind":"stop"}))).unwrap();
+        control.drain_actions();
+        control
+            .publish_outcome(&format!("stop-{n}"), CommandStatus::AppliedLocal, None, Some(json!({"kind":"controller_stopped"})))
+            .unwrap();
+    }
+    assert_eq!(control.command("queued-69").unwrap().reason.as_deref(), Some("superseded_by_safety_command"));
+    assert_eq!(control.admit("walk".into(), movement()).unwrap().0, StatusCode::ACCEPTED,
+        "the live set holds no leaked receipts");
+    let mut bad = movement();
+    bad["operation"]["duration_ms"] = json!(0);
+    let (_, refused, _) = control.admit("bad".into(), bad).unwrap();
+    assert_eq!((refused.reason.as_deref(), refused.detail.is_some()), (Some("invalid_operation"), true));
+    let control = self::control(2, 100);
+    for n in 0..3 {
+        let mut stale = movement();
+        stale["session"] = json!("other");
+        control.admit(format!("stale-{n}"), stale).unwrap();
+    }
+    assert!(control.command("stale-0").is_none(), "refusals are evicted like any terminal receipt");
+    assert!(control.command("stale-1").is_some() && control.command("stale-2").is_some(),
+        "exactly the retention bound is kept");
+}
+
