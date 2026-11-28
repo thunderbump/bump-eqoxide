@@ -82,10 +82,14 @@ A command ID is never reusable in a session, including an ID refused at admissio
 - A body sent without `Content-Type: application/json` is 415 and consumes nothing.
 - A server's refusal of an awaited command (merchant open, buy) has reason `server_refused`, with
   the server's text in `detail`.
-- An awaited command's receipt can be visible a tick or two (20–40 ms) before state shows the
-  inventory or merchant revision it changed. Applying the outcome forces a state publication, so
-  the revision catches up at once. A request that carries the older revision in that window is
-  refused as `inventory_revision_required_or_stale`; re-read state and retry with a new ID.
+- A confirmed buy is not shown until the host has received the state that carries the inventory
+  it changed, or 500 ms have passed. Transactions stay blocked until then, and applying the outcome
+  forces a state publication. A script that sees `confirmed` and then reads state therefore gets
+  the new revision in all but the 500 ms fallback. A request carrying an older revision is refused
+  as `inventory_revision_required_or_stale`; re-read state and retry with a new ID.
+- An awaited outcome still pending when the session becomes not ready or changes zone ends
+  `unknown`, and transactions stay blocked until relog.
+- A `Content-Type` of `application/json` or `application/*+json` is accepted.
 - A malformed body consumes nothing and returns 422 `invalid_command_payload`. That covers a body
   that is not JSON, a payload of the wrong shape, and a unit operation such as `stop` with extra
   fields.

@@ -129,6 +129,8 @@ struct Host {
     last_event: u64,
     last_echo: u64,
     completions: Completions,
+    /// Completions waiting for a newer snapshot, with the snapshot and time they arrived at.
+    held_completions: Vec<(Completion, *const GameState, Instant)>,
     /// The last `CombatRecord::id` and death instant published as events (central-6ly1.8).
     last_combat: u64,
     last_death_count: u32,
@@ -147,13 +149,29 @@ impl Host {
                 .store(!matches!(settled, Status::Confirmed | Status::Refused), Ordering::Release);
         }
     }
-    /// Returns whether any outcome was applied, so the caller can publish state at once and the
-    /// receipt and the inventory it changed reach scripts together.
-    fn drain_completions(&mut self) -> bool {
-        let mut applied = false;
+    /// Apply awaited outcomes. A confirmed transaction is held until the host has seen a snapshot
+    /// newer than the one current when it arrived (or 500 ms pass): the network owner resolves a
+    /// buy before it publishes the inventory that buy changed, so applying it at once would show
+    /// `confirmed` beside the old revision and let a follow-up pass the revision check on stale
+    /// inventory. Returns whether anything was applied, so the caller can publish state at once.
+    fn drain_completions(&mut self, snapshot: &Arc<GameState>) -> bool {
+        let current = Arc::as_ptr(snapshot);
         while let Ok(done) = self.completions.1.try_recv() {
-            self.apply_completion(done);
-            applied = true;
+            self.held_completions.push((done, current, Instant::now()));
+        }
+        let mut applied = false;
+        let held = std::mem::take(&mut self.held_completions);
+        for (done, seen, at) in held {
+            let waits = done.transaction
+                && done.status == Status::Confirmed
+                && seen == current
+                && at.elapsed() < Duration::from_millis(500);
+            if waits {
+                self.held_completions.push((done, seen, at));
+            } else {
+                self.apply_completion(done);
+                applied = true;
+            }
         }
         applied
     }
@@ -875,6 +893,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         last_event: 0,
         last_echo: 0,
         completions: tokio::sync::mpsc::unbounded_channel(),
+        held_completions: Vec::new(),
         last_combat: 0,
         last_death_count: 0,
         published_position: None,
@@ -930,9 +949,11 @@ pub async fn run(profile: Profile) -> Result<(), String> {
     let mut shutdown_started: Option<Instant> = None;
     loop {
         interval.tick().await;
+        let gs = wiring.snapshot.load_full();
         // Outcomes the server already settled are applied before any fence this tick can run,
-        // so a readiness drop or zone change cannot turn a settled buy into `unknown`.
-        if host.drain_completions() {
+        // so a readiness drop or zone change cannot turn a settled buy into `unknown`. A confirmed
+        // transaction still waiting for fresh state when a fence runs ends `unknown`, the safe way.
+        if host.drain_completions(&gs) {
             publish_at = Instant::now();
         }
         let now = Instant::now();
@@ -949,13 +970,14 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
             if terminal.is_some() {
+                host.drain_completions(&gs);
                 host.halt("network_ended", None);
                 control.set_ready(false);
                 control.publish_event(json!({"kind":"session_ended","reason":terminal}));
             }
         }
-        let gs = wiring.snapshot.load_full();
         if gs.zone_epoch != host.epoch {
+            host.drain_completions(&gs);
             host.halt("zone_entry", None);
             control.set_ready(false);
             host.body = None;
@@ -1017,7 +1039,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         host.step(&gs, col.as_deref(), ready, now, dt);
         host.update_knowledge(&gs);
         // A completion that arrived during this tick is applied before the publish, after the fences.
-        if host.drain_completions() {
+        if host.drain_completions(&gs) {
             publish_at = now;
         }
         if now >= publish_at {
@@ -1103,6 +1125,7 @@ mod tests {
             last_event: 0,
             last_echo: 0,
         completions: tokio::sync::mpsc::unbounded_channel(),
+        held_completions: Vec::new(),
         last_combat: 0,
         last_death_count: 0,
         published_position: None,
@@ -1463,6 +1486,7 @@ mod transaction_admission_tests {
             last_event: 0,
             last_echo: 0,
         completions: tokio::sync::mpsc::unbounded_channel(),
+        held_completions: Vec::new(),
         last_combat: 0,
         last_death_count: 0,
         published_position: None,
@@ -1652,7 +1676,13 @@ mod execution_claim_tests {
         host.completions.0.send(done).unwrap();
         assert_eq!(host.control.command("buy").unwrap().status, Status::Accepted,
             "not visible until the host loop applies it");
-        host.drain_completions();
+        let before = Arc::new(GameState::new());
+        host.drain_completions(&before);
+        assert_eq!(host.control.command("buy").unwrap().status, Status::Accepted,
+            "a confirmed buy waits for the snapshot that carries its inventory");
+        assert!(host.transaction_uncertain.load(Ordering::Acquire), "and transactions stay closed meanwhile");
+        let after = Arc::new(GameState::new());
+        host.drain_completions(&after);
         assert_eq!(host.control.command("buy").unwrap().status, Status::Confirmed);
         assert!(!host.transaction_uncertain.load(Ordering::Acquire), "and the latch cleared with it");
     }

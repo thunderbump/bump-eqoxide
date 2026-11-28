@@ -903,7 +903,12 @@ async fn put_command(
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json")));
+        .is_some_and(|v| {
+            v.split(';').next().is_some_and(|t| {
+                let t = t.trim().to_ascii_lowercase();
+                t == "application/json" || (t.starts_with("application/") && t.ends_with("+json"))
+            })
+        });
     if !json {
         return Err(ApiError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "content_type_must_be_application_json".into(), None));
     }
