@@ -632,6 +632,10 @@ impl Control {
             entry.receipt.reason = Some(reason.into());
             entry.receipt.updated_at_ms = now_ms;
             if attack_off && entry.receipt.status == CommandStatus::Refused {
+                // One shape for an off whose zone ended before it was sent, wherever it stopped.
+                if reason == "zone_epoch_changed" {
+                    entry.receipt.reason = Some("stale_zone_epoch_before_dispatch".into());
+                }
                 entry.receipt.evidence = Some(attack_off_not_sent());
             }
             changes.push(entry.receipt.clone());

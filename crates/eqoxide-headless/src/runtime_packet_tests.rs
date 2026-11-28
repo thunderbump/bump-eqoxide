@@ -830,7 +830,7 @@ async fn attack_off_fenced_before_dispatch_says_not_sent() {
     let mut session = Session::new().await;
     session.admit("off", json!({"kind":"attack_off"})).await;
     session.host.control.publish_state(session.host.epoch + 1, json!({})).unwrap();
-    assert_refused_not_sent(&session, "off", "zone_epoch_changed");
+    assert_refused_not_sent(&session, "off", "stale_zone_epoch_before_dispatch");
 }
 
 /// The host has moved to the new zone before the journal publishes it: dispatch refuses the old
@@ -855,4 +855,19 @@ async fn zone_in_clears_attack_on_before_any_drain() {
     session.engage();
     session.gs.begin_zone_in();
     assert!(!session.gs.auto_attack);
+}
+
+/// A v1 or UI off reports through the tracker like any v1 request, including over a queued off.
+#[tokio::test]
+async fn a_v1_off_is_accepted_by_the_tracker() {
+    let mut session = Session::new().await;
+    let tracker = session.host.command.actions();
+    for queued in [false, true] {
+        if queued {
+            session.host.halt("not_ready", None);
+        }
+        let context = tracker.begin("v1_attack_off");
+        assert!(context.scope(async { session.host.command.request_attack(false) }).await);
+        assert!(tracker.is_accepted(context.id()), "queued off before: {queued}");
+    }
 }

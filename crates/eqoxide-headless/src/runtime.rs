@@ -919,6 +919,11 @@ impl Host {
         load: &mut dyn FnMut(&str) -> Result<(Arc<Collision>, Value), String>,
     ) -> Result<bool, String> {
         let Frame { col, loaded_zone, geometry, publish_at } = frame;
+        if terminal.is_some() {
+            // No network owner is left; on every tick after, since safety commands raced in
+            // before admission closed still need an end.
+            self.finish_session(gs);
+        }
         self.settle_attack_offs(gs);
         if gs.zone_epoch != self.epoch {
             self.drain_completions();
@@ -1138,9 +1143,6 @@ pub async fn run(profile: Profile) -> Result<(), String> {
                 control.set_ready(false);
                 control.publish_event(json!({"kind":"session_ended","reason":terminal}));
             }
-        }
-        if terminal.is_some() {
-            host.finish_session(&gs);
         }
         let link = || {
             let health = wiring.health.lock().unwrap();

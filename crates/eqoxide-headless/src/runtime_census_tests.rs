@@ -57,9 +57,12 @@ struct Census {
     read: u64,
     /// The reason the network owner recorded for each position-update sequence it sent.
     reasons: std::collections::HashMap<u16, eqoxide_core::game_state::PositionSendReason>,
+    last_send_at: Option<Instant>,
     ready: bool,
     net_running: bool,
     resume: Resume,
+    /// The run loop's terminal network outcome, passed to every frame once set.
+    terminal: Option<String>,
     _peer: UdpSocket,
 }
 
@@ -89,9 +92,11 @@ impl Census {
             clock: started,
             read: 0,
             reasons: Default::default(),
+            last_send_at: None,
             ready: false,
             net_running: true,
             resume,
+            terminal: None,
             _peer: peer,
         }
     }
@@ -106,7 +111,15 @@ impl Census {
                 );
                 // At most one position update per network tick, so the last send is this tick's.
                 if let Some(sent) = self.controller.controller_view.lock().unwrap().last_position_send {
-                    self.reasons.insert(sent.seq, sent.reason);
+                    if self.reasons.insert(sent.seq, sent.reason).is_none() {
+                        // A keepalive is owed only after the keepalive interval of silence.
+                        if sent.reason == eqoxide_core::game_state::PositionSendReason::Keepalive {
+                            let gap = self.last_send_at.map(|at| sent.at - at);
+                            assert!(gap.is_none_or(|gap| gap >= Duration::from_millis(1300)),
+                                "keepalive {gap:?} after the previous update");
+                        }
+                        self.last_send_at = Some(sent.at);
+                    }
                 }
             }
         }
@@ -118,7 +131,7 @@ impl Census {
         let ready = self
             .host
             .frame(
-                &snapshot, &mut self.frame, &None, &|| false, &link, now, TICK.as_secs_f32(),
+                &snapshot, &mut self.frame, &self.terminal, &|| false, &link, now, TICK.as_secs_f32(),
                 self.started, &self.collision,
                 &mut |_| Ok((Arc::new(floor()), json!({"status":"loaded"}))),
             )
@@ -161,6 +174,25 @@ impl Census {
         self.net_running = true;
         self.ticks(10).await;
         assert!(self.ready, "the scripted zone entry must reach ready");
+    }
+
+    /// A PUT whose admission outcome the caller checks itself.
+    async fn put_any(&mut self, id: &str, operation: Value) {
+        let _ = self.put_status(id, operation).await;
+    }
+
+    async fn put_status(&mut self, id: &str, operation: Value) -> StatusCode {
+        self.host.control.router().oneshot(
+            Request::put(format!("/v2/player/commands/{id}"))
+                .header("authorization", "Bearer test-credential")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({
+                    "session": "test-session",
+                    "zone_epoch": self.host.epoch,
+                    "operation": operation,
+                }).to_string()))
+                .unwrap(),
+        ).await.unwrap().status()
     }
 
     async fn put(&mut self, id: &str, operation: Value) {
@@ -370,4 +402,29 @@ async fn scripted_session(resume: Resume) {
     s.ticks(3).await;
     assert_eq!(exact(&s.phase("camp with attack on")),
         expect(&[("OP_AUTO_ATTACK off (camp)", 1), ("OP_CAMP", 1), ("OP_SPAWN_APPEARANCE", 1)]));
+}
+
+/// The run loop's terminal path through `Host::frame`: when the network owner ends, an
+/// `attack_off` it never drained is refused as not sent, and a later one is refused at
+/// admission. Dropping the terminal handling from `frame` leaves the first `accepted` forever.
+#[tokio::test]
+async fn a_terminal_network_outcome_settles_queued_attack_offs() {
+    let mut s = Census::new(Resume::AfterGeometry).await;
+    s.enter_zone("qeynos2").await;
+    s.net_running = false;
+    s.put("queued", json!({"kind":"attack_off"})).await;
+    s.tick().await;
+    assert_eq!(s.host.control.command("queued").unwrap().status, Status::Accepted);
+    s.terminal = Some("session_ended".into());
+    s.tick().await;
+    for id in ["queued", "late"] {
+        if id == "late" {
+            s.put_any(id, json!({"kind":"attack_off"})).await;
+            s.tick().await;
+        }
+        let receipt = s.host.control.command(id).unwrap();
+        assert_eq!((receipt.status, receipt.reason.as_deref()), (Status::Refused, Some("not_ready")), "{id}: {receipt:?}");
+        assert_eq!(receipt.evidence, Some(json!({"kind":"attack_off_not_sent","packets":[]})), "{id}");
+    }
+    assert_eq!(exact(&s.phase("terminal")), expect(&[]), "nothing is sent after the end");
 }
