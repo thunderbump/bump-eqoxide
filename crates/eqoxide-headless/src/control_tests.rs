@@ -1062,6 +1062,16 @@ async fn malformed_bodies_are_422_and_consume_nothing() {
         .header("authorization", "Bearer private-test-token").header("content-type", "text/plain")
         .body(Body::from(movement().to_string())).unwrap();
     assert_eq!(control.router().oneshot(plain).await.unwrap().status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    for content_type in ["application/json, application/problem+json"] {
+        let listed = Request::builder().method("PUT").uri(path)
+            .header("authorization", "Bearer private-test-token").header("content-type", content_type)
+            .body(Body::from(movement().to_string())).unwrap();
+        assert_eq!(control.router().oneshot(listed).await.unwrap().status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let vendor = Request::builder().method("PUT").uri("/v2/player/commands/vendor")
+        .header("authorization", "Bearer private-test-token").header("content-type", "application/vnd.eqoxide+json")
+        .body(Body::from(request(json!({"kind":"stop"})).to_string())).unwrap();
+    assert_eq!(control.router().oneshot(vendor).await.unwrap().status(), StatusCode::ACCEPTED);
     assert_eq!(authorized(&control, "PUT", path, Some(movement())).await.0, StatusCode::ACCEPTED,
         "the same ID is still free");
 }

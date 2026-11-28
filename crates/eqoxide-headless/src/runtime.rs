@@ -129,8 +129,6 @@ struct Host {
     last_event: u64,
     last_echo: u64,
     completions: Completions,
-    /// Completions waiting for a newer snapshot, with the snapshot and time they arrived at.
-    held_completions: Vec<(Completion, *const GameState, Instant)>,
     /// The last `CombatRecord::id` and death instant published as events (central-6ly1.8).
     last_combat: u64,
     last_death_count: u32,
@@ -142,36 +140,27 @@ impl Host {
     /// Publish an awaited outcome and settle the latch from the receipt as it stands: late
     /// evidence for a fenced `unknown` is not applied, so it cannot reopen transactions either.
     fn apply_completion(&self, done: Completion) {
-        let _ = self.control.publish_outcome_with_detail(&done.id, done.status, done.reason, done.detail, done.evidence);
         if done.transaction {
-            let settled = self.control.settled_status(&done.id).unwrap_or(done.status);
+            // The latch first, then the receipt, so a script that sees `confirmed` can send its
+            // next transaction at once. Both run on the host loop, so no fence falls between them.
+            // A receipt already terminal (fenced to `unknown`) keeps its status, and so the latch.
+            let settled = match self.control.settled_status(&done.id) {
+                Some(status) if status.terminal() => status,
+                _ => done.status,
+            };
             self.transaction_uncertain
                 .store(!matches!(settled, Status::Confirmed | Status::Refused), Ordering::Release);
         }
+        let _ = self.control.publish_outcome_with_detail(&done.id, done.status, done.reason, done.detail, done.evidence);
     }
-    /// Apply awaited outcomes. A confirmed transaction is held until the host has seen a snapshot
-    /// newer than the one current when it arrived (or 500 ms pass): the network owner resolves a
-    /// buy before it publishes the inventory that buy changed, so applying it at once would show
-    /// `confirmed` beside the old revision and let a follow-up pass the revision check on stale
-    /// inventory. Returns whether anything was applied, so the caller can publish state at once.
-    fn drain_completions(&mut self, snapshot: &Arc<GameState>) -> bool {
-        let current = Arc::as_ptr(snapshot);
-        while let Ok(done) = self.completions.1.try_recv() {
-            self.held_completions.push((done, current, Instant::now()));
-        }
+    /// Apply awaited outcomes on the host loop, so no fence can run between settling the latch
+    /// and publishing the receipt. Returns whether anything was applied, so the caller can
+    /// publish state at once.
+    fn drain_completions(&mut self, _snapshot: &Arc<GameState>) -> bool {
         let mut applied = false;
-        let held = std::mem::take(&mut self.held_completions);
-        for (done, seen, at) in held {
-            let waits = done.transaction
-                && done.status == Status::Confirmed
-                && seen == current
-                && at.elapsed() < Duration::from_millis(500);
-            if waits {
-                self.held_completions.push((done, seen, at));
-            } else {
-                self.apply_completion(done);
-                applied = true;
-            }
+        while let Ok(done) = self.completions.1.try_recv() {
+            self.apply_completion(done);
+            applied = true;
         }
         applied
     }
@@ -893,7 +882,6 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         last_event: 0,
         last_echo: 0,
         completions: tokio::sync::mpsc::unbounded_channel(),
-        held_completions: Vec::new(),
         last_combat: 0,
         last_death_count: 0,
         published_position: None,
@@ -951,8 +939,7 @@ pub async fn run(profile: Profile) -> Result<(), String> {
         interval.tick().await;
         let gs = wiring.snapshot.load_full();
         // Outcomes the server already settled are applied before any fence this tick can run,
-        // so a readiness drop or zone change cannot turn a settled buy into `unknown`. A confirmed
-        // transaction still waiting for fresh state when a fence runs ends `unknown`, the safe way.
+        // so a readiness drop or zone change cannot turn a settled buy into `unknown`.
         if host.drain_completions(&gs) {
             publish_at = Instant::now();
         }
@@ -1125,7 +1112,6 @@ mod tests {
             last_event: 0,
             last_echo: 0,
         completions: tokio::sync::mpsc::unbounded_channel(),
-        held_completions: Vec::new(),
         last_combat: 0,
         last_death_count: 0,
         published_position: None,
@@ -1486,7 +1472,6 @@ mod transaction_admission_tests {
             last_event: 0,
             last_echo: 0,
         completions: tokio::sync::mpsc::unbounded_channel(),
-        held_completions: Vec::new(),
         last_combat: 0,
         last_death_count: 0,
         published_position: None,
@@ -1676,13 +1661,7 @@ mod execution_claim_tests {
         host.completions.0.send(done).unwrap();
         assert_eq!(host.control.command("buy").unwrap().status, Status::Accepted,
             "not visible until the host loop applies it");
-        let before = Arc::new(GameState::new());
-        host.drain_completions(&before);
-        assert_eq!(host.control.command("buy").unwrap().status, Status::Accepted,
-            "a confirmed buy waits for the snapshot that carries its inventory");
-        assert!(host.transaction_uncertain.load(Ordering::Acquire), "and transactions stay closed meanwhile");
-        let after = Arc::new(GameState::new());
-        host.drain_completions(&after);
+        host.drain_completions(&Arc::new(GameState::new()));
         assert_eq!(host.control.command("buy").unwrap().status, Status::Confirmed);
         assert!(!host.transaction_uncertain.load(Ordering::Acquire), "and the latch cleared with it");
     }

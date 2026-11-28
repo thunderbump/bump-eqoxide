@@ -904,10 +904,13 @@ async fn put_command(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| {
-            v.split(';').next().is_some_and(|t| {
-                let t = t.trim().to_ascii_lowercase();
-                t == "application/json" || (t.starts_with("application/") && t.ends_with("+json"))
-            })
+            // One media type, as Axum's `Json` extractor accepts: `application/json` or
+            // `application/*+json`, with optional parameters; a list is rejected.
+            !v.contains(',')
+                && v.split(';').next().is_some_and(|t| {
+                    let t = t.trim().to_ascii_lowercase();
+                    t == "application/json" || (t.starts_with("application/") && t.ends_with("+json"))
+                })
         });
     if !json {
         return Err(ApiError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "content_type_must_be_application_json".into(), None));
